@@ -888,6 +888,45 @@ def _shared_confirmed_species(photos):
     return [s for s in tagged[0] if keyword_match_key(s) in common]
 
 
+def derive_burst_override(photos, preferred_order=None):
+    """Burst ``species_override`` implied by its frames' confirmed species.
+
+    The rule :func:`serialize_results` applies on regroup, shared with the
+    undo/redo refresh and the encounter-scoped confirm so a burst's cached
+    set never contradicts its frames: every frame tagged and sharing a
+    species → a confirmed override for the shared set; every frame tagged
+    but nothing shared, or every frame untagged → the explicit-empty
+    sentinel (so the burst does not inherit the encounter's baseline and
+    re-advertise a species its frames no longer carry); otherwise ``None``
+    (inherit the encounter).
+
+    ``preferred_order`` (a species list) puts those names first in the
+    shared list, so the entry the user just confirmed stays the primary.
+    """
+    from pipeline_results import (
+        build_species_override,
+        empty_species_override,
+        photo_confirmed_species_list,
+        species_key_set,
+    )
+
+    if not photos:
+        return None
+    if _photos_uniformly_confirmed(photos):
+        shared = _shared_confirmed_species(photos)
+        if preferred_order:
+            shared_keys = species_key_set(shared)
+            first = [s for s in preferred_order if s and species_key_set([s]) <= shared_keys]
+            first_keys = species_key_set(first)
+            shared = first + [s for s in shared if not species_key_set([s]) <= first_keys]
+        return build_species_override(shared)
+    if all(photo_confirmed_species_list(p) for p in photos):
+        return empty_species_override()
+    if all(not photo_confirmed_species_list(p) for p in photos):
+        return empty_species_override()
+    return None
+
+
 def _photos_uniformly_confirmed(photos):
     """True when every photo is tagged and they all share a species.
 
@@ -1467,11 +1506,6 @@ def refresh_cache_species_for_photos(
     Returns True when the cache changed on disk, False otherwise (no
     cache, no overlap with the affected ids, or already in sync).
     """
-    from pipeline_results import (
-        build_species_override,
-        empty_species_override,
-        photo_confirmed_species_list,
-    )
 
     if not species_by_photo:
         return False
@@ -1510,28 +1544,7 @@ def refresh_cache_species_for_photos(
             ]
             if not b_photos:
                 continue
-            if _photos_uniformly_confirmed(b_photos):
-                burst["species_override"] = build_species_override(
-                    _shared_confirmed_species(b_photos)
-                )
-            elif all(photo_confirmed_species_list(p) for p in b_photos):
-                # Every photo is tagged but they share nothing (a remove
-                # took the only common species, leaving disjoint extras):
-                # the burst's own set is empty, so it gets the explicit-
-                # empty sentinel rather than inheriting the encounter's
-                # baseline and re-advertising the removed species.
-                burst["species_override"] = empty_species_override()
-            elif all(
-                not (p.get("confirmed_species_list") or p.get("confirmed_species"))
-                for p in b_photos
-            ):
-                # Every photo carries no species: this is the state a remove
-                # leaves. Use the explicit-empty sentinel so the burst does
-                # not inherit the encounter's still-confirmed species on
-                # reload (which would let a flag-only apply re-tag it).
-                burst["species_override"] = empty_species_override()
-            else:
-                burst["species_override"] = None
+            burst["species_override"] = derive_burst_override(b_photos)
         if _photos_uniformly_confirmed(enc_photos):
             enc_confirmed_list = _shared_confirmed_species(enc_photos)
             enc["confirmed_species"] = enc_confirmed_list[0] if enc_confirmed_list else None

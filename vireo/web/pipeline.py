@@ -1534,8 +1534,12 @@ def create_pipeline_blueprint(
             flag = row["flag"] or "none"
             photo["flag"] = flag
             photo["rating"] = row["rating"] or 0
-            names = species.get(photo["id"], [])
+            names = [n for n in species.get(photo["id"], []) if n]
             photo["confirmed_species"] = names[0] if names else None
+            # The list is what Rapid Review reads first (photoSpeciesList),
+            # so a stale one would keep showing a removed second species
+            # and mis-derive "Mixed species" after an edit, undo, or redo.
+            photo["confirmed_species_list"] = list(names)
 
     @blueprint.route("/api/pipeline/results")
     def api_pipeline_results():

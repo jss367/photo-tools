@@ -3523,3 +3523,93 @@ def test_serialize_results_disjoint_tagged_burst_gets_empty_override(tmp_path):
                 }
                 saw = True
     assert saw
+
+
+# -- derive_burst_override / auto_detach_burst_for_species (multi-species) --
+
+
+def _species_photo(pid, names):
+    return {"id": pid, "confirmed_species": names[0] if names else None,
+            "confirmed_species_list": list(names)}
+
+
+def test_derive_burst_override_confirms_shared_set_in_preferred_order():
+    from pipeline import derive_burst_override
+
+    photos = [_species_photo(1, ["Teal", "Wigeon"]), _species_photo(2, ["Wigeon", "Teal", "Gadwall"])]
+    assert derive_burst_override(photos) == {
+        "species": "Teal", "confirmed": True, "species_list": ["Teal", "Wigeon"],
+    }
+    assert derive_burst_override(photos, preferred_order=["Wigeon"]) == {
+        "species": "Wigeon", "confirmed": True, "species_list": ["Wigeon", "Teal"],
+    }
+
+
+def test_derive_burst_override_sentinels_and_inherit():
+    from pipeline import derive_burst_override
+    from pipeline_results import empty_species_override
+
+    # Every frame tagged, nothing shared → the burst's own set is empty.
+    assert derive_burst_override(
+        [_species_photo(1, ["Teal"]), _species_photo(2, ["Wigeon"])]
+    ) == empty_species_override()
+    # Every frame untagged → explicit empty, never inherit the encounter.
+    assert derive_burst_override(
+        [_species_photo(1, []), _species_photo(2, [])]
+    ) == empty_species_override()
+    # Some tagged, some not → inherit the encounter.
+    assert derive_burst_override(
+        [_species_photo(1, ["Teal"]), _species_photo(2, [])]
+    ) is None
+    assert derive_burst_override([]) is None
+
+
+def test_auto_detach_does_not_promote_candidate_override_to_confirmed_species():
+    """A detach-time candidate ({"species": guess, "confirmed": False}, no
+    list) is a classifier hint; detaching that burst for a new species must
+    not carry the guess into the new encounter's confirmed list."""
+    from pipeline_results import auto_detach_burst_for_species
+
+    results = {
+        "photos": [
+            {"id": i, "timestamp": f"2026-01-01T10:00:0{i}", "species_top5": []}
+            for i in range(1, 5)
+        ],
+        "encounters": [{
+            "species": ["Teal", 0.9],
+            "confirmed_species": "Teal",
+            "confirmed_species_list": ["Teal"],
+            "species_predictions": [],
+            "species_confirmed": True,
+            "photo_count": 4,
+            "burst_count": 2,
+            "time_range": ["2026-01-01T10:00:01", "2026-01-01T10:00:04"],
+            "photo_ids": [1, 2, 3, 4],
+            "bursts": [
+                {"photo_ids": [1, 2], "species_predictions": [],
+                 "species_override": {"species": "Gadwall", "confirmed": False}},
+                {"photo_ids": [3, 4], "species_predictions": [], "species_override": None},
+            ],
+        }],
+        "summary": {},
+    }
+    auto_detach_burst_for_species(results, 0, 0, "Wigeon")
+    new_enc = next(e for e in results["encounters"] if e["photo_ids"] == [1, 2])
+    assert new_enc["species_confirmed"] is True
+    assert new_enc["confirmed_species"] == "Wigeon"
+    assert new_enc["confirmed_species_list"] == ["Wigeon"]
+
+    # A genuinely confirmed second species on the burst does carry over.
+    results["encounters"] = [{
+        **results["encounters"][0],
+        "photo_ids": [1, 2, 3, 4], "photo_count": 4, "burst_count": 2,
+        "bursts": [
+            {"photo_ids": [1, 2], "species_predictions": [],
+             "species_override": {"species": "Teal", "confirmed": True,
+                                  "species_list": ["Teal", "Gadwall"]}},
+            {"photo_ids": [3, 4], "species_predictions": [], "species_override": None},
+        ],
+    }]
+    auto_detach_burst_for_species(results, 0, 0, "Wigeon")
+    new_enc = next(e for e in results["encounters"] if e["photo_ids"] == [1, 2])
+    assert new_enc["confirmed_species_list"] == ["Wigeon", "Teal", "Gadwall"]

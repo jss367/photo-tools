@@ -23742,3 +23742,88 @@ def test_encounter_species_replace_does_not_confirm_list_entry_missing_from_a_fr
         "confirmed": False,
         "species_list": ["Gadwall", "American Wigeon"],
     }
+
+
+def test_encounter_species_encounter_scoped_replace_rebuilds_child_burst_overrides(app_and_db):
+    """An encounter-scoped A→B must not leave a child burst's materialized
+    override saying A: both review pages read the override before the
+    encounter, and a flag-only Rapid apply would re-tag the stale A."""
+    import json as _json
+    app, db = app_and_db
+    client = app.test_client()
+    photo_ids = [p["id"] for p in db.conn.execute("SELECT id FROM photos").fetchall()]
+    burst_ids, other_ids = photo_ids[:2], photo_ids[2:]
+    path = _seed_encounter_cache(
+        app, db, photo_ids, confirmed_species="Green-winged Teal",
+        bursts=[
+            {"photo_ids": burst_ids, "species_predictions": [],
+             "species_override": {"species": "Green-winged Teal", "confirmed": True,
+                                  "species_list": ["Green-winged Teal"]}},
+            {"photo_ids": other_ids, "species_predictions": [], "species_override": None},
+        ],
+    )
+    teal = db.add_keyword("Green-winged Teal", is_species=True)
+    for pid in photo_ids:
+        db.tag_photo(pid, teal)
+
+    resp = client.post("/api/encounters/species", json={
+        "species": "American Wigeon", "photo_ids": photo_ids,
+    })
+    assert resp.status_code == 200, resp.get_json()
+    body = resp.get_json()
+    assert body["species_list"] == ["American Wigeon"]
+    for pid in photo_ids:
+        assert "Green-winged Teal" not in _species_names(db, pid)
+
+    expected_override = {
+        "species": "American Wigeon", "confirmed": True,
+        "species_list": ["American Wigeon"],
+    }
+    with open(path) as f:
+        enc = _json.load(f)["encounters"][0]
+    assert enc["confirmed_species_list"] == ["American Wigeon"]
+    assert enc["bursts"][0]["species_override"] == expected_override
+    assert enc["bursts"][1]["species_override"] is None, "inheriting bursts stay inheriting"
+    assert body["encounters"][0]["bursts"][0]["species_override"] == expected_override
+
+    # The override rewrite rides on the same history entry as the tag edit,
+    # so undo puts the burst back to Teal along with the keywords.
+    assert client.post("/api/undo").status_code == 200
+    with open(path) as f:
+        enc = _json.load(f)["encounters"][0]
+    assert enc["bursts"][0]["species_override"]["species_list"] == ["Green-winged Teal"]
+    for pid in photo_ids:
+        assert "Green-winged Teal" in _species_names(db, pid)
+
+
+def test_pipeline_results_overlay_refreshes_confirmed_species_list(app_and_db):
+    """``/api/pipeline/results`` overlays the database's species onto every
+    cached photo — the list, not just the primary — so a reload after an
+    edit, undo, or redo never shows a species the photo no longer carries."""
+    import json as _json
+    app, db = app_and_db
+    client = app.test_client()
+    photo_ids = [p["id"] for p in db.conn.execute("SELECT id FROM photos").fetchall()]
+    path = _seed_encounter_cache(app, db, photo_ids, confirmed_species="Green-winged Teal")
+    with open(path) as f:
+        data = _json.load(f)
+    for p in data["photos"]:
+        p["confirmed_species"] = "American Wigeon"
+        p["confirmed_species_list"] = ["American Wigeon", "Green-winged Teal"]
+    with open(path, "w") as f:
+        _json.dump(data, f)
+    teal = db.add_keyword("Green-winged Teal", is_species=True)
+    db.tag_photo(photo_ids[0], teal)
+    expected = db.get_species_keywords_for_photos(photo_ids)
+
+    resp = client.get("/api/pipeline/results")
+    assert resp.status_code == 200, resp.get_json()
+    photos = {p["id"]: p for p in resp.get_json()["photos"]}
+    for pid in photo_ids:
+        names = expected.get(pid, [])
+        assert photos[pid]["confirmed_species_list"] == names
+        assert photos[pid]["confirmed_species"] == (names[0] if names else None)
+    assert photos[photo_ids[0]]["confirmed_species_list"] == ["Green-winged Teal"]
+    assert not any(
+        "American Wigeon" in photos[pid]["confirmed_species_list"] for pid in photo_ids
+    ), "the stale cached second species must not survive the overlay"

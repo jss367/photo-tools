@@ -1931,7 +1931,8 @@ function rapidApplyTitle(diff, openNext) {
   if (diff.clearNew > 0) actions.push('clear flags on ' + diff.clearNew + ' ' + rapidPlural(diff.clearNew, 'photo'));
   if (diff.speciesChanged) actions.push('set confirmed species to "' + diff.species + '"');
   if (diff.removedSpecies && diff.removedSpecies.length) {
-    actions.push('remove species keyword "' + joinSpecies(diff.removedSpecies) + '" from every burst frame');
+    var rmLabel = diff.removedSpecies.length > 1 ? 'species keywords' : 'species keyword';
+    actions.push('remove ' + rmLabel + ' "' + joinSpecies(diff.removedSpecies) + '" from every burst frame');
   }
   if (diff.tagNew > 0) {
     var kwLabel = diff.speciesList && diff.speciesList.length > 1 ? 'species keywords' : 'species keyword';
@@ -2142,8 +2143,18 @@ async function applyCurrent(openNext) {
           // adopted /api/encounters/species response below. Kept only because
           // some rapid-review tests still mock the old response shape.
           if (species && resp.photos[pidStr].has_species_keyword) {
-            p.confirmed_species_list = targetList.slice();
-            p.confirmed_species = targetList[0] || null;
+            // Merge, never overwrite: a mixed frame may carry a species the
+            // burst as a whole does not, and a flag-only apply never touched
+            // it. Only species this apply drops from the burst's set go.
+            var mirrorKeys = {};
+            targetList.forEach(function(name) { mirrorKeys[speciesKey(name)] = true; });
+            setDiff.removed.forEach(function(name) { mirrorKeys[speciesKey(name)] = true; });
+            var mirrorExtras = photoSpeciesList(p).filter(function(name) {
+              return !mirrorKeys[speciesKey(name)];
+            });
+            var mirrored = targetList.concat(mirrorExtras);
+            p.confirmed_species_list = mirrored.slice();
+            p.confirmed_species = mirrored[0] || null;
           }
         }
       });

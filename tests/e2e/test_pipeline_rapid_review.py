@@ -1694,8 +1694,15 @@ def test_rapid_review_flag_only_apply_keeps_mixed_frames_second_species(live_ser
                    "has_species_keywords": {"American Wigeon": True}}
         for pid in (1, 2, 3)
     }
+    # /group/apply reports the keyword on every frame so the local mirror
+    # branch runs; it must merge, not overwrite, the mixed frame's list.
+    apply_photos = {
+        "1": {"flag": "flagged", "has_species_keyword": True},
+        "2": {"flag": "none", "has_species_keyword": True},
+        "3": {"flag": "none", "has_species_keyword": True},
+    }
     _mock_pipeline_rapid_review(
-        page, results=results, state_photos=state,
+        page, results=results, state_photos=state, apply_photos=apply_photos,
         species_payloads=species_payloads, save_payloads=save_payloads,
     )
     _goto_rapid_review(page, live_server, "?enc=0&burst=0")

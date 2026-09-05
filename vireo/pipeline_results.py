@@ -277,12 +277,14 @@ def auto_detach_burst_for_species(results, enc_idx, burst_idx, new_species):
         )
         # The detached burst may carry more than one confirmed species; the
         # new encounter inherits the whole list with new_species as primary.
-        detached_list = _as_species_list(
-            detached.get("species_override"), "species_list", "species",
-        )
+        # Only the burst's own authoritative set counts: a detach-time
+        # candidate ({"species": guess, "confirmed": False}, no list) is a
+        # classifier hint and must not become a confirmed second species.
+        detached_list = burst_species_list({}, detached)
+        new_keys = species_key_set([new_species])
         confirmed_list = [new_species] + [
             s for s in detached_list
-            if species_key_set([s]) != species_key_set([new_species])
+            if species_key_set([s]) != new_keys
         ]
         encounters.append({
             "species": detached_species,

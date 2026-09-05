@@ -27407,6 +27407,30 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     target_enc["species_confirmed"] = bool(
                         new_encounter_state["species_confirmed"]
                     )
+                    # Child bursts may carry overrides serialize_results (or
+                    # an earlier burst edit) materialized for the pre-edit
+                    # species. Both review pages read those before the
+                    # encounter, so leaving them would show the old species
+                    # on every burst and let a flag-only Rapid apply re-tag
+                    # it. Rebuild each fully-submitted burst's override from
+                    # what its frames carry now (read inside this
+                    # transaction); bursts without an override keep
+                    # inheriting the encounter's new list.
+                    from pipeline import derive_burst_override
+                    submitted = set(photo_ids)
+                    for child in target_enc.get("bursts") or []:
+                        if child.get("species_override") is None:
+                            continue
+                        child_ids = child.get("photo_ids") or []
+                        if not child_ids or not set(child_ids) <= submitted:
+                            continue
+                        child["species_override"] = derive_burst_override(
+                            [
+                                {"confirmed_species_list": actual_by_photo.get(pid, [])}
+                                for pid in child_ids
+                            ],
+                            preferred_order=new_species_list,
+                        )
                 if photo_edit_id is not None and before_cached["encounters"] != cached["encounters"]:
                     # Labels and confirmation counts are part of the same user
                     # action even when no burst moves to another encounter.

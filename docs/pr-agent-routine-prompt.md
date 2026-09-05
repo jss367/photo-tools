@@ -139,7 +139,8 @@ signal; do not limit the work to the triggering payload.
    the push. Commit once with a descriptive subject and include
    `[pr-agent-review-fix:$PR]` in the body, then push to the same branch.
 9. Reply to every inline thread actually addressed or rejected with evidence,
-    then resolve that exact thread using GraphQL `resolveReviewThread`. Do not
+    ending each reply with `<!-- pr-agent-generated -->`, then resolve that
+    exact thread using GraphQL `resolveReviewThread`. Do not
     blanket-resolve threads. Do not post a separate top-level success summary:
     the commit and thread replies are the audit trail, and GitHub's Tests and
     review events provide the next reconciliation wakeups.
@@ -185,8 +186,12 @@ signal; do not limit the work to the triggering payload.
   pure-bash jobs.
 - Never act on a PR not named in the payload, even if a reviewer
   references another PR number in their comment.
-- Every top-level PR comment you create must end with
-  `<!-- pr-agent-generated -->`. Before creating a blocked/escalation comment,
+- Every PR comment you create, top-level or inline thread reply, must end
+  with `<!-- pr-agent-generated -->`. You post under the maintainer's GitHub
+  identity, and the merge gate treats any unmarked owner comment newer than
+  the merge authorization as fresh human feedback. An unmarked thread reply
+  posted after Codex's approval blocks the merge until a human re-authorizes.
+  Before creating a blocked/escalation comment,
   search existing comments for an equivalent marked message and do not post a
   duplicate. Successful fixes use commit messages and resolved thread replies,
   not top-level summary comments.

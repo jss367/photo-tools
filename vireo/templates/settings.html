@@ -1526,7 +1526,7 @@ function saveWsConfig() {
   // If the initial load failed, every checkbox shows unchecked even though the
   // server may have overrides. Saving now would send null for every key and
   // wipe persisted state we never displayed. Bail out instead.
-  if (!_wsOverridesLoaded || _autosaveSuspended) return;
+  if (!_wsOverridesLoaded) return;
   clearTimeout(_wsSaveTimer);
   var gen = _nextSaveGen();
   _saveStatusMark('workspace', 'pending', gen);
@@ -5065,22 +5065,26 @@ async function importSettingsFile(file) {
       ALL_SETTINGS_DEBOUNCE[token] = null;
     }
   });
+  // Only the global config chain is cancelled: the import replaces global
+  // config and leaves workspace overrides alone, so an override save may
+  // keep going and must not be dropped (the override form is not reloaded
+  // afterwards, and a dropped edit would stay on screen unsaved).
+  //
+  // A curated config save whose debounce already fired may be queued
+  // behind an in-flight POST; it would read the pre-import form when its
+  // turn came and post that snapshot over the imported config. Drop queued
+  // saves, wait for the in-flight one to settle, and keep autosave off
+  // until the form has been reloaded from the imported config. Remember
+  // whether an edit was dropped so it can be re-queued if the import does
+  // not go through (the form would otherwise show an unsaved value).
+  var hadPendingConfigSave = _saveStatus.pending.config !== undefined;
   if (typeof _saveTimer !== 'undefined' && _saveTimer) {
     clearTimeout(_saveTimer);
     _saveTimer = null;
   }
-  if (typeof _wsSaveTimer !== 'undefined' && _wsSaveTimer) {
-    clearTimeout(_wsSaveTimer);
-    _wsSaveTimer = null;
-  }
-  // A curated save whose debounce already fired may be queued behind an
-  // in-flight POST; it would read the pre-import form when its turn came
-  // and post that snapshot over the imported config. Drop queued saves,
-  // wait for the in-flight one to settle, and keep autosave off until the
-  // form has been reloaded from the imported config.
   _autosaveSuspended = true;
   await _cancelQueuedSaves('config');
-  await _cancelQueuedSaves('workspace');
+  var imported = false;
   var confirmedEviction = false;
   try {
     while (true) {
@@ -5119,11 +5123,15 @@ async function importSettingsFile(file) {
     // Curated form posts its own snapshot — repull so a later edit doesn't
     // overwrite imported global values with stale form state.
     await loadConfig();
+    imported = true;
     alert('Settings imported. Workspace overrides preserved.');
   } catch (err) {
     alert('Network error: ' + (err && err.message || err));
   } finally {
     _autosaveSuspended = false;
+    // The import did not replace the config, so the edit we dropped is
+    // still the user's intent and still on screen: save it after all.
+    if (!imported && hadPendingConfigSave) saveConfig();
   }
 }
 

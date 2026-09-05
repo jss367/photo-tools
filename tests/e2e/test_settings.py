@@ -308,3 +308,55 @@ def test_settings_import_drops_queued_autosave(live_server, page):
     expect(status).not_to_have_attribute("data-state", "saving")
     cfg = page.request.get(f"{url}/api/config").json()
     assert cfg["keyword_case"] == "auto"
+
+
+def test_settings_failed_import_requeues_dropped_autosave(live_server, page):
+    """If the import is rejected, the edit dropped for it is saved after all."""
+    url = live_server["url"]
+    page.goto(f"{url}/settings", timeout=5000)
+    status = _wait_for_settings_idle(page)
+    page.on("dialog", lambda d: d.accept())
+
+    held = []
+    config_posts = []
+
+    def _hold_first_post(route, request):
+        if request.method == "POST":
+            config_posts.append(request)
+            if len(config_posts) == 1:
+                held.append(route)
+                return
+        route.continue_()
+
+    page.route("**/api/config", _hold_first_post)
+    page.select_option("#cfgKeywordCase", "title")
+    for _ in range(60):
+        if held:
+            break
+        page.wait_for_timeout(50)
+    assert held, "first POST was never requested"
+    page.select_option("#cfgKeywordCase", "lower")
+    page.wait_for_timeout(700)
+    assert len(config_posts) == 1
+
+    # Invalid payload: the server rejects it and leaves config untouched.
+    page.set_input_files(
+        "#settingsImportInput",
+        {
+            "name": "bad.json",
+            "mimeType": "application/json",
+            "buffer": json.dumps({"classification_threshold": "not a number"}).encode(),
+        },
+    )
+    page.wait_for_timeout(300)
+    with page.expect_response(
+        lambda r: r.url.endswith("/api/settings/import") and r.status == 400
+    ):
+        held[0].continue_()
+
+    # The dropped 'lower' edit is re-queued and persists.
+    expect(status).to_have_attribute("data-state", "saved", timeout=10_000)
+    assert len(config_posts) >= 2
+    expect(page.locator("#cfgKeywordCase")).to_have_value("lower")
+    cfg = page.request.get(f"{url}/api/config").json()
+    assert cfg["keyword_case"] == "lower"

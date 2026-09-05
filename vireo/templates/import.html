@@ -1187,7 +1187,7 @@ function renderImportDestModes() {
     // this host") could turn a deleted target into a different NAS path
     // while keeping remote mode selected, so that case falls through to
     // the visible selection-lost fallback instead.
-    const same = migratedRemoteTarget(prevTarget, importRemoteTargets);
+    const same = migratedRemoteTarget(prevTarget, importRemoteTargets, _previousRemoteTargets);
     if (same) {
       sel.value = 'remote:' + same.id;
       restored = true;
@@ -1207,10 +1207,17 @@ function renderImportDestModes() {
 // The refreshed entry that is unambiguously the same target as ``prev``
 // under a different id, or null. Shared by the direct-SSH destination
 // dropdown and the chained-move target select.
-function migratedRemoteTarget(prev, targets) {
+// A migration is: the old id vanished and exactly one *new* id appeared
+// with the same connection tuple. A tuple twin that already existed
+// before the refresh (same NAS path under a different port/key/mount) is
+// a different target, not a migration — treating it as one would keep a
+// selection pointing at a configuration the user never chose.
+function migratedRemoteTarget(prev, targets, previousTargets) {
   if (!prev) return null;
+  const known = new Set((previousTargets || []).map((t) => t.id));
   const matches = targets.filter(
-    (t) => t.id !== prev.id && t.user === prev.user && t.host === prev.host
+    (t) => t.id !== prev.id && !known.has(t.id)
+      && t.user === prev.user && t.host === prev.host
       && t.remote_path === prev.remote_path);
   return matches.length === 1 ? matches[0] : null;
 }
@@ -1971,7 +1978,7 @@ function updateAfterMoveUI() {
     // local copies, so uncheck it and say why.
     const prevTarget = _previousRemoteTargets.find((t) => t.id === previous)
       || importRemoteTargets.find((t) => t.id === previous) || null;
-    const same = migratedRemoteTarget(prevTarget, eligible);
+    const same = migratedRemoteTarget(prevTarget, eligible, _previousRemoteTargets);
     if (same) {
       sel.value = same.id;
     } else if (chk.checked) {

@@ -17744,7 +17744,8 @@ def test_import_page_after_move_eligibility_requires_existing_root(
     # server resolves every field), and a selected SSH destination follows
     # a legacy id change by connection tuple instead of dropping to Local.
     assert "return JSON.stringify(t, Object.keys(t).sort());" in html
-    assert "function migratedRemoteTarget(prev, targets)" in html
+    assert "function migratedRemoteTarget(prev, targets, previousTargets)" in html
+    assert "!known.has(t.id)" in html
     assert html.count("migratedRemoteTarget(") >= 3
     assert '"Then move to NAS" was unchecked: ' in html
     assert "t.remote_path === prev.remote_path" in html

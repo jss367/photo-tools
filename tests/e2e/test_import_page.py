@@ -2938,6 +2938,51 @@ def test_import_after_move_target_pick_survives_refresh_or_unchecks(
     expect(page.locator("#afterMovePreview")).to_contain_text("/volume1/Photography")
 
 
+def test_import_remote_selection_does_not_migrate_to_preexisting_twin(
+    live_server, page,
+):
+    """Two saved targets can share user/host/remote_path (different port or
+    key). Deleting the selected one must not hand the selection to its
+    pre-existing twin as if it were an id migration; a migration is a
+    *new* id replacing the old one."""
+    url = live_server["url"]
+    state = {"keep_a": True}
+
+    def target(tid, port):
+        return {
+            "id": tid, "name": "NAS " + tid, "user": "photo", "host": "nas.local",
+            "port": port, "remote_path": "/volume1/Photography",
+            "mount_path": "/Volumes/Photography",
+            "local_archive_root": "", "local_archive_root_present": None,
+        }
+
+    def remote_targets(route):
+        targets = ([target("a", 22)] if state["keep_a"] else []) + [target("b", 2222)]
+        route.fulfill(
+            status=200, content_type="application/json",
+            body=json.dumps({"rsync_available": True, "ssh_available": True,
+                             "targets": targets}),
+        )
+
+    page.route("**/api/remote-targets", remote_targets)
+    page.goto(f"{url}/import")
+    _suppress_auto_preview(page)
+
+    page.locator("#modeCopy").check()
+    page.locator("#sourceInput").fill("/tmp/card-a")
+    page.locator("#btnAddSource").click()
+    page.locator("#destMode").select_option("remote:a")
+    page.locator("#remoteSubpath").fill("2026/kenya")
+
+    state["keep_a"] = False
+    page.evaluate("() => document.dispatchEvent(new Event('visibilitychange'))")
+
+    expect(page.locator("#destMode")).to_have_value("local", timeout=10000)
+    banner = page.locator("#remoteTargetsError")
+    expect(banner).to_be_visible()
+    expect(banner).to_contain_text('"NAS a" is no longer configured')
+
+
 def test_import_new_workspace_shows_target_default_in_after_import_display(
     live_server, page
 ):

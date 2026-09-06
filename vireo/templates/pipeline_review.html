@@ -6763,7 +6763,13 @@ function buildPipelineMetadataHtml(photo) {
   var conflictBurst = conflictEnc && conflictEnc.bursts &&
     conflictEnc.bursts[grmState.burstIdx];
   var conflictExpected = speciesCandidateForReviewUnit(conflictEnc, conflictBurst);
-  var speciesConflict = analyzePhotoSpeciesConflict(photo, conflictExpected);
+  // Same expected identity the card behind this modal used: without the
+  // review unit's own candidate key, an encounter holding two identified taxa
+  // that share a display name falls back to the ambiguous "name:" key, and
+  // the modal would read that as agreement while the card reads a conflict.
+  var speciesConflict = analyzePhotoSpeciesConflict(
+    photo, conflictExpected, null,
+    speciesCandidateKeyForReviewUnit(conflictEnc, conflictBurst, conflictExpected));
   if (speciesConflict && speciesConflict.severity) {
     var conflictHeading = speciesConflict.severity === 'strong'
       ? 'Strong classification conflict'

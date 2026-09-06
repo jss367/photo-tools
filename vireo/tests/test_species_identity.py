@@ -715,3 +715,44 @@ def test_same_name_fold_does_not_hide_a_different_species(db, tmp_path):
     evidence = _review_conflict(data, LILAC["common_name"])
     assert evidence["severity"] == "strong"
     assert evidence["alternativeSpecies"] == BROWED["common_name"]
+
+
+def test_group_review_modal_reads_the_same_conflict_as_the_card(db, tmp_path):
+    """The modal and the photo card behind it must agree. The modal has to
+    resolve the review unit's own species key to do that: an encounter holding
+    two identified taxa that share one display name leaves ``species_identities``
+    on the ambiguous ``name:`` fallback, which the modal would otherwise read as
+    agreement while the card reads a conflict.
+    """
+    from encounters import encounter_species_label
+    from pipeline import attach_species_identities, serialize_results
+
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("Node is required to execute the review comparison")
+    display = "Sharedus species"
+    db.conn.execute("UPDATE taxa SET name = ?, common_name = NULL WHERE inat_id IN (18976, 18997)", (display,))
+    for i, tid in enumerate((18976, 18997)):
+        _, det = _photo(db, tmp_path, f"modal-homonym-{i}.jpg")
+        db.add_prediction(det, display, .99, "BioCLIP", labels_fingerprint="custom", taxonomy={"taxon_id": tid})
+    photos = load_photo_features(db)
+    data = serialize_results({"photos": photos, "summary": {}, "encounters": [
+        {"photos": photos, "species": encounter_species_label(photos), "bursts": [photos]},
+    ]})
+    data = json.loads(json.dumps(data))
+    attach_species_identities(data, SpeciesResolver(db=db))
+    # The shared name itself cannot identify either taxon.
+    assert data["species_identities"][display]["key"].startswith("name:")
+
+    html = (Path(__file__).parents[1] / "templates/pipeline_review.html").read_text()
+    helpers = html[html.index("var SPECIES_CONFLICT_THRESHOLDS"):html.index("function buildSpeciesConflictEvidence")]
+    modal_start = html.index("var conflictEnc = pipelineResults")
+    modal = html[modal_start:html.index("  // Species predictions:", modal_start)]
+    script = ("var pipelineResults = " + json.dumps(data) + ";\n"
+              + "var grmState = {encIdx: 0, burstIdx: 0};\n"
+              + "var photo = pipelineResults.photos[1];\n"
+              + "function escapeHtml(s) { return String(s); }\n"
+              + "function formatSpeciesConfidence(v) { return Math.round(v * 100) + '%'; }\n"
+              + helpers + "\nvar html = '';\n" + modal + "\nprocess.stdout.write(html);")
+    result = subprocess.run([node, "-e", script], capture_output=True, text=True, check=True, timeout=15)
+    assert "Strong classification conflict" in result.stdout

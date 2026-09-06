@@ -240,6 +240,22 @@ def _write_photo_sync(db, photo_id, xmp_path, plan):
 _MAX_REPORTED_FAILURE_REASONS = 5
 
 
+def _failure_reason(exc):
+    """Path-free failure cause for grouping identical failures across photos.
+
+    ``str(OSError)`` renders as ``[Errno 13] Permission denied: '/path/to.xmp'``
+    -- the trailing per-file path makes every entry unique, so counting raw
+    error strings would turn one NAS-wide EACCES into thousands of distinct
+    ``(1 photo)`` reasons and defeat the summary. Rebuild the message from
+    ``errno`` / ``strerror`` so the per-photo path drops out.
+    """
+    if isinstance(exc, OSError) and exc.strerror:
+        if exc.errno is not None:
+            return f"[Errno {exc.errno}] {exc.strerror}"
+        return exc.strerror
+    return str(exc)
+
+
 def _sync_result(synced, failures):
     """Build the sync result, telling the job layer whether it actually worked.
 
@@ -248,10 +264,10 @@ def _sync_result(synced, failures):
     "failed", not "completed", so the UI cannot report success over a NAS
     that rejected every write.
     """
-    counts = Counter(f["error"] for f in failures)
+    counts = Counter(f.get("reason") or f["error"] for f in failures)
     reasons = [
-        f"{error} ({count} photo{'s' if count != 1 else ''})"
-        for error, count in counts.most_common(_MAX_REPORTED_FAILURE_REASONS)
+        f"{reason} ({count} photo{'s' if count != 1 else ''})"
+        for reason, count in counts.most_common(_MAX_REPORTED_FAILURE_REASONS)
     ]
     remaining = len(counts) - len(reasons)
     if remaining > 0:
@@ -303,16 +319,24 @@ def sync_to_xmp(db, progress_callback=None, change_ids=None):
         # Check if the folder exists (NAS might be offline)
         folder = os.path.dirname(xmp_path)
         if not os.path.isdir(folder):
-            failures.append(
-                {"photo_id": photo_id, "error": f"folder not accessible: {folder}"}
-            )
+            failures.append({
+                "photo_id": photo_id,
+                "error": f"folder not accessible: {folder}",
+                # Strip the per-folder path so many photos on an offline NAS
+                # summarise as one cause instead of one per subfolder.
+                "reason": "folder not accessible",
+            })
             continue
 
         try:
             plan = _plan_photo_sync(photo_changes, sync_flags, sync_locations)
             _write_photo_sync(db, photo_id, xmp_path, plan)
         except Exception as e:
-            failures.append({"photo_id": photo_id, "error": str(e)})
+            failures.append({
+                "photo_id": photo_id,
+                "error": str(e),
+                "reason": _failure_reason(e),
+            })
             log.warning("Failed to sync photo %d: %s", photo_id, e)
         else:
             if plan.supported_ids:

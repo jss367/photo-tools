@@ -1116,3 +1116,52 @@ def test_sync_failure_reasons_are_deduplicated(tmp_path, monkeypatch):
     assert result["ok"] is False
     assert len(result["errors"]) == 1
     assert "(3 photos)" in result["errors"][0]
+
+
+def test_sync_failure_reason_ignores_per_photo_filename(tmp_path, monkeypatch):
+    """One NAS-wide EACCES on many sidecars must collapse to one reason.
+
+    ``str(OSError)`` appends the offending filename
+    (``[Errno 13] Permission denied: '/path/to/DSC_0001.xmp'``), so counting
+    raw error strings would treat every per-photo failure as a distinct
+    reason and reduce the summary back to one-line-per-photo. The summary
+    must strip the filename so the count captures the whole batch under one
+    cause.
+    """
+    import xmp as xmp_module
+    from db import Database
+    from sync import sync_to_xmp
+
+    db = Database(str(tmp_path / "test.db"))
+    db.set_active_workspace(db.ensure_default_workspace())
+    pids = []
+    for i in range(4):
+        pid, _ = _setup_photo_with_xmp(tmp_path / f"lot{i}", db)
+        db.queue_change(pid, 'keyword_add', 'Test')
+        pids.append(pid)
+
+    def refuse_with_filename(xmp_path, *args, **kwargs):
+        raise PermissionError(13, "Permission denied", xmp_path)
+
+    monkeypatch.setattr(xmp_module, "write_sidecar", refuse_with_filename)
+    monkeypatch.setattr("sync.write_sidecar", refuse_with_filename)
+
+    result = sync_to_xmp(db)
+
+    assert result["synced"] == 0
+    assert result["failed"] == len(pids)
+    assert result["ok"] is False
+    # Sanity: the underlying per-photo error strings really do differ.
+    raw_errors = {f["error"] for f in result["failures"]}
+    assert len(raw_errors) == len(pids), raw_errors
+    # The summary collapses them to one cause and reports the full count.
+    assert len(result["errors"]) == 1, result["errors"]
+    reason = result["errors"][0]
+    assert "Permission denied" in reason
+    assert f"({len(pids)} photos)" in reason
+    # And it names the cause without leaking any per-photo path.
+    for f in result["failures"]:
+        # Each failure keeps its raw path-bearing error for the detail log,
+        # but the summary line must not include the specific filename.
+        assert f["error"] != reason
+        assert ".xmp" not in reason

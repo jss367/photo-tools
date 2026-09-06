@@ -4079,3 +4079,113 @@ def test_post_loop_trim_quota_refresh_covers_pre_existing_overshoot(
         "raised quota accommodates the batch; the added capacity "
         "would remain unused"
     )
+
+
+def test_post_loop_trim_quota_refresh_runs_under_publication_guard(
+    tmp_path, monkeypatch,
+):
+    """Trim's quota refresh must be atomic with the settings-side clear.
+
+    Regression for a P2 codex review finding on PR #1607 against
+    ``83a88bf6``: even with the refresh in place, if it runs OUTSIDE
+    ``working_copy_publication_guard``, a quota raise landing between
+    the refresh and the guard acquisition lets
+    ``_settings_post_save_side_effects`` complete its marker clear
+    first. The trim then holds the stale lower ceiling, deletes files
+    and re-stamps markers on rows the user's raise was meant to cover.
+    The refresh has to happen INSIDE the guard so the read and the
+    trim decision are atomic with the settings-side clear.
+
+    Asserts ``_eviction_lock._is_owned()`` at the moment
+    ``_configured_quota_mb`` is called during the trim — that fails
+    when the refresh runs outside the guard.
+    """
+    import config as cfg
+    import working_copy_cache
+    from db import Database
+    from scanner import _extract_working_copies
+
+    monkeypatch.setattr(cfg, "CONFIG_PATH", str(tmp_path / "config.json"))
+    cfg.save({
+        **cfg.DEFAULTS,
+        "working_copy_max_size": 1000,
+        "working_copy_quality": 90,
+        "working_copy_cache_max_mb": 1,
+    })
+
+    folder = tmp_path / "photos"
+    folder.mkdir()
+    vireo_dir = tmp_path / "vireo"
+    vireo_dir.mkdir()
+    (vireo_dir / "working").mkdir()
+    db = Database(str(vireo_dir / "test.db"))
+    folder_id = db.add_folder(str(folder))
+
+    imported_ids = []
+    for i in range(10):
+        src = folder / f"photo-{i:02d}.jpg"
+        _make_jpeg(str(src), 2000, 1500)
+        imported_ids.append(
+            _photo_id_of_file(db, folder_id, f"photo-{i:02d}.jpg", src)
+        )
+    db.conn.close()
+
+    import scanner as _scanner_mod
+
+    def fixed_extract(_source, output, **_kwargs):
+        with open(output, "wb") as handle:
+            handle.truncate(110 * 1024)
+        return True
+
+    monkeypatch.setattr(
+        _scanner_mod, "extract_working_copy", fixed_extract,
+    )
+
+    # ``cfg.load`` is called by ``_configured_quota_mb``. Hook it to
+    # record whether the eviction lock is held at call time. During
+    # the batch loop, several unrelated cfg reads happen — narrow to
+    # the post-loop trim by dropping calls that occur before every
+    # extract has been written.
+    real_load = cfg.load
+    batch_writes = {"count": 0, "expected": len(imported_ids)}
+    lock_held_when_refreshed = []
+
+    def counting_extract(source, output, **kwargs):
+        batch_writes["count"] += 1
+        return fixed_extract(source, output, **kwargs)
+
+    monkeypatch.setattr(
+        _scanner_mod, "extract_working_copy", counting_extract,
+    )
+
+    def spy_load(*args, **kwargs):
+        if batch_writes["count"] >= batch_writes["expected"]:
+            lock_held_when_refreshed.append(
+                working_copy_cache._eviction_lock._is_owned()
+            )
+        return real_load(*args, **kwargs)
+
+    monkeypatch.setattr(cfg, "load", spy_load)
+
+    verify_db = Database(str(vireo_dir / "test.db"))
+    _extract_working_copies(verify_db, str(vireo_dir))
+    verify_db.conn.close()
+
+    assert lock_held_when_refreshed, (
+        "expected the trim's ``_configured_quota_mb`` call to reach "
+        "``cfg.load`` after all batch writes completed"
+    )
+    # The trim's refresh is the FIRST cfg.load after the batch loop
+    # completes (before ``evict_if_over_quota`` and any later
+    # per-request reads). Under the fix, that call has the lock held;
+    # without the fix, the lock is NOT held on that first call.
+    # Later calls come from ``evict_if_over_quota`` and other paths
+    # that legitimately don't take the guard, so we only check the
+    # first.
+    assert lock_held_when_refreshed[0], (
+        "trim's quota refresh ran OUTSIDE "
+        "``working_copy_publication_guard`` — a settings-side marker "
+        "clear racing between the refresh and the trim's guard "
+        "acquisition would then re-stamp fresh markers on rows the "
+        f"user's raise was meant to cover: {lock_held_when_refreshed!r}"
+    )

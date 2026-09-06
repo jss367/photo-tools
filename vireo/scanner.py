@@ -2503,25 +2503,26 @@ def _extract_working_copies(db, vireo_dir, progress_callback=None,
         # capacity the user just added sits unused until some later quota or
         # source-mtime change unblocks those rows. The mid-batch stop path
         # already re-reads for exactly this reason.
-        refreshed_quota_mb = _configured_quota_mb()
-        if refreshed_quota_mb > 0:
-            quota_bytes = max(0, refreshed_quota_mb) * 1024 * 1024
-        batch_over = existing_bytes + batch_bytes - quota_bytes
-        if batch_over > 0:
-            # Serialize the unlink and the deferred-marker UPDATE with
-            # ``working_copy_publication_guard`` — the same lock quota
-            # eviction takes. Without it, a competing publisher (on-
-            # demand render, id reuse) can atomically write ``wc_abs``
-            # between our unlink and our UPDATE; the ``id + path``
-            # predicate then matches the newly-committed replacement
-            # and we would clear its ``working_copy_path`` and stamp
-            # ``working_copy_evicted_mtime``, silently suppressing the
-            # replacement's own backfill until its source mtime or the
-            # quota changes.
-            from working_copy_cache import (
-                _file_identity as _trim_file_identity,
-            )
-            with working_copy_publication_guard():
+        #
+        # The re-read has to run INSIDE ``working_copy_publication_guard``
+        # for the same reason. ``_settings_post_save_side_effects``
+        # takes that same lock to clear its capacity markers on a
+        # quota raise; a re-read outside the guard could still see the
+        # stale lower value if the raise lands between our read and
+        # our guard acquisition — the settings-side clear would then
+        # complete first, and this trim would delete files and re-
+        # stamp markers on rows the user's raise was meant to cover.
+        # Take the guard, refresh, decide, and act — all atomic with
+        # the settings-side clear.
+        from working_copy_cache import (
+            _file_identity as _trim_file_identity,
+        )
+        with working_copy_publication_guard():
+            refreshed_quota_mb = _configured_quota_mb()
+            if refreshed_quota_mb > 0:
+                quota_bytes = max(0, refreshed_quota_mb) * 1024 * 1024
+            batch_over = existing_bytes + batch_bytes - quota_bytes
+            if batch_over > 0:
                 for path, size in sorted(
                     list(retained_new_files.items()),
                     key=lambda kv: _wc_id_from_batch_path(kv[0]),

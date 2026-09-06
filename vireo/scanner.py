@@ -1864,25 +1864,36 @@ def _extract_working_copies(db, vireo_dir, progress_callback=None,
                 fingerprint_mismatched = False
                 if not os.path.isfile(wc_abs):
                     publication_lost = True
-                else:
-                    published_identity = (
-                        captured_wc_identity[-1]
-                        if captured_wc_identity
-                        else None
-                    )
-                    if published_identity is not None:
-                        try:
-                            current_identity = _wc_file_identity(
-                                os.stat(wc_abs)
-                            )
-                        except OSError:
-                            current_identity = None
-                        if (
-                            current_identity is None
-                            or current_identity != published_identity
-                        ):
-                            fingerprint_mismatched = True
-                            publication_lost = True
+                elif captured_wc_identity:
+                    # ``on_publish`` fires from INSIDE extract's own
+                    # guard, so a non-``None`` entry is the ground-
+                    # truth fingerprint of the bytes extract just
+                    # atomically wrote. Verify it matches what is on
+                    # disk now — a stale extractor for the previous
+                    # owner of a recycled id could have atomically
+                    # replaced ``wc_abs`` between extract's guard
+                    # release and this reacquire, and we would
+                    # otherwise commit their pixels to the current
+                    # row. When the sink's last entry is ``None``
+                    # (the guarded stat itself failed inside
+                    # extract's guard) we have no proof of ownership
+                    # either — same treatment as the trim
+                    # revalidation for ``expected_identity is None``:
+                    # don't trust what we can't prove.
+                    published_identity = captured_wc_identity[-1]
+                    try:
+                        current_identity = _wc_file_identity(
+                            os.stat(wc_abs)
+                        )
+                    except OSError:
+                        current_identity = None
+                    if (
+                        published_identity is None
+                        or current_identity is None
+                        or current_identity != published_identity
+                    ):
+                        fingerprint_mismatched = True
+                        publication_lost = True
                 if publication_lost:
                     pass
                 else:

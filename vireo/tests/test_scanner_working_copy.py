@@ -4890,3 +4890,81 @@ def test_orphan_cleanup_unlinks_stale_bytes_over_replacement_row(
         "its next pass and Row_B's next request re-backfill: "
         f"wc_abs still contains {wc_abs.stat().st_size} bytes"
     )
+
+
+def test_success_update_rejects_publication_with_none_fingerprint(
+    tmp_path, monkeypatch,
+):
+    """Success UPDATE must reject a publish whose captured fingerprint is None.
+
+    Regression for a P1 codex finding on PR #1607 against ``1c96e9f4``.
+    The earlier fingerprint check only fired when
+    ``captured_wc_identity[-1] is not None``. But ``_capture_wc_identity``
+    at ~scanner.py:1696 catches ``os.stat``'s ``OSError`` and appends
+    ``None`` to the sink — so the sink can legitimately have entries
+    that don't prove ownership. In that case the old check fell through
+    and the UPDATE committed ``working_copy_path=wc_rel`` even though
+    we had no fingerprint proof the bytes on disk are ours; a stale
+    extractor for the previous owner of a recycled id could have
+    atomically replaced ``wc_abs`` between publish and this reacquire
+    and its pixels would be attached to the current row.
+
+    Fix: when the sink has entries AND the last entry is ``None``,
+    treat as ``publication_lost`` (same treatment the trim
+    revalidation uses for ``expected_identity is None``). Empty sinks
+    (extract never wired ``on_publish``) stay on the pre-check path
+    for test compatibility.
+
+    Setup: custom ``extract_working_copy`` writes the file normally
+    but calls ``on_publish`` with a non-existent path so
+    ``_capture_wc_identity``'s stat fails and appends ``None`` —
+    exactly the state scanner records when ``on_publish``'s guarded
+    stat fails.  Assert the row's ``working_copy_path`` is still NULL
+    after the run.
+    """
+    import scanner as _scanner_mod
+
+    app, vireo_dir, ids = _prepare_backfill_app(
+        tmp_path, monkeypatch, ["target.jpg"],
+    )
+    target_id = ids[0]
+
+    def none_fingerprint_extract(
+        source, output, on_publish=None, **_kwargs,
+    ):
+        os.makedirs(os.path.dirname(output), exist_ok=True)
+        with open(output, "wb") as handle:
+            handle.truncate(110 * 1024)
+        if on_publish is not None:
+            # Force ``_capture_wc_identity`` to append ``None`` to
+            # its sink — the same state scanner records when the
+            # guarded stat inside the callback fails.
+            on_publish("/vireo/nonexistent/on-publish-stat-failed")
+        return True
+
+    monkeypatch.setattr(
+        _scanner_mod, "extract_working_copy", none_fingerprint_extract,
+    )
+
+    app._kickoff_working_copy_backfill()
+    job = _wait_for_backfill_terminal(app._job_runner)
+    assert job["status"] == "completed", f"job: {job}"
+
+    from db import Database
+    db_path = app.config["DB_PATH"]
+    verify_db = Database(db_path)
+    row = verify_db.conn.execute(
+        "SELECT working_copy_path FROM photos WHERE id=?",
+        (target_id,),
+    ).fetchone()
+    verify_db.conn.close()
+
+    assert row is not None, "target row disappeared during the run"
+    assert row["working_copy_path"] is None, (
+        "the success UPDATE committed ``working_copy_path=wc_rel`` "
+        "even though the fingerprint captured under extract's guard "
+        "was ``None`` — with no proof the bytes on disk are ours, a "
+        "stale extractor could have atomically replaced ``wc_abs`` "
+        "and the row would now serve their pixels: "
+        f"working_copy_path={row['working_copy_path']!r}"
+    )

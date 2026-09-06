@@ -905,8 +905,9 @@ def test_species_confirm_grouping_edit_stores_snapshot_outside_row(app_and_db):
     })
     assert response.status_code == 200, response.get_json()
     rows = _grouping_rows(db)
-    if not rows:
-        pytest.skip('this seed did not auto-detach; covered by the detach tests')
+    # The photo edit plus the burst-override write must be recorded as one
+    # pipeline_grouping row; a skip here would hide that conversion regressing.
+    assert rows
     for row in rows:
         meta = json.loads(row['new_value'])
         assert 'before' not in meta and 'after' not in meta

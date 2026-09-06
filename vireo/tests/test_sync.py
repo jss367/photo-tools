@@ -1557,3 +1557,81 @@ def test_sync_serializes_case_variant_sidecars_without_merging_them(tmp_path):
     # And each photo's change reached the path that photo names.
     assert "Osprey" in read_keywords(mixed_path)
     assert "Kestrel" in read_keywords(upper_path)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="symlink creation needs elevation")
+def test_sync_serializes_photos_whose_sidecars_are_symlinked_together(tmp_path):
+    """A sidecar that is a symlink to another photo's sidecar is one file.
+
+    These two paths differ in basename, so grouping puts them in different
+    buckets and the pool runs them concurrently -- but ``_write_tree_atomic``
+    resolves the link before replacing, so both publish over the same file.
+    Without the per-target lock each editor parses the pre-change tree and
+    the last writer discards the other photo's keyword while both report
+    synced.
+    """
+    import time
+
+    import xmp as xmp_module
+    from db import Database
+    from sync import sync_to_xmp
+    from xmp import read_keywords
+
+    db = Database(str(tmp_path / "test.db"))
+    db.set_active_workspace(db.ensure_default_workspace())
+    target_id, target_xmp = _setup_photo_with_xmp(tmp_path, db)
+    folder = os.path.dirname(target_xmp)
+    folder_id = db.get_photo(target_id)["folder_id"]
+    link_id = db.add_photo(folder_id=folder_id, filename="hawk.jpg",
+                           extension=".jpg", file_size=100, file_mtime=1.0)
+    os.symlink(target_xmp, os.path.join(folder, "hawk.xmp"))
+
+    db.queue_change(target_id, "keyword_add", "Osprey")
+    db.queue_change(link_id, "keyword_add", "Kestrel")
+
+    # Widen the window between parse and publish so an unserialized run
+    # would reliably lose one of the two keywords.
+    original = xmp_module._write_tree_atomic
+
+    def slow_publish(tree, path):
+        time.sleep(0.05)
+        return original(tree, path)
+
+    xmp_module._write_tree_atomic = slow_publish
+    try:
+        result = sync_to_xmp(db)
+    finally:
+        xmp_module._write_tree_atomic = original
+
+    assert result["synced"] == 2, result["errors"]
+    assert read_keywords(target_xmp) == {"Osprey", "Kestrel"}
+
+
+def test_sync_reports_a_malformed_queue_row_without_aborting_the_run(tmp_path):
+    """One unplannable photo fails alone; the rest of the run still writes.
+
+    ``_plan_photo_sync`` calls ``int(value)`` for a rating, and the schema
+    permits a NULL or non-numeric value. Planning moved out of the per-photo
+    try when the writes were hoisted onto a pool, which let one legacy row
+    abort every other photo's sidecar.
+    """
+    from db import Database
+    from sync import sync_to_xmp
+    from xmp import read_keywords
+
+    db = Database(str(tmp_path / "test.db"))
+    db.set_active_workspace(db.ensure_default_workspace())
+    bad_id, _ = _setup_photo_with_xmp(tmp_path / "bad", db)
+    good_id, good_xmp = _setup_photo_with_xmp(tmp_path / "good", db)
+    db.queue_change(bad_id, "rating", "not-a-number")
+    db.queue_change(good_id, "keyword_add", "Osprey")
+
+    result = sync_to_xmp(db)
+
+    assert result["synced"] == 1
+    assert result["failed"] == 1
+    assert result["ok"] is False
+    assert result["failures"][0]["photo_id"] == bad_id
+    assert read_keywords(good_xmp) == {"Osprey"}
+    # The good photo's row is retired; the malformed one stays queued.
+    assert [c["photo_id"] for c in db.get_pending_changes()] == [bad_id]

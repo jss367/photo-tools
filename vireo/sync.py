@@ -2,6 +2,7 @@
 
 import logging
 import os
+import threading
 from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
@@ -382,7 +383,20 @@ def sync_to_xmp(db, progress_callback=None, change_ids=None):
             }
             continue
 
-        plans[photo_id] = _plan_photo_sync(photo_changes, sync_flags, sync_locations)
+        try:
+            plans[photo_id] = _plan_photo_sync(
+                photo_changes, sync_flags, sync_locations,
+            )
+        except Exception as e:
+            # A malformed queue row -- a rating whose value is NULL or not an
+            # integer, which the schema permits -- must fail its own photo, as
+            # it did when planning ran inside the per-photo try, rather than
+            # abort every other photo's write.
+            prepare_failures[photo_id] = {
+                "photo_id": photo_id,
+                "error": str(e),
+                "reason": _failure_reason(e),
+            }
 
     locations = {}
     if sync_locations:
@@ -430,14 +444,40 @@ def sync_to_xmp(db, progress_callback=None, change_ids=None):
         )
         by_sidecar[canonical_key].append((photo_id, xmp_path))
 
+    sidecar_locks = {}
+    sidecar_locks_guard = threading.Lock()
+
+    def lock_for(xmp_path):
+        """Return the lock guarding whatever file ``xmp_path`` resolves to.
+
+        Grouping keys on the folder and basename, which catches the aliases
+        that arise from the catalog itself -- a RAW and a JPEG, case variants,
+        a symlinked folder. It cannot catch a sidecar path that is itself a
+        symlink to a different photo's sidecar: those basenames differ, so the
+        two land in different groups and run on different workers, while
+        ``_write_tree_atomic`` resolves the link and replaces the same file.
+        Resolving here costs nothing the publish was not already paying (it
+        resolves too) and it happens on the pool thread, not in the serial
+        prepare loop.
+        """
+        key = os.path.normcase(os.path.realpath(xmp_path))
+        with sidecar_locks_guard:
+            lock = sidecar_locks.get(key)
+            if lock is None:
+                lock = sidecar_locks[key] = threading.Lock()
+        return lock
+
     def write_sidecar_group(canonical_key):
         """Write every photo queued against one sidecar; never raises."""
         outcomes = {}
         for photo_id, xmp_path in by_sidecar[canonical_key]:
             try:
-                _write_photo_sync(
-                    xmp_path, plans[photo_id], locations.get(photo_id),
-                )
+                # One lock at a time and never nested, so no worker can
+                # deadlock against another.
+                with lock_for(xmp_path):
+                    _write_photo_sync(
+                        xmp_path, plans[photo_id], locations.get(photo_id),
+                    )
             except Exception as e:  # recorded per photo, as before
                 outcomes[photo_id] = e
             else:

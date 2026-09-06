@@ -169,9 +169,16 @@ async function checkPendingSync() {
     var banner = document.getElementById('syncBanner');
     if (data.pending_count > 0) {
       var status = document.getElementById('syncStatus');
-      if (status.textContent === 'Synced!') {
+      // A stale success message ("Synced!", "Synced N photos!" from a
+      // partial run that left the unchecked change types queued, or
+      // "Nothing to sync." from a run that found nothing when there is
+      // now something) alongside a nonzero pending count reads as a UI
+      // bug. Match the state we set on the element, not the specific
+      // words, so future copy changes cannot desync this check.
+      if (status.dataset.syncState === 'success') {
         status.textContent = '';
         status.style.color = 'var(--text-dim)';
+        status.dataset.syncState = '';
       }
       document.getElementById('syncBannerText').textContent =
         data.pending_count.toLocaleString() + ' change' + (data.pending_count !== 1 ? 's' : '') +
@@ -188,6 +195,8 @@ async function runSync(changeIds) {
   var status = document.getElementById('syncStatus');
   status.textContent = 'Syncing...';
   status.style.color = 'var(--text-dim)';
+  // Any state from the previous run is now stale.
+  status.dataset.syncState = '';
   try {
     var requestOptions = {method: 'POST'};
     if (Array.isArray(changeIds)) {
@@ -240,26 +249,41 @@ async function runSync(changeIds) {
           if (event.status === 'cancelled') {
             status.textContent = 'Sync cancelled before it reported results.';
             status.style.color = 'var(--text-dim)';
+            status.dataset.syncState = 'cancelled';
           } else {
             status.textContent = 'Sync failed'
               + (why ? ': ' + why : ' (no detail reported)')
               + '. Sidecars already written stay written; everything else '
               + 'stays pending.';
             status.style.color = 'var(--danger)';
+            status.dataset.syncState = 'failure';
           }
         } else if (event.status === 'cancelled') {
-          status.textContent = 'Sync cancelled — ' + synced.toLocaleString() + ' written.';
-          status.style.color = 'var(--text-dim)';
+          // sync_to_xmp() does not poll cancellation inside its per-photo
+          // loop, so a cancel requested mid-run still returns a structured
+          // result and any writes that failed before the cancel took hold
+          // must be surfaced. Reporting only ``N written`` would present a
+          // NAS-wide permission failure as an ordinary cancellation.
+          var cancelledMsg = 'Sync cancelled — ' + synced.toLocaleString() + ' written';
+          if (failed > 0) {
+            cancelledMsg += ', failed on ' + failed.toLocaleString();
+            if (reasons.length) cancelledMsg += ' — ' + reasons[0];
+          }
+          status.textContent = cancelledMsg + '.';
+          status.style.color = failed > 0 ? 'var(--danger)' : 'var(--text-dim)';
+          status.dataset.syncState = failed > 0 ? 'failure' : 'cancelled';
         } else if (failed === 0 && event.status === 'completed') {
           status.textContent = synced > 0
             ? 'Synced ' + synced.toLocaleString() + ' photo' + (synced === 1 ? '' : 's') + '!'
             : 'Nothing to sync.';
           status.style.color = 'var(--accent)';
+          status.dataset.syncState = 'success';
         } else {
           status.textContent = 'Wrote ' + synced.toLocaleString() + ', failed on '
             + failed.toLocaleString() + (reasons.length ? ' — ' + reasons[0] : '')
             + '. Changes stay pending.';
           status.style.color = 'var(--danger)';
+          status.dataset.syncState = 'failure';
         }
         setTimeout(checkPendingSync, 1000);
       },

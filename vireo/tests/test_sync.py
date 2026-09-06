@@ -1217,3 +1217,61 @@ def test_sync_panel_does_not_report_zero_for_a_resultless_failure():
     # One tooltip assignment, so a stale failure detail cannot survive a
     # later clean run and the two sites cannot drift apart.
     assert handler.count("status.title") == 1
+
+
+def test_sync_panel_clears_stale_success_when_pending_remains():
+    """A "Synced N photos!" success stays green until checkPendingSync clears it.
+
+    ``runVisibleSync`` syncs only the checked change types, so the unchecked
+    ones intentionally stay queued. The panel must not leave the green
+    success message next to a nonzero pending count -- the two together read
+    as a UI bug. Match the state we set on the element (``dataset.syncState``)
+    rather than the specific words, so future copy tweaks to the success
+    branch cannot desync the check.
+    """
+    from pathlib import Path
+
+    panel = (Path(__file__).parents[1] / "templates/_sync_panel.html").read_text()
+
+    # The success branches (``Synced!`` / ``Synced N photos!`` /
+    # ``Nothing to sync.``) mark the element as success.
+    complete_handler = panel[panel.index("onComplete: function(event)"):]
+    complete_handler = complete_handler[:complete_handler.index("onError:")]
+    assert "status.dataset.syncState = 'success'" in complete_handler
+
+    # ``checkPendingSync`` clears any stale success when pending remains,
+    # so the marker approach must be used there too. The old literal-text
+    # match (``status.textContent === 'Synced!'``) is gone: it silently
+    # missed the ``Synced N photos!`` case runVisibleSync produces.
+    check_fn = panel[panel.index("async function checkPendingSync"):]
+    check_fn = check_fn[:check_fn.index("async function runSync")]
+    assert "status.dataset.syncState === 'success'" in check_fn
+    assert "status.textContent === 'Synced!'" not in check_fn
+
+
+def test_sync_panel_cancelled_summary_includes_failures():
+    """A cancelled run that already saw failures must surface them.
+
+    ``api_job_sync`` does not poll cancellation inside ``sync_to_xmp``'s
+    per-photo loop, so a cancel requested mid-run still returns a structured
+    result containing both writes and failures while the JobRunner emits
+    ``status: "cancelled"``. Reporting only the written count would present
+    a NAS-wide permission failure as an ordinary cancellation.
+    """
+    from pathlib import Path
+
+    panel = (Path(__file__).parents[1] / "templates/_sync_panel.html").read_text()
+    handler = panel[panel.index("onComplete: function(event)"):]
+    handler = handler[:handler.index("onError:")]
+
+    cancelled = handler[handler.index("event.status === 'cancelled'"):]
+    # Take just the cancelled branch, up to the next ``else if`` / ``else``.
+    cancelled = cancelled[:cancelled.index("} else if (failed === 0")]
+
+    # Both the failed count and the first reason must be reported when
+    # failures occurred before cancellation took hold.
+    assert "failed.toLocaleString()" in cancelled
+    assert "reasons[0]" in cancelled
+    # And the colour must switch to danger so the summary is not read as an
+    # ordinary user-requested cancellation.
+    assert "var(--danger)" in cancelled

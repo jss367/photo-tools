@@ -3784,3 +3784,111 @@ def test_post_loop_trim_verifies_file_identity_before_unlinking(
         "wc_abs was clobbered — trim did not honor the identity check"
     )
     db.close()
+
+
+def test_post_loop_trim_quota_refresh_covers_pre_existing_overshoot(
+    tmp_path, monkeypatch,
+):
+    """Trim's quota re-read must also protect the existing+batch case.
+
+    Complements the batch-alone-overshoots regression from ``28870d3d``.
+    The trim now decides ``batch_over`` in two shapes: the batch's own
+    footprint over quota, OR ``existing + batch`` over quota (small
+    unscoped batch onto a nearly-full cache). The quota re-read has to
+    cover both — otherwise a mid-batch quota raise that lands after the
+    loop's last read still causes the trim to delete a small batch
+    file whose combined footprint now fits.
+    """
+    import config as cfg
+    import working_copy_cache
+    from db import Database
+    from scanner import _extract_working_copies
+
+    monkeypatch.setattr(cfg, "CONFIG_PATH", str(tmp_path / "config.json"))
+    cfg.save({
+        **cfg.DEFAULTS,
+        "working_copy_max_size": 1000,
+        "working_copy_quality": 90,
+        "working_copy_cache_max_mb": 1,
+    })
+
+    folder = tmp_path / "photos"
+    folder.mkdir()
+    vireo_dir = tmp_path / "vireo"
+    vireo_dir.mkdir()
+    working_dir = vireo_dir / "working"
+    working_dir.mkdir()
+    db = Database(str(vireo_dir / "test.db"))
+    folder_id = db.add_folder(str(folder))
+
+    # 850 KB pre-existing coverage against a 1 MB ceiling.
+    existing_src = folder / "existing.jpg"
+    _make_jpeg(str(existing_src), 2000, 1500)
+    existing_id = _photo_id_of_file(
+        db, folder_id, "existing.jpg", existing_src,
+    )
+    existing_wc = working_dir / f"{existing_id}.jpg"
+    with open(existing_wc, "wb") as handle:
+        handle.truncate(850 * 1024)
+    db.conn.execute(
+        "UPDATE photos SET working_copy_path=? WHERE id=?",
+        (f"working/{existing_id}.jpg", existing_id),
+    )
+    db.conn.commit()
+
+    # One 200 KB batch file — below ``incremental_threshold`` so no
+    # mid-batch enforce fires. existing + batch = 1050 KB, 26 KB over.
+    batch_src = folder / "batch.jpg"
+    _make_jpeg(str(batch_src), 2000, 1500)
+    batch_id = _photo_id_of_file(db, folder_id, "batch.jpg", batch_src)
+    db.conn.close()
+
+    import scanner as _scanner_mod
+
+    def small_extract(_source, output, **_kwargs):
+        with open(output, "wb") as handle:
+            handle.truncate(200 * 1024)
+        return True
+
+    monkeypatch.setattr(
+        _scanner_mod, "extract_working_copy", small_extract,
+    )
+
+    # Raise the quota between the loop's end and the trim's re-read.
+    # ``working_copy_stats`` is called only in the trim path (unscoped,
+    # right before the trim's guard block); use it as the injection
+    # point. The re-read must now see 4 MB, batch_over goes negative,
+    # nothing is trimmed.
+    raised = {"done": False}
+    real_stats = working_copy_cache.working_copy_stats
+
+    def raise_quota_then_stats(*args, **kwargs):
+        if not raised["done"]:
+            raised["done"] = True
+            cfg.save({**cfg.load(), "working_copy_cache_max_mb": 4})
+        return real_stats(*args, **kwargs)
+
+    monkeypatch.setattr(
+        working_copy_cache, "working_copy_stats",
+        raise_quota_then_stats,
+    )
+
+    verify_db = Database(str(vireo_dir / "test.db"))
+    _extract_working_copies(verify_db, str(vireo_dir))
+
+    batch_wc = working_dir / f"{batch_id}.jpg"
+    assert batch_wc.exists(), (
+        "trim used a stale (lower) quota and deleted the small batch "
+        "file even though the raised ceiling accommodates existing + "
+        "batch"
+    )
+    row = verify_db.conn.execute(
+        "SELECT working_copy_evicted_mtime FROM photos WHERE id=?",
+        (batch_id,),
+    ).fetchone()
+    verify_db.conn.close()
+    assert row["working_copy_evicted_mtime"] is None, (
+        "trim stamped a capacity-deferred marker even though the "
+        "raised quota accommodates the batch; the added capacity "
+        "would remain unused"
+    )

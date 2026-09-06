@@ -7604,6 +7604,19 @@ if (window.ResizeObserver) {
     keepFocusedCardVisible();
     noteFocusedCardVisibility();
   }).observe(gridContainer);
+
+  // The grid itself can reflow while the viewport keeps its size: the
+  // thumbnail-size slider changes the column count, a stack tray opens, a page
+  // of photos is appended. None of those fire a scroll event, so the sampled
+  // visibility would go stale — false after a reflow carried the card back
+  // into view, true after one carried it away — and the next resize would act
+  // on that stale answer. Re-sample instead; there is nothing to correct,
+  // because the viewport did not move. The size guard inside
+  // noteFocusedCardVisibility keeps this out of the way during a viewport
+  // resize, which the observer above owns.
+  new ResizeObserver(function() {
+    noteFocusedCardVisibility();
+  }).observe(document.getElementById('grid'));
 }
 
 /* ---------- Scroll Position Tracking ---------- */

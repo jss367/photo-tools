@@ -286,3 +286,32 @@ def test_browse_resize_keeps_a_collapsed_stack_cover_visible(live_server, page):
     assert visibility["fullyVisible"] is True, (
         f"the collapsed stack cover left the grid viewport after the resize: {visibility}"
     )
+
+
+def test_browse_thumbnail_size_change_resamples_focus_visibility(live_server, page):
+    # The thumbnail-size slider reflows the grid without changing the viewport's
+    # box. At the top of the grid it does not fire a scroll event either —
+    # there is nothing above the viewport for the browser to anchor — so a
+    # reflow that pulls the selection back into view goes unnoticed and the
+    # sampled visibility stays stale. A later resize would then refuse to keep
+    # a card the user is looking at on screen.
+    page.set_viewport_size({"width": 1400, "height": 900})
+    page.goto(live_server["url"] + "/browse")
+    page.locator(".grid-card").first.wait_for(state="visible")
+
+    slider = page.locator("#thumbSizeSlider")
+    slider.fill("400")  # one column: the last card sits below the fold
+    page.evaluate(SETTLE)
+    cards = page.locator(".grid-card")
+    cards.last.click()
+    page.evaluate("() => { gridContainer.scrollTop = 0; }")
+    page.wait_for_function(SCROLL_SAMPLED)
+    assert page.evaluate(CARD_VISIBILITY)["fullyVisible"] is False
+
+    slider.fill("120")  # six columns: every card fits in the first rows
+    page.evaluate(SETTLE)
+    assert page.evaluate("() => gridContainer.scrollTop") == 0
+    assert page.evaluate(CARD_VISIBILITY)["fullyVisible"] is True
+    assert page.evaluate("focusedCardWasOnScreen") is True, (
+        "a grid-only reflow left the sampled visibility stale"
+    )

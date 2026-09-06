@@ -28216,19 +28216,27 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             image_path = os.path.join(folder["path"], photo["filename"])
 
         if using_working_copy:
-            # Stamp access recency and hold the publication guard across
-            # the decode — same pattern as ``/photos/<id>/original`` and
-            # ``/photos/<id>/edit-preview``. Without this, repeated
-            # interactive crop previews leave the working copy's atime
-            # unchanged and it stays first in the quota eviction queue
-            # even while the user is actively working on the photo. The
-            # guard also prevents ``_evict_once`` from unlinking the
-            # source bytes between the touch and the decode.
+            # Stamp access recency — same pattern as
+            # ``/photos/<id>/original`` and ``/photos/<id>/edit-preview``.
+            # Without this, repeated interactive crop previews leave the
+            # working copy's atime unchanged and it stays first in the
+            # quota eviction queue even while the user is actively
+            # working on the photo.
+            #
+            # Only the touch runs under the guard, and deliberately so.
+            # ``working_copy_publication_guard`` is a process-wide lock
+            # that the quota pass holds across a full scandir of the
+            # cache; holding it across a decode as well would serialize
+            # every interactive image read in the app against every
+            # other one and against eviction, which is exactly the
+            # stall this PR set out to remove. A `utime` under the lock
+            # costs microseconds. If eviction unlinks the file between
+            # the touch and the open, the decode returns None and the
+            # original-source fallback below handles it — that path
+            # already exists for precisely this race.
             with working_copy_publication_guard():
                 touch_working_copy_access(image_path)
-                img = load_image(image_path, max_size=None)
-        else:
-            img = load_image(image_path, max_size=None)
+        img = load_image(image_path, max_size=None)
         if img is None and using_working_copy:
             # Quota enforcement can unlink the working copy after the
             # existence check above but before Pillow opens it. Re-resolve
@@ -28884,32 +28892,33 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 if not source_failure_current:
                     if using_working_copy:
                         # Record access on the working copy whenever we
-                        # read it as an edit-preview source and hold
-                        # the publication guard through touch + decode.
-                        # Without the guard the touch races
-                        # ``_evict_once``'s identity check (which then
-                        # skips this file as "replaced," silently
-                        # overshooting a lowered quota); without the
+                        # read it as an edit-preview source. Without the
                         # touch the interactive editor's repeated
                         # ``/edit-preview`` requests never advance the
-                        # WC's mtime and an actively edited photo stays
-                        # the oldest eviction candidate. Mirrors the
-                        # ``/original`` recipe-render fix and the
-                        # ``_serve_trusted_working_copy`` caller
-                        # contract. The guard is an RLock, so
-                        # reentering it from inside the offline-only
-                        # ``source_guard`` below is safe.
+                        # WC's recency and an actively edited photo
+                        # stays the oldest eviction candidate. The touch
+                        # runs under the guard because it races
+                        # ``_evict_once``'s identity check, which would
+                        # otherwise skip this file as "replaced" and
+                        # silently overshoot a lowered quota.
+                        #
+                        # The decode stays OUTSIDE the guard: it is a
+                        # process-wide lock and the editor fires these
+                        # on every slider move, so holding it across
+                        # Pillow would serialize the whole app's image
+                        # reads behind one preview. If eviction unlinks
+                        # the copy in the exists/open window, ``img`` is
+                        # None and the original-source retry below
+                        # recovers. The offline-only ``source_guard``
+                        # below still wraps the decode for the case
+                        # where the WC is the only local source; the
+                        # guard is an RLock, so the touch reentering it
+                        # from there is safe.
                         with working_copy_publication_guard():
                             touch_working_copy_access(canonical)
-                            img = load_image(
-                                canonical, max_size=load_max_size,
-                                **load_kwargs,
-                            )
-                    else:
-                        img = load_image(
-                            canonical, max_size=load_max_size,
-                            **load_kwargs,
-                        )
+                    img = load_image(
+                        canonical, max_size=load_max_size, **load_kwargs,
+                    )
                 return (
                     canonical, using_working_copy, selected_ext,
                     load_max_size, native_dims, img, source_failure_current,
@@ -29539,10 +29548,16 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             # invalidation (not on identity skips), the settings flow
             # never schedules its background retry and the cache can
             # sit above the requested quota until another write or
-            # restart. Hold the guard through the decode read so the
-            # source bytes we load cannot be unlinked out from under
-            # us either — mirroring ``_serve_trusted_working_copy``'s
-            # caller contract.
+            # restart.
+            #
+            # The decode stays outside the guard. This is the 1:1
+            # pixel-peeping path; the guard is process-wide and the
+            # quota pass holds it across a scandir of the whole cache,
+            # so wrapping a full-resolution Pillow decode in it would
+            # make every zoomed view queue behind every other one.
+            # Leaving the decode unguarded keeps main's behaviour for
+            # the exists/open race (a vanished copy 500s and records a
+            # failure marker) and adds only the touch.
             edit_source_is_working_copy = (
                 trusted_wc_path is not None
                 and image_path == trusted_wc_path
@@ -29550,13 +29565,9 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             if edit_source_is_working_copy:
                 with working_copy_publication_guard():
                     touch_working_copy_access(trusted_wc_path)
-                    img = load_image(
-                        image_path, max_size=None, **load_kwargs,
-                    )
-            else:
-                img = load_image(
-                    image_path, max_size=None, **load_kwargs,
-                )
+            img = load_image(
+                image_path, max_size=None, **load_kwargs,
+            )
             if (
                 img is not None
                 and resolved_ext in RAW_EXTENSIONS

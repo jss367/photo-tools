@@ -13391,3 +13391,71 @@ def test_crop_preview_touches_working_copy_under_guard(
         "edit handoff would treat this as a content change and "
         "overwrite the file the external editor saved into"
     )
+
+
+def test_interactive_render_routes_decode_outside_the_eviction_guard(
+    client_with_photo, monkeypatch,
+):
+    """The render routes stamp under the guard but decode outside it.
+
+    ``working_copy_publication_guard`` is one process-wide ``RLock``,
+    and the quota pass holds it across a ``scandir`` of the whole
+    working-copy cache. Holding it across Pillow decodes as well would
+    serialize every interactive image read — 1:1 zoom, crop previews,
+    edit previews — against each other and against eviction, which is
+    the stall this PR set out to remove. The stamp is a ``utime`` and
+    costs microseconds, so it stays inside; the decode does not.
+
+    ``/crop`` stands in for the shared shape here (``/original``'s
+    recipe branch and ``/edit-preview`` were changed the same way);
+    its transient-miss recovery already re-resolves the original when
+    eviction unlinks the copy in the exists/open window.
+    """
+    import os
+
+    import image_loader
+    import working_copy_cache
+    from PIL import Image
+
+    app, db, photo_id = client_with_photo
+    vireo_dir = os.path.dirname(app.config["THUMB_CACHE_DIR"])
+    working_dir = os.path.join(vireo_dir, "working")
+    os.makedirs(working_dir, exist_ok=True)
+    wc_path = os.path.join(working_dir, f"{photo_id}.jpg")
+    Image.new("RGB", (800, 600), (200, 60, 40)).save(
+        wc_path, "JPEG", quality=90,
+    )
+    db.conn.execute(
+        "UPDATE photos SET working_copy_path=? WHERE id=?",
+        (f"working/{photo_id}.jpg", photo_id),
+    )
+    db.conn.commit()
+
+    lock_held_when_decoded = []
+    real_load_image = image_loader.load_image
+
+    def spy_load_image(path, *args, **kwargs):
+        # The route imports ``load_image`` from ``image_loader`` inside
+        # the request, so patching the module attribute is what the
+        # call actually resolves.
+        if os.path.exists(path) and os.path.samefile(path, wc_path):
+            lock_held_when_decoded.append(
+                working_copy_cache._eviction_lock._is_owned()
+            )
+        return real_load_image(path, *args, **kwargs)
+
+    monkeypatch.setattr(image_loader, "load_image", spy_load_image)
+
+    resp = app.test_client().get(f"/photos/{photo_id}/crop")
+    assert resp.status_code == 200, resp.data
+
+    assert lock_held_when_decoded, (
+        "test setup: the crop route never decoded the working copy"
+    )
+    assert not any(lock_held_when_decoded), (
+        "crop-preview decoded the working copy while holding "
+        "``working_copy_publication_guard``; that lock is process-wide "
+        "and eviction holds it across a full cache scandir, so every "
+        "other interactive image read would queue behind this decode: "
+        f"{lock_held_when_decoded!r}"
+    )

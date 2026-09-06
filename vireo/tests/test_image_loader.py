@@ -1610,31 +1610,25 @@ def test_load_working_image_stamps_when_access_is_recorded(tmp_path):
     )
 
 
-def test_load_working_image_decode_runs_under_guard_when_recording_access(
+def test_load_working_image_decode_is_not_serialized_by_the_eviction_guard(
     tmp_path, monkeypatch,
 ):
-    """The decode and the touch must live inside a single guarded block.
+    """Interactive decodes must not hold the process-wide eviction lock.
 
-    Regression for a P2 codex finding on PR #1607 against ``36a179f7``.
-    The consolidation guarded ``touch_working_copy_access`` but the
-    decode itself ran BEFORE the guard was acquired. Two hazards:
+    ``working_copy_publication_guard`` is a single process-wide
+    ``RLock``, and the quota pass holds it across a ``scandir`` of the
+    entire working-copy cache (measured at 42ms warm / 543ms cold on a
+    17k-file cache, and this backfill exists to grow that cache past
+    70k). Wrapping the decode in it too would make every interactive
+    image read — 1:1 zoom, lightbox prefetch, burst-review sharpness
+    regions — queue behind every other one and behind eviction. That
+    stall is the failure mode this work is meant to remove, so the
+    guard covers the recency stamp only.
 
-    1. Between ``os.path.exists`` and ``_load_standard``, an
-       eviction pass can unlink the working copy, turning an otherwise
-       healthy interactive read into a transient fallback to the
-       source.
-    2. Between the decode and the touch, a competing publisher can
-       atomically replace the canonical path, so
-       ``touch_working_copy_access`` stamps recency onto bytes that
-       were NOT the ones we just decoded — and the decoded image is
-       not the one whose access we are recording.
-
-    The invariant ``_serve_trusted_working_copy`` and the other
-    interactive render routes (``/original``, ``/edit-preview``,
-    ``/crop``) rely on is: the same guard held across existence
-    check, decode, and touch. Assert
-    ``working_copy_cache._eviction_lock._is_owned()`` at the moment
-    the decode runs, when ``record_access=True``.
+    The residual races are benign and pre-existing: an unlink in the
+    exists/open window falls through to the original source, and a
+    publisher replacing the path between decode and touch costs one
+    misattributed stamp on a file that is in active use either way.
     """
     import image_loader
     import working_copy_cache
@@ -1647,30 +1641,50 @@ def test_load_working_image_decode_runs_under_guard_when_recording_access(
     Image.new("RGB", (64, 48), (10, 20, 30)).save(str(wc), "JPEG")
 
     lock_held_when_decoded = []
+    lock_held_when_touched = []
     real_load_standard = image_loader._load_standard
+    real_touch = working_copy_cache.touch_working_copy_access
 
     def spy_load_standard(path, max_size):
+        # ``_eviction_lock`` is an ``RLock``; ``_is_owned`` reports
+        # whether the calling thread already holds it.
         lock_held_when_decoded.append(
             working_copy_cache._eviction_lock._is_owned()
         )
         return real_load_standard(path, max_size)
 
+    def spy_touch(path):
+        lock_held_when_touched.append(
+            working_copy_cache._eviction_lock._is_owned()
+        )
+        return real_touch(path)
+
     monkeypatch.setattr(image_loader, "_load_standard", spy_load_standard)
+    monkeypatch.setattr(
+        working_copy_cache, "touch_working_copy_access", spy_touch,
+    )
 
     photo = {"id": 7, "working_copy_path": "working/7.jpg", "folder_id": 1}
     image = image_loader.load_working_image(
         photo, str(vireo_dir), max_size=32, record_access=True,
     )
+
     assert image is not None
     assert lock_held_when_decoded, (
         "test setup: the decode path was never called; the working "
         "copy may have looked missing"
     )
-    assert all(lock_held_when_decoded), (
-        "``load_working_image(record_access=True)`` decoded the "
-        "working copy OUTSIDE ``working_copy_publication_guard`` — "
-        "an eviction pass unlinking mid-decode or a publisher "
-        "replacing the path between decode and touch would let the "
-        "touch stamp recency onto bytes we never actually read: "
+    assert not any(lock_held_when_decoded), (
+        "``load_working_image(record_access=True)`` decoded the working "
+        "copy while holding ``working_copy_publication_guard``. That "
+        "lock is process-wide and eviction holds it across a full "
+        "cache scandir, so every interactive image read in the app "
+        "would serialize behind it: "
         f"{lock_held_when_decoded!r}"
+    )
+    assert lock_held_when_touched and all(lock_held_when_touched), (
+        "the recency stamp must still run under the guard — an "
+        "unguarded touch races ``_evict_once``'s identity check, which "
+        "then skips the file as replaced and leaves the cache above a "
+        f"lowered quota: {lock_held_when_touched!r}"
     )

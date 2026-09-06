@@ -1,4 +1,5 @@
 """Working copy extraction for large JPEGs."""
+import contextlib
 import os
 
 from PIL import Image
@@ -4368,10 +4369,8 @@ def test_post_loop_trim_revalidates_batch_bytes_under_publication_guard(
             not reclaim["done"]
             and batch_writes["count"] >= batch_writes["expected"]
         ):
-            try:
+            with contextlib.suppress(OSError):
                 os.remove(target_path)
-            except OSError:
-                pass
             reclaim["done"] = True
         with real_guard():
             yield

@@ -1523,6 +1523,7 @@ def _extract_working_copies(db, vireo_dir, progress_callback=None,
     from working_copy_cache import (
         evict_if_over_quota,
         working_copy_publication_guard,
+        working_copy_stats,
     )
 
     quota_bytes = wc_cache_max_mb * 1024 * 1024
@@ -2403,7 +2404,38 @@ def _extract_working_copies(db, vireo_dir, progress_callback=None,
 
     trimmed_ids = []
     if retained_new_files and quota_bytes > 0:
-        batch_over = sum(retained_new_files.values()) - quota_bytes
+        batch_bytes = sum(retained_new_files.values())
+        existing_bytes = 0
+        if scope is None:
+            # Measure what was already cached before this batch. Comparing
+            # only the batch against the whole ceiling reports no overshoot
+            # whenever the batch alone fits — but a sweep landing on a cache
+            # that is already near the ceiling still pushes total usage over
+            # it, and the final pass then pays for the batch's new coverage
+            # with somebody's pre-existing coverage. That is the exact trade
+            # ``displaced_existing`` refuses mid-batch, and it must not sneak
+            # back in after the loop. A batch smaller than
+            # ``incremental_threshold`` never runs the guarded mid-batch
+            # enforcement at all, so this is the only place the guarantee can
+            # be honoured for small sweeps.
+            #
+            # Protecting the batch on the final pass does not achieve this on
+            # its own: it makes pre-existing files the *only* eviction
+            # candidates. The batch has to give up its own lowest-priority
+            # output instead.
+            try:
+                existing_bytes = max(
+                    0, working_copy_stats(vireo_dir)["size"] - batch_bytes,
+                )
+            except Exception:
+                # Accounting failure must not strand the batch; fall back to
+                # the batch-only comparison the trim used before.
+                log.exception(
+                    "Working-copy usage accounting failed; trimming against "
+                    "the batch footprint alone"
+                )
+                existing_bytes = 0
+        batch_over = existing_bytes + batch_bytes - quota_bytes
         if batch_over > 0:
             # Serialize the unlink and the deferred-marker UPDATE with
             # ``working_copy_publication_guard`` — the same lock quota

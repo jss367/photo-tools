@@ -2925,6 +2925,104 @@ def test_orphan_cleanup_preserves_racing_publisher_uncommitted_bytes(
     )
 
 
+def test_small_sweep_near_ceiling_keeps_existing_coverage(
+    tmp_path, monkeypatch,
+):
+    """A library-wide sweep must not buy new coverage with existing coverage.
+
+    ``displaced_existing`` enforces that mid-batch, but a batch smaller than
+    ``incremental_threshold`` never triggers the guarded mid-batch pass at
+    all. The post-loop trim then compared only the batch's own footprint
+    against the whole ceiling, saw no overshoot because the batch alone
+    fits, and left the final ``evict_if_over_quota`` to reclaim somebody's
+    pre-existing copy so the batch's new file could stay.
+
+    Protecting the batch on that final pass does not fix it — that makes
+    pre-existing files the only eviction candidates. The batch has to give
+    up its own lowest-priority output instead.
+    """
+    import config as cfg
+    import scanner
+    from db import Database
+    from scanner import _extract_working_copies
+
+    monkeypatch.setattr(cfg, "CONFIG_PATH", str(tmp_path / "config.json"))
+    cfg.save({
+        **cfg.DEFAULTS,
+        "working_copy_max_size": 1000,
+        "working_copy_quality": 90,
+        "working_copy_cache_max_mb": 1,
+    })
+
+    folder = tmp_path / "photos"
+    folder.mkdir()
+    vireo_dir = tmp_path / "vireo"
+    vireo_dir.mkdir()
+    working_dir = vireo_dir / "working"
+    working_dir.mkdir()
+    db = Database(str(vireo_dir / "test.db"))
+    folder_id = db.add_folder(str(folder))
+
+    # 990 KB of pre-existing coverage under a 1 MB ceiling, with the oldest
+    # mtimes in the directory — i.e. first in line for an ASC-mtime pass.
+    covered_ids = []
+    for i in range(9):
+        src = folder / f"covered-{i}.jpg"
+        _make_jpeg(str(src), 2000, 1500)
+        photo_id = _photo_id_of_file(
+            db, folder_id, f"covered-{i}.jpg", src,
+        )
+        copy_path = working_dir / f"{photo_id}.jpg"
+        with open(copy_path, "wb") as handle:
+            handle.truncate(110 * 1024)
+        os.utime(str(copy_path), (1_000_000 + i, 1_000_000 + i))
+        db.conn.execute(
+            "UPDATE photos SET working_copy_path=? WHERE id=?",
+            (f"working/{photo_id}.jpg", photo_id),
+        )
+        covered_ids.append(photo_id)
+    db.conn.commit()
+
+    # One candidate, ~110 KB — well under ``incremental_threshold``
+    # (quota // 4 = 256 KB), so no mid-batch enforcement ever runs.
+    src = folder / "new.jpg"
+    _make_jpeg(str(src), 2000, 1500)
+    new_id = _photo_id_of_file(db, folder_id, "new.jpg", src)
+
+    def fixed_extract(_source, output, **_kwargs):
+        with open(output, "wb") as handle:
+            handle.truncate(110 * 1024)
+        return True
+
+    monkeypatch.setattr(scanner, "extract_working_copy", fixed_extract)
+
+    _extract_working_copies(db, str(vireo_dir))
+
+    survivors = [
+        pid for pid in covered_ids
+        if (working_dir / f"{pid}.jpg").exists()
+    ]
+    assert len(survivors) == len(covered_ids), (
+        "the sweep destroyed pre-existing coverage to make room for its "
+        f"own new file: {len(survivors)} of {len(covered_ids)} survived"
+    )
+    assert not (working_dir / f"{new_id}.jpg").exists(), (
+        "the batch kept its own output while the cache was over the "
+        "ceiling; it must give up its lowest-priority file instead"
+    )
+    trimmed = db.conn.execute(
+        "SELECT working_copy_path, working_copy_evicted_mtime"
+        " FROM photos WHERE id=?",
+        (new_id,),
+    ).fetchone()
+    assert trimmed["working_copy_path"] is None
+    assert trimmed["working_copy_evicted_mtime"] is not None, (
+        "a trimmed row without the capacity-deferred marker comes back as "
+        "a candidate on the next launch"
+    )
+    db.close()
+
+
 def test_post_loop_trim_marks_trimmed_rows_capacity_deferred(
     tmp_path, monkeypatch,
 ):
@@ -3076,23 +3174,21 @@ def test_post_loop_trim_evicts_lowest_id_first_preserving_newest(
     db.close()
 
 
-def test_final_enforce_reclaims_pre_existing_before_batch_files(
+def test_scoped_import_near_ceiling_may_displace_existing_coverage(
     tmp_path, monkeypatch,
 ):
-    """A near-full cache + small batch must not cannibalise batch coverage.
+    """A scoped run is allowed to spend old coverage on the shoot at hand.
 
-    Regression for a P2 codex review finding on PR #1607 against
-    ``7e45a41``: the DESC-priority trim only fires when the batch's OWN
-    footprint exceeds the ceiling. When batch bytes are small (below
-    ``incremental_threshold``, so the mid-batch ``displaced_existing``
-    stop never triggers) but a nearly-full cache pushes total usage
-    over the ceiling, the final unprotected ``evict_if_over_quota``
-    sorted by ASC mtime and reclaimed the batch's newest imports —
-    defeating the non-cannibalization behavior. Passing the batch's
-    retained files as ``protect_paths`` on unscoped runs forces
-    eviction to reclaim pre-existing coverage first.
+    Counterpart to ``test_small_sweep_near_ceiling_keeps_existing_coverage``.
+    The two paths answer the same question — total usage crosses the ceiling
+    although the batch alone fits — with deliberately opposite policies, and
+    the split is the whole point: a scan or import of specific folders is
+    user-initiated work on photos being culled right now, so displacing the
+    least recently used old copy is what the cache is for. The background
+    sweep has no such claim and defers instead.
     """
     import config as cfg
+    import scanner
     from db import Database
     from scanner import _extract_working_copies
 
@@ -3104,64 +3200,59 @@ def test_final_enforce_reclaims_pre_existing_before_batch_files(
         "working_copy_cache_max_mb": 1,
     })
 
-    folder = tmp_path / "photos"
-    folder.mkdir()
+    archive = tmp_path / "archive"
+    archive.mkdir()
+    card = tmp_path / "todays-card"
+    card.mkdir()
     vireo_dir = tmp_path / "vireo"
     vireo_dir.mkdir()
     working_dir = vireo_dir / "working"
     working_dir.mkdir()
     db = Database(str(vireo_dir / "test.db"))
-    folder_id = db.add_folder(str(folder))
+    archive_id = db.add_folder(str(archive))
+    card_id = db.add_folder(str(card))
 
-    # Pre-existing coverage taking up 850 KB of the 1 MB budget.
-    existing_src = folder / "existing.jpg"
+    # Pre-existing coverage taking 850 KB of the 1 MB budget, oldest mtime.
+    existing_src = archive / "existing.jpg"
     _make_jpeg(str(existing_src), 2000, 1500)
-    existing_id = _photo_id_of_file(
-        db, folder_id, "existing.jpg", existing_src,
+    existing_photo = _photo_id_of_file(
+        db, archive_id, "existing.jpg", existing_src,
     )
-    existing_wc = working_dir / f"{existing_id}.jpg"
+    existing_wc = working_dir / f"{existing_photo}.jpg"
     with open(existing_wc, "wb") as handle:
         handle.truncate(850 * 1024)
     os.utime(str(existing_wc), (1_000_000, 1_000_000))
     db.conn.execute(
         "UPDATE photos SET working_copy_path=? WHERE id=?",
-        (f"working/{existing_id}.jpg", existing_id),
+        (f"working/{existing_photo}.jpg", existing_photo),
     )
     db.conn.commit()
 
-    # Import a fresh batch of small files — total 200 KB, well below
-    # ``incremental_threshold`` (=quota//4 = 256 KB) so mid-batch
-    # enforce never fires. Combined usage: 850 + 200 = 1050 KB, over
-    # the 1024 KB ceiling by 26 KB.
-    newest_src = folder / "new.jpg"
+    # 200 KB of freshly imported work: under ``incremental_threshold``
+    # (quota // 4 = 256 KB) so mid-batch enforcement never fires, but
+    # 850 + 200 = 1050 KB puts total usage 26 KB over the ceiling.
+    newest_src = card / "new.jpg"
     _make_jpeg(str(newest_src), 2000, 1500)
-    newest_id = _photo_id_of_file(db, folder_id, "new.jpg", newest_src)
-
-    import scanner as _scanner_mod
+    newest_photo = _photo_id_of_file(db, card_id, "new.jpg", newest_src)
 
     def small_extract(_source, output, **_kwargs):
         with open(output, "wb") as handle:
             handle.truncate(200 * 1024)
         return True
 
-    monkeypatch.setattr(
-        _scanner_mod, "extract_working_copy", small_extract,
-    )
+    monkeypatch.setattr(scanner, "extract_working_copy", small_extract)
 
-    _extract_working_copies(db, str(vireo_dir))
+    _extract_working_copies(db, str(vireo_dir), scope=[str(card)])
 
-    newest_wc = working_dir / f"{newest_id}.jpg"
-    assert newest_wc.exists(), (
-        "final enforce reclaimed the batch's newest-import file "
-        "instead of pre-existing coverage; the batch's non-"
-        "cannibalization behavior is defeated when total (batch + "
-        "existing) crosses the ceiling but the batch's own footprint "
-        "does not"
+    assert (working_dir / f"{newest_photo}.jpg").exists(), (
+        "a scoped import gave up its own output instead of displacing "
+        "older cache; the shoot being culled right now is exactly what "
+        "the cache should be spent on"
     )
     assert not existing_wc.exists(), (
-        "final enforce did not reclaim the pre-existing coverage "
-        "even though total usage was over quota — the ceiling is "
-        "not enforced"
+        "total usage stayed over the ceiling — the scoped path must "
+        "still enforce the quota by reclaiming the least recently used "
+        "pre-existing copy"
     )
     db.close()
 

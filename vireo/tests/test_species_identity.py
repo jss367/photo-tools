@@ -637,3 +637,81 @@ def test_review_keeps_homonymous_predictions_and_confirmed_tags_distinct(db, tmp
               + "\nprocess.stdout.write(JSON.stringify(hasMixedSpecies({})));\n")
     result = subprocess.run([node, "-e", script], capture_output=True, text=True, check=True, timeout=15)
     assert json.loads(result.stdout) == (not same_taxon)
+
+
+def _confirmed_species_photo(db, tmp_path, entry, name="photo.jpg"):
+    """A photo tagged with a plain common-name keyword linked to its taxon —
+    the shape a real catalog carries after an accept or an XMP read.
+    """
+    pid, _ = _photo(db, tmp_path, name)
+    keyword_id = db.add_keyword(entry["common_name"], is_species=True)
+    local = db.conn.execute("SELECT id FROM taxa WHERE inat_id = ?", (entry["taxon_id"],)).fetchone()["id"]
+    db.conn.execute("UPDATE keywords SET taxon_id = ?, source_taxon_id = ? WHERE id = ?",
+                    (local, entry["taxon_id"], keyword_id))
+    db.tag_photo(pid, keyword_id)
+    return pid
+
+
+def _review_conflict(data, expected_species):
+    """Run the review page's own conflict analysis over a results payload."""
+    html = (Path(__file__).parents[1] / "templates/pipeline_review.html").read_text()
+    start = html.index("var SPECIES_CONFLICT_THRESHOLDS")
+    source = ("var pipelineResults = " + json.dumps(data) + ";\n"
+              + html[start:html.index("function buildSpeciesConflictEvidence", start)]
+              + "\nprocess.stdout.write(JSON.stringify(analyzePhotoSpeciesConflict("
+                "pipelineResults.photos[0], " + json.dumps(expected_species) + ")));")
+    result = subprocess.run([shutil.which("node"), "-e", source],
+                            capture_output=True, text=True, check=True, timeout=15)
+    return json.loads(result.stdout)
+
+
+def test_unstamped_catalog_does_not_flag_a_species_against_itself(db, tmp_path):
+    """A catalog whose taxonomy never recorded common-name provenance leaves
+    every predicted common name unresolved (``name:``) while the confirmed
+    keyword keeps its taxon identity. Review must not read that plumbing
+    difference as two species disagreeing under one name.
+    """
+    from pipeline import attach_species_identities
+
+    if not shutil.which("node"):
+        pytest.skip("Node is required to execute the review comparison")
+    # No stamp: SpeciesResolver distrusts every common name in this catalog.
+    db.set_meta("common_name_identity_version", "")
+    pid = _confirmed_species_photo(db, tmp_path, LILAC)
+    resolver = SpeciesResolver(db=db)
+    assert resolver.resolve(LILAC["common_name"]).key == "name:lilac-crowned parrot"
+    data = {"photos": [{"id": pid, "species_top5": [
+        [LILAC["common_name"], .9995, "BioCLIP-2.5"],
+        [LILAC["common_name"], .8813, "iNat21 (EVA-02 Large)"],
+    ]}]}
+    attach_species_identities(data, resolver)
+    assert data["photos"][0]["confirmed_species_identities"] == [
+        {"name": LILAC["common_name"], "key": f"taxon:{LILAC['taxon_id']}"},
+    ]
+
+    evidence = _review_conflict(data, LILAC["common_name"])
+    assert evidence["severity"] is None
+    # The predictions support the suggestion instead of arguing against it.
+    assert evidence["expectedSupport"] == pytest.approx(.9404)
+    assert evidence.get("alternativeSpecies") is None
+
+
+def test_same_name_fold_does_not_hide_a_different_species(db, tmp_path):
+    """The fold is display-name equality only: a genuinely different name at
+    the same strength must still surface as a conflict.
+    """
+    from pipeline import attach_species_identities
+
+    if not shutil.which("node"):
+        pytest.skip("Node is required to execute the review comparison")
+    db.set_meta("common_name_identity_version", "")
+    pid = _confirmed_species_photo(db, tmp_path, LILAC)
+    data = {"photos": [{"id": pid, "species_top5": [
+        [BROWED["common_name"], .9995, "BioCLIP-2.5"],
+        [BROWED["common_name"], .8813, "iNat21 (EVA-02 Large)"],
+    ]}]}
+    attach_species_identities(data, SpeciesResolver(db=db))
+
+    evidence = _review_conflict(data, LILAC["common_name"])
+    assert evidence["severity"] == "strong"
+    assert evidence["alternativeSpecies"] == BROWED["common_name"]

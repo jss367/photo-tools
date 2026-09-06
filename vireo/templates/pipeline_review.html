@@ -2894,6 +2894,17 @@ function normalizedSpeciesName(name) {
   return String(name || '').trim().toLocaleLowerCase().replace(/\s+/g, ' ');
 }
 
+function speciesDisplayKey(name) {
+  return String(name || '').trim().toLocaleLowerCase().replace(/\s+/g, ' ');
+}
+
+// A "name:" key is the resolver's way of saying it could not identify the
+// species at all — the key is the display text itself, not evidence about a
+// taxon. "taxon:"/"scientific:" keys are evidence.
+function speciesKeyIsUnidentified(key) {
+  return String(key || '').indexOf('name:') === 0;
+}
+
 function speciesCandidateForReviewUnit(enc, burst) {
   var override = burst && burst.species_override;
   if (override && override.species) return override.species;
@@ -2909,6 +2920,7 @@ function analyzePhotoSpeciesConflict(photo, expectedSpecies, normalizeSpecies, e
     var confirmed = (photo.confirmed_species_identities || []).filter(function(entry) { return entry.name === expectedSpecies; });
     if (confirmed.length === 1) expectedKey = confirmed[0].key;
   }
+  var expectedDisplayKey = speciesDisplayKey(expectedSpecies);
   var top5 = (photo && photo.species_top5) || [];
   if (!expectedKey || top5.length === 0) return null;
 
@@ -2920,6 +2932,18 @@ function analyzePhotoSpeciesConflict(photo, expectedSpecies, normalizeSpecies, e
     if (!entry || entry.length < 2) return;
     var display = String(entry[0] || '').trim();
     var species = entry[3] || normalizeSpecies(display);
+    // Two identity keys can carry the same display name when one side is
+    // taxon-linked and the other was never identified — a catalog whose
+    // taxonomy never recorded its common-name provenance leaves every
+    // predicted name at "name:mallard" while the confirmed keyword holds
+    // "taxon:6930". One name and no competing evidence is one species, so
+    // count it as support for the current suggestion instead of evidence
+    // against it. Two identified taxa that merely share a name stay distinct:
+    // those are homonyms, and the difference is real.
+    if (species !== expectedKey && speciesDisplayKey(display) === expectedDisplayKey &&
+        (speciesKeyIsUnidentified(species) || speciesKeyIsUnidentified(expectedKey))) {
+      species = expectedKey;
+    }
     displayNames[species] = display;
     var confidence = Number(entry[1]);
     var model = String(entry[2] || 'unknown');

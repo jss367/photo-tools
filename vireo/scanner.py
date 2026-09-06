@@ -2544,9 +2544,24 @@ def _extract_working_copies(db, vireo_dir, progress_callback=None,
                     )
                 except OSError:
                     current_identity = None
-                if current_identity is None or (
-                    expected_identity is not None
-                    and current_identity != expected_identity
+                # Drop when the file is missing, when its identity
+                # has changed since publish, OR when we never captured
+                # a publisher fingerprint. ``_capture_wc_identity``
+                # records ``None`` on a stat failure (and the
+                # fallback ``os.stat(wc_abs)`` after ``on_publish``
+                # can fail the same way) — without a fingerprint we
+                # cannot tell our just-published bytes apart from a
+                # competing publisher that atomically replaced the
+                # same canonical path between publish and this trim.
+                # Trusting the path unconditionally would let the
+                # trim below unlink the replacement's valid bytes.
+                # Skip such candidates entirely; a later
+                # ``evict_if_over_quota`` pass will reclaim them by
+                # sampled identity if quota still needs the space.
+                if (
+                    expected_identity is None
+                    or current_identity is None
+                    or current_identity != expected_identity
                 ):
                     retained_new_files.pop(stale_path, None)
                     retained_new_identities.pop(stale_path, None)

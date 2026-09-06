@@ -4512,3 +4512,173 @@ def test_trim_deferred_marker_carries_snapshot_source_identity(
         "row's new extraction inputs until the primary mtime or "
         "quota changes"
     )
+
+
+def test_trim_revalidation_rejects_candidates_without_publisher_fingerprint(
+    tmp_path, monkeypatch,
+):
+    """Trim revalidation must drop entries with no captured fingerprint.
+
+    Regression for a P2 codex finding on PR #1607 against ``49299a7d``.
+    When ``_capture_wc_identity`` cannot stat the just-published file,
+    scanner records ``retained_new_identities[wc_abs] = None``. The
+    trim's revalidation treated that as "trusted" — its drop condition
+    only fired when ``current_identity`` was missing or when a captured
+    fingerprint mismatched. If a competing publisher (on-demand render,
+    id reuse, ``_evict_once``) atomically replaced the canonical path
+    between publish and trim, current_identity would be real but no
+    captured fingerprint existed to detect the swap, so the entry
+    stayed in ``retained_new_files`` and the trim's later iterate —
+    whose skip check is also permissive when ``expected_identity is
+    None`` — could unlink the replacement publisher's valid bytes.
+
+    Setup: 10 files at 110 KB each, quota 1 MB, batch exceeds ceiling
+    by 76 KB so the post-loop trim would fire. Wrap
+    ``extract_working_copy`` so its ``on_publish`` callback is invoked
+    with a non-existent path — ``_capture_wc_identity`` catches
+    ``OSError`` and appends ``None`` to its sink, so scanner records
+    ``retained_new_identities[wc_abs] = None`` for every file (its
+    documented no-fingerprint state). All published bytes are real and
+    present.
+
+    With the fix, revalidation drops every entry whose captured
+    fingerprint is None (they cannot be proven ours), ``batch_bytes``
+    falls to zero, the trim declines to touch anything, no markers are
+    stamped and no files are removed. Without the fix, the trim
+    iterates the retained set, its permissive identity skip lets every
+    ``os.remove`` succeed, and at least one file is unlinked with a
+    spurious capacity-deferred marker on its row.
+    """
+    import config as cfg
+    from db import Database
+    from scanner import _extract_working_copies
+
+    monkeypatch.setattr(cfg, "CONFIG_PATH", str(tmp_path / "config.json"))
+    cfg.save({
+        **cfg.DEFAULTS,
+        "working_copy_max_size": 1000,
+        "working_copy_quality": 90,
+        "working_copy_cache_max_mb": 1,
+    })
+
+    folder = tmp_path / "photos"
+    folder.mkdir()
+    vireo_dir = tmp_path / "vireo"
+    vireo_dir.mkdir()
+    working_dir = vireo_dir / "working"
+    working_dir.mkdir()
+    db = Database(str(vireo_dir / "test.db"))
+    folder_id = db.add_folder(str(folder))
+
+    imported_ids = []
+    for i in range(10):
+        src = folder / f"photo-{i:02d}.jpg"
+        _make_jpeg(str(src), 2000, 1500)
+        imported_ids.append(
+            _photo_id_of_file(db, folder_id, f"photo-{i:02d}.jpg", src)
+        )
+    db.conn.close()
+
+    import contextlib
+
+    import scanner as _scanner_mod
+    import working_copy_cache
+
+    def fingerprint_failing_extract(
+        _source, output, on_publish=None, **_kwargs,
+    ):
+        with open(output, "wb") as handle:
+            handle.truncate(110 * 1024)
+        if on_publish is not None:
+            # Force ``_capture_wc_identity`` to record ``None`` for
+            # this publish by handing it a path whose ``os.stat``
+            # fails — the same no-fingerprint state scanner records
+            # when the callback's own stat can't observe the file.
+            on_publish("/vireo/nonexistent/fingerprint-capture-failed")
+        return True
+
+    monkeypatch.setattr(
+        _scanner_mod,
+        "extract_working_copy",
+        fingerprint_failing_extract,
+    )
+
+    # Simulate a competing publisher atomically replacing the
+    # lowest-id batch file's bytes just before our trim acquires
+    # the guard — that's the first slot the trim iterates (ASC by
+    # id, "lowest priority" of the batch's DESC-id set), so without
+    # the fix the trim unlinks the replacement's bytes on its very
+    # first iteration. Overwriting also bumps the wc's wall-clock
+    # mtime to "now", making it the NEWEST wc mtime, so the
+    # unprotected final ``evict_if_over_quota`` (ASC by mtime)
+    # picks a different file to reclaim. If the trim leaves this
+    # file alone, its replacement bytes survive the whole extract.
+    target_id = min(imported_ids)
+    target_path = str(working_dir / f"{target_id}.jpg")
+    replacement_bytes = b"COMPETING_PUBLISHER_BYTES" * 100
+    real_guard = working_copy_cache.working_copy_publication_guard
+    guard_calls = {"count": 0, "fired": False}
+    # ``fingerprint_failing_extract`` skips ``extract_working_copy``'s
+    # own guard usage; only scanner's per-file re-acquire at
+    # ~scanner.py:1851 counts (one per row). The trim's guard at
+    # ~scanner.py:2523 is therefore the ``len(rows) + 1``-th
+    # acquisition.
+    trim_guard_call = len(imported_ids) + 1
+
+    @contextlib.contextmanager
+    def guard_wrapper():
+        guard_calls["count"] += 1
+        if guard_calls["count"] == trim_guard_call:
+            # Overwrite the target's bytes atomically before the
+            # trim's guard is held — simulating a competing publisher
+            # that ran to completion just before ours.
+            guard_calls["fired"] = True
+            with contextlib.suppress(OSError):
+                with open(target_path, "wb") as handle:
+                    handle.write(replacement_bytes)
+        with real_guard():
+            yield
+
+    monkeypatch.setattr(
+        working_copy_cache,
+        "working_copy_publication_guard",
+        guard_wrapper,
+    )
+
+    verify_db = Database(str(vireo_dir / "test.db"))
+    _extract_working_copies(verify_db, str(vireo_dir))
+
+    marker = verify_db.conn.execute(
+        "SELECT working_copy_evicted_mtime FROM photos WHERE id=?",
+        (target_id,),
+    ).fetchone()
+    verify_db.conn.close()
+
+    assert guard_calls["fired"], (
+        "test setup: the guard wrapper never reached the trim's "
+        f"acquisition (expected call #{trim_guard_call}, saw "
+        f"{guard_calls['count']}) — the regression is not exercised"
+    )
+    target_file = working_dir / f"{target_id}.jpg"
+    survivor_bytes = target_file.read_bytes() if target_file.exists() else b""
+    assert survivor_bytes == replacement_bytes, (
+        "the trim unlinked the lowest-id batch file even though its "
+        "``retained_new_identities`` entry was None (fingerprint "
+        "capture failure). The bytes on disk did not belong to us — "
+        "a competing publisher atomically replaced them before our "
+        "trim acquired the guard — so unlinking wiped their valid "
+        "bytes. With the ``expected_identity is None`` guard in the "
+        "revalidation, such entries drop from the retained set and "
+        "the trim declines to touch them; a later "
+        "``evict_if_over_quota`` pass reclaims by sampled identity "
+        f"if quota still needs the space. survivor_bytes_len="
+        f"{len(survivor_bytes)}"
+    )
+    assert marker is None or marker["working_copy_evicted_mtime"] is None, (
+        "the trim stamped a capacity-deferred marker on the lowest-id "
+        "row even though its ``retained_new_identities`` entry was "
+        "None (fingerprint capture failure). The marker on a row we "
+        "cannot prove we published suppresses regeneration on future "
+        "candidate passes until the primary mtime or the quota "
+        f"changes: marker={dict(marker) if marker else None!r}"
+    )

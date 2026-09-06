@@ -1365,6 +1365,128 @@ def test_startup_backfill_pause_parks_between_rows_and_resumes(
         assert (vireo_dir / "working" / f"{pid}.jpg").exists()
 
 
+def test_startup_backfill_skips_row_when_id_reused_during_pause(
+    tmp_path, monkeypatch,
+):
+    """A row whose photo id was reused during pause must not be extracted.
+
+    Regression for a P1 codex review finding on PR #1607: because
+    ``photos.id`` is not AUTOINCREMENT, SQLite reuses a deleted photo's
+    id for the next INSERT. If that happens while the backfill is parked
+    on a pause request, the resumed loop's snapshot still points at the
+    deleted photo's folder/filename/size/mtime — extracting from that
+    stale source and updating ``working_copy_path WHERE id=?`` would
+    silently attach the deleted photo's JPEG to the newly-imported row.
+
+    Sets up two candidates, pauses after row 1 finishes, deletes row 2,
+    reinserts a different file (which reuses the freed id), then resumes.
+    The resumed worker must skip the stale row rather than write a
+    working_copy_path onto the replacement.
+    """
+    import threading
+
+    import scanner
+
+    app, vireo_dir, ids = _prepare_backfill_app(
+        tmp_path, monkeypatch, ["a.jpg", "b.jpg"],
+    )
+    stale_id = ids[1]
+
+    real_extract = scanner.extract_working_copy
+    first_call_started = threading.Event()
+    release_first_call = threading.Event()
+    calls = []
+    calls_lock = threading.Lock()
+
+    def gated_extract(*args, **kwargs):
+        with calls_lock:
+            calls.append(args[0])
+            is_first = len(calls) == 1
+        if is_first:
+            first_call_started.set()
+            assert release_first_call.wait(timeout=30), "test never released row 1"
+        return real_extract(*args, **kwargs)
+
+    monkeypatch.setattr(scanner, "extract_working_copy", gated_extract)
+
+    app._kickoff_working_copy_backfill()
+
+    assert first_call_started.wait(timeout=30), "backfill never started extracting"
+    job_id = [
+        j for j in app._job_runner.list_jobs()
+        if j["type"] == "working_copy_backfill"
+    ][0]["id"]
+
+    assert app._job_runner.pause_job(job_id) is True
+    release_first_call.set()
+
+    paused = _wait_for_backfill_status(app._job_runner, {"paused"})
+    assert paused["id"] == job_id
+
+    # Delete row 2's photo and reinsert a different file. On an
+    # ``INTEGER PRIMARY KEY`` without AUTOINCREMENT SQLite reuses the
+    # freed id (which is >max(id) after a delete of the highest row), so
+    # the replacement lands on the same photo_id the snapshot points at.
+    from db import Database
+    db_path = app.config["DB_PATH"]
+    admin_db = Database(db_path)
+    stale_row = admin_db.conn.execute(
+        "SELECT p.folder_id, f.path AS folder_path"
+        " FROM photos p JOIN folders f ON f.id=p.folder_id"
+        " WHERE p.id=?",
+        (stale_id,),
+    ).fetchone()
+    assert stale_row is not None
+    folder_id = stale_row["folder_id"]
+    photos_dir = stale_row["folder_path"]
+    admin_db.conn.execute("DELETE FROM photos WHERE id=?", (stale_id,))
+    admin_db.conn.commit()
+
+    replacement = os.path.join(photos_dir, "replacement.jpg")
+    # Different dimensions → guaranteed different file_size so the
+    # identity guard flags the mismatch even if the two saves land in
+    # the same coarse mtime bucket on this filesystem.
+    _make_jpeg(replacement, 1600, 1200)
+    new_id = admin_db.add_photo(
+        folder_id, "replacement.jpg", ".jpg",
+        file_size=os.path.getsize(replacement),
+        file_mtime=os.path.getmtime(replacement),
+        width=1600, height=1200,
+    )
+    admin_db.conn.close()
+    assert new_id == stale_id, (
+        f"test setup: expected id reuse (freed {stale_id}, got {new_id}); "
+        "SQLite behavior may have changed"
+    )
+
+    assert app._job_runner.resume_job(job_id) is True
+
+    job = _wait_for_backfill_terminal(app._job_runner)
+    assert job["status"] == "completed", f"job: {job}"
+
+    # The stale snapshot row must not have been extracted: the source
+    # path (photos/b.jpg) no longer exists on disk, but even if it did,
+    # writing that JPEG under working/<stale_id>.jpg and attaching it to
+    # the replacement row is the bug this guard prevents.
+    with calls_lock:
+        for src in calls[1:]:
+            assert "b.jpg" not in src, (
+                f"worker extracted the stale row's source after resume: {src}"
+            )
+
+    # And the replacement row's working_copy_path must not have been set
+    # by this run — that's the deleted photo's identity, not the new one.
+    verify_db = Database(db_path)
+    wc_path = verify_db.conn.execute(
+        "SELECT working_copy_path FROM photos WHERE id=?", (stale_id,),
+    ).fetchone()["working_copy_path"]
+    verify_db.conn.close()
+    assert wc_path is None, (
+        f"replacement photo (id={stale_id}) received a working_copy_path "
+        f"from the stale snapshot: {wc_path!r}"
+    )
+
+
 def _make_noisy_jpeg(path, width, height):
     """A high-entropy JPEG so extracted working copies stay large enough to
     exercise the quota tracker (uniform-gray JPEGs compress to a few KB)."""

@@ -1256,6 +1256,34 @@ def working_copy_backfill_candidate_count(db):
     ).fetchone()[0]
 
 
+def _snapshot_row_still_current(db, row):
+    """Return True if the candidate snapshot's identity still matches the DB.
+
+    ``_extract_working_copies`` reads its rows up front and then processes
+    them for minutes to days. During a pause the worker parks between rows;
+    ``photos.id`` is not AUTOINCREMENT, so a row can be deleted and its id
+    reused by a new import with different bytes while the loop is stopped.
+    Callers use this to skip the row instead of extracting the deleted
+    photo's source and attaching that JPEG to the replacement.
+
+    ``file_size`` and ``file_mtime`` may be NULL, so use ``IS`` (not ``=``)
+    for those comparisons.
+    """
+    current = db.conn.execute(
+        "SELECT folder_id, filename, file_size, file_mtime"
+        " FROM photos WHERE id=?",
+        (row["id"],),
+    ).fetchone()
+    if current is None:
+        return False
+    return (
+        current["folder_id"] == row["folder_id"]
+        and current["filename"] == row["filename"]
+        and current["file_size"] == row["file_size"]
+        and current["file_mtime"] == row["file_mtime"]
+    )
+
+
 def _extract_working_copies(db, vireo_dir, progress_callback=None,
                             status_callback=None, scope=None,
                             cancel_check=None, source_paths=None):
@@ -1488,6 +1516,24 @@ def _extract_working_copies(db, vireo_dir, progress_callback=None,
         if cancel_check is not None and cancel_check():
             log.info("Working-copy extraction cancelled after %d/%d rows", i - 1, total)
             break
+
+        # ``cancel_check`` parks the worker on a pause request via
+        # ``wait_if_paused``, so this snapshot row may have been picked up
+        # hours ago. ``photos.id`` is not AUTOINCREMENT, so during the park
+        # the row could have been deleted and its id reused by a new import
+        # with entirely different bytes. Refetch the identity columns and
+        # skip when the snapshot no longer matches — otherwise we would
+        # extract the deleted photo's source path and attach that JPEG to
+        # the replacement row's ``working_copy_path``.
+        if not _snapshot_row_still_current(db, row):
+            log.info(
+                "Skipping working-copy extraction for photo %s: snapshot "
+                "no longer matches the current row (deleted or replaced "
+                "since candidate selection)",
+                row["id"],
+            )
+            _emit_working_copy_progress(i)
+            continue
 
         # Close the remaining gap between candidate selection and this file
         # read in case an alias is swapped while earlier rows are processed.
@@ -1743,6 +1789,12 @@ def _extract_working_copies(db, vireo_dir, progress_callback=None,
                             retained_new_files
                         )
 
+                # Extraction takes seconds per RAW; carry the snapshot's
+                # identity through the WHERE so an id reuse that happens
+                # between the pre-extract revalidate and this commit still
+                # cannot stamp the deleted row's working_copy_path onto the
+                # replacement. Same NULL-safe (folder_id, filename,
+                # file_size, file_mtime) guard used for deferred rows below.
                 if not publication_lost and raw_failed_then_companion:
                     # The companion-derived working copy is usable, but
                     # request paths still need to know the RAW itself failed:
@@ -1754,8 +1806,13 @@ def _extract_working_copies(db, vireo_dir, progress_callback=None,
                         " working_copy_failed_at=datetime('now'),"
                         " working_copy_failed_mtime=?,"
                         " working_copy_failed_source='source'"
-                        " WHERE id=?",
-                        (wc_rel, row["file_mtime"], row["id"]),
+                        " WHERE id=? AND folder_id=? AND filename=?"
+                        " AND file_size IS ? AND file_mtime IS ?",
+                        (
+                            wc_rel, row["file_mtime"], row["id"],
+                            row["folder_id"], row["filename"],
+                            row["file_size"], row["file_mtime"],
+                        ),
                     )
                 elif not publication_lost:
                     db.conn.execute(
@@ -1764,8 +1821,13 @@ def _extract_working_copies(db, vireo_dir, progress_callback=None,
                         " working_copy_failed_at=NULL,"
                         " working_copy_failed_mtime=NULL,"
                         " working_copy_failed_source=NULL"
-                        " WHERE id=?",
-                        (wc_rel, row["id"]),
+                        " WHERE id=? AND folder_id=? AND filename=?"
+                        " AND file_size IS ? AND file_mtime IS ?",
+                        (
+                            wc_rel, row["id"], row["folder_id"],
+                            row["filename"], row["file_size"],
+                            row["file_mtime"],
+                        ),
                     )
                 if not publication_lost:
                     commit_with_retry(db.conn)
@@ -1786,12 +1848,20 @@ def _extract_working_copies(db, vireo_dir, progress_callback=None,
                 "marked as failed and will retry on file change or after %s",
                 row["id"], source, _FAILURE_RETRY_AFTER.lstrip("-"),
             )
+            # Same identity guard as the success path: don't stamp a
+            # failure marker on a row whose id was reused for a new photo
+            # while this extraction was running.
             db.conn.execute(
                 "UPDATE photos SET working_copy_failed_at=datetime('now'),"
                 " working_copy_failed_mtime=?,"
                 " working_copy_failed_source=?"
-                " WHERE id=?",
-                (row["file_mtime"], failure_source, row["id"]),
+                " WHERE id=? AND folder_id=? AND filename=?"
+                " AND file_size IS ? AND file_mtime IS ?",
+                (
+                    row["file_mtime"], failure_source, row["id"],
+                    row["folder_id"], row["filename"],
+                    row["file_size"], row["file_mtime"],
+                ),
             )
             commit_with_retry(db.conn)
 

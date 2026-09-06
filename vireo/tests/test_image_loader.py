@@ -1543,3 +1543,68 @@ def test_safe_scan_walk_on_entry_fires_for_every_entry(tmp_path):
     beats = []
     list(safe_scan_walk(str(root), on_entry=lambda: beats.append(1)))
     assert len(beats) == 7, "one heartbeat per directory entry, including subdirectories"
+
+
+def test_load_working_image_does_not_stamp_by_default(tmp_path):
+    """Job callers must not flatten the eviction recency signal.
+
+    ``load_working_image`` is shared by classification, sharpness and
+    culling, which walk the whole library. If it stamped unconditionally,
+    one pipeline run would mark every working copy as recently used and
+    quota eviction would have nothing left to order by.
+    """
+    import os
+    import time
+
+    from image_loader import load_working_image
+    from PIL import Image
+
+    vireo_dir = tmp_path / "vireo"
+    working = vireo_dir / "working"
+    working.mkdir(parents=True)
+    wc = working / "7.jpg"
+    Image.new("RGB", (64, 48), (10, 20, 30)).save(str(wc), "JPEG")
+    stale = time.time() - 30 * 24 * 3600
+    os.utime(str(wc), (stale, stale))
+
+    photo = {"id": 7, "working_copy_path": "working/7.jpg", "folder_id": 1}
+    image = load_working_image(photo, str(vireo_dir), max_size=32)
+
+    assert image is not None
+    assert os.stat(str(wc)).st_atime == stale, (
+        "a job-path read stamped the working copy; every library-wide pass "
+        "would then look like recent user activity"
+    )
+
+
+def test_load_working_image_stamps_when_access_is_recorded(tmp_path):
+    """Request paths opt in and the stamp lands on atime, not mtime."""
+    import os
+    import time
+
+    from image_loader import load_working_image
+    from PIL import Image
+
+    vireo_dir = tmp_path / "vireo"
+    working = vireo_dir / "working"
+    working.mkdir(parents=True)
+    wc = working / "7.jpg"
+    Image.new("RGB", (64, 48), (10, 20, 30)).save(str(wc), "JPEG")
+    stale = time.time() - 30 * 24 * 3600
+    os.utime(str(wc), (stale, stale))
+
+    photo = {"id": 7, "working_copy_path": "working/7.jpg", "folder_id": 1}
+    image = load_working_image(
+        photo, str(vireo_dir), max_size=32, record_access=True,
+    )
+
+    assert image is not None
+    stat_result = os.stat(str(wc))
+    assert stat_result.st_atime > stale, (
+        "an opted-in read left the working copy at its old recency, so it "
+        "stays first in the eviction queue while the user is looking at it"
+    )
+    assert stat_result.st_mtime == stale, (
+        "the stamp moved mtime, which is the content-version key the "
+        "external-edit handoff and the display-cache gates read"
+    )

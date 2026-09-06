@@ -17616,7 +17616,13 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
 
             photo_dict = dict(photo)
             folders = {folder["id"]: folder["path"]}
-            img = load_working_image(photo_dict, vireo_dir, max_size=1024, folders=folders)
+            # A user reviewing a burst is actively using these working
+            # copies; stamp them so quota eviction does not treat them as
+            # the least recently used files in the cache.
+            img = load_working_image(
+                photo_dict, vireo_dir, max_size=1024, folders=folders,
+                record_access=True,
+            )
             if img is None:
                 results.append({"photo_id": photo_id, "sharpness": None, "error": "could not load image"})
                 continue

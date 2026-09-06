@@ -558,8 +558,26 @@ def get_canonical_image_path(photo, vireo_dir, folders):
     return os.path.join(folder_path, photo["filename"])
 
 
+def _record_working_copy_access(wc_path):
+    """Stamp a working copy as recently used for quota-eviction ordering.
+
+    Held under ``working_copy_publication_guard`` like every other access
+    stamp, so it cannot land between the quota pass's directory scan and
+    its unlink. Imported lazily to keep ``image_loader`` free of a
+    module-level dependency on the cache layer.
+    """
+    from working_copy_cache import (
+        touch_working_copy_access,
+        working_copy_publication_guard,
+    )
+
+    with working_copy_publication_guard():
+        touch_working_copy_access(wc_path)
+
+
 def load_working_image(
     photo, vireo_dir, max_size=1024, folders=None, *, return_source=False,
+    record_access=False,
 ):
     """Load a photo's working image — the fast path for all pixel operations.
 
@@ -571,6 +589,12 @@ def load_working_image(
         vireo_dir: path to ~/.vireo/
         max_size: maximum dimension (longest side). None for full resolution.
         folders: optional {folder_id: path} mapping (required when working_copy_path is NULL)
+        record_access: stamp the working copy as recently used when it is
+            the source. Opt-in rather than automatic: quota eviction orders
+            by recency, and a background job that walks the whole library
+            (classification, sharpness, culling) would stamp every copy and
+            flatten the signal into noise. Request paths serving a user
+            looking at a photo pass True; job callers leave it False.
 
     Returns:
         PIL.Image.Image or None. When ``return_source=True``, returns an
@@ -589,6 +613,8 @@ def load_working_image(
         if os.path.exists(wc_path):
             working_image = _load_standard(wc_path, max_size)
             if working_image is not None:
+                if record_access:
+                    _record_working_copy_access(wc_path)
                 return _result(working_image, "working_copy")
 
     # No usable working copy — load original (may be JPEG or RAW). This also

@@ -62,7 +62,15 @@ _XATTR_SKIP_ERRNOS = frozenset(
 # POSIX ACLs and security labels as extended attributes, so failing to copy
 # one would publish a sidecar that is readable by more people than the
 # original. Never skip these, whatever the errno.
-_CRITICAL_XATTR_PREFIXES = ("system.posix_acl", "security.")
+#
+# The Linux ``system.`` namespace is reserved for kernel-managed attributes
+# with access-control semantics -- ``system.posix_acl_access`` /
+# ``system.posix_acl_default`` on native filesystems, ``system.nfs4_acl`` on
+# NFSv4 exports, ``system.richacl`` on RichACL mounts. Missing one and
+# skipping it on EACCES/EPERM/ENOTSUP would publish a sidecar with weaker
+# access than the original, so the prefix is the whole namespace rather than
+# an enumerated allow-list.
+_CRITICAL_XATTR_PREFIXES = ("system.", "security.")
 
 # Attribute names already reported, so a 2,000-photo sync logs each cause once.
 _reported_xattr_skips = set()

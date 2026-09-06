@@ -710,6 +710,26 @@ def test_copy_xattrs_never_skips_access_control_attributes():
         xmp._copy_xattrs("source", "dest", *api)
 
 
+@pytest.mark.parametrize(
+    "attribute",
+    ["system.nfs4_acl", "system.richacl", "security.selinux"],
+)
+def test_copy_xattrs_never_skips_non_posix_acl_namespaces(attribute):
+    """NFSv4/RichACL/security xattrs are access control too.
+
+    The Linux ``system.`` namespace is reserved for kernel-managed access
+    control -- ``system.nfs4_acl`` on NFSv4 mounts, ``system.richacl`` on
+    RichACL mounts. If ``setxattr`` returns EACCES/EPERM/ENOTSUP, skipping
+    the attribute would publish a sidecar with weaker access than the
+    original; the previous all-or-nothing copy aborted in that case.
+    """
+    import xmp
+
+    _, *api = _fake_xattr_store({attribute: b"acl"}, refuse=attribute)
+    with pytest.raises(PermissionError):
+        xmp._copy_xattrs("source", "dest", *api)
+
+
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX extended attributes")
 def test_sidecar_update_survives_unsettable_source_xattr(sample_xmp, monkeypatch):
     """End to end: an uncopyable source attribute still rewrites the sidecar."""

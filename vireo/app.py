@@ -5050,6 +5050,17 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 "working_copy_backfill", work,
                 ephemeral=True,
                 config={"trigger": "startup"},
+                # A library with tens of thousands of un-backfilled RAWs
+                # takes days of sequential decode, so the user needs a way
+                # to stand it down while they work without losing the
+                # progress made so far. ``cancel_check`` above already
+                # routes through ``runner.is_cancelled``, which parks on a
+                # pause request before reporting cancellation, and the
+                # extractor polls it at the top of each row — after that
+                # row's commit and before the next file read, so nothing
+                # is held while parked (no open write transaction, no
+                # publication guard, no in-flight extraction).
+                pausable=True,
             )
         except Exception:
             log.exception("Failed to start working-copy backfill job")

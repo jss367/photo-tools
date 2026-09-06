@@ -1201,6 +1201,170 @@ def test_startup_backfill_does_not_persist_to_history(tmp_path, monkeypatch):
     assert rows == [], "ephemeral job must not persist to history"
 
 
+def _wait_for_backfill_status(runner, statuses, timeout=30.0, poll=0.02):
+    """Poll until the backfill job reports one of *statuses*; return the job.
+
+    Used by the pause tests, which need to observe transient states
+    (``pausing`` -> ``paused``) that ``_wait_for_backfill_terminal`` would
+    poll straight past.
+    """
+    import time
+    deadline = time.time() + timeout
+    last_seen = None
+    while time.time() < deadline:
+        jobs = [
+            j for j in runner.list_jobs()
+            if j["type"] == "working_copy_backfill"
+        ]
+        if jobs:
+            last_seen = jobs[0]
+            if last_seen["status"] in statuses:
+                return last_seen
+        time.sleep(poll)
+    raise AssertionError(
+        f"working_copy_backfill never reached {sorted(statuses)} within "
+        f"{timeout}s; last seen status={(last_seen or {}).get('status')!r}"
+    )
+
+
+def _prepare_backfill_app(tmp_path, monkeypatch, filenames):
+    """Create an app whose catalog has one oversized JPEG per name in
+    *filenames*, all awaiting a working copy. Returns (app, vireo_dir, ids).
+    """
+    import os
+
+    import config as cfg
+    import models
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(cfg, "CONFIG_PATH", str(tmp_path / "config.json"))
+    monkeypatch.setattr(models, "DEFAULT_MODELS_DIR", str(tmp_path / "vireo-models"))
+    monkeypatch.setattr(models, "CONFIG_PATH", str(tmp_path / "models.json"))
+    cfg.save({**cfg.DEFAULTS, "working_copy_max_size": 1000, "working_copy_quality": 90})
+
+    from app import create_app
+    from db import Database
+
+    vireo_dir = tmp_path / "vireo"
+    vireo_dir.mkdir()
+    thumb_dir = vireo_dir / "thumbnails"
+    thumb_dir.mkdir()
+    db_path = str(vireo_dir / "test.db")
+
+    photos_dir = tmp_path / "photos"
+    photos_dir.mkdir()
+
+    db = Database(db_path)
+    folder_id = db.add_folder(str(photos_dir))
+    ids = []
+    for name in filenames:
+        src = photos_dir / name
+        _make_jpeg(str(src), 2000, 1500)
+        ids.append(db.add_photo(
+            folder_id, name, ".jpg",
+            file_size=os.path.getsize(str(src)),
+            file_mtime=os.path.getmtime(str(src)),
+            width=2000, height=1500,
+        ))
+    db.conn.close()
+
+    app = create_app(
+        db_path=db_path, thumb_cache_dir=str(thumb_dir), api_token="t",
+    )
+    return app, vireo_dir, ids
+
+
+def test_startup_backfill_job_is_pausable(tmp_path, monkeypatch):
+    """The backfill must register as pausable.
+
+    ``JobRunner.pause_job`` refuses any job without this flag, and the jobs
+    page only renders Pause/Resume for ``job.pausable`` — so without it a
+    multi-day backfill on a large RAW library can only be cancelled, never
+    stood down and picked back up.
+    """
+    app, _vireo_dir, _ids = _prepare_backfill_app(
+        tmp_path, monkeypatch, ["big.jpg"],
+    )
+    app._kickoff_working_copy_backfill()
+
+    job = _wait_for_backfill_terminal(app._job_runner)
+    assert job["status"] == "completed", f"job: {job}"
+    assert job.get("pausable") is True
+
+
+def test_startup_backfill_pause_parks_between_rows_and_resumes(
+    tmp_path, monkeypatch,
+):
+    """Pause parks the worker between rows; resume finishes the remaining work.
+
+    Gates the extractor so the pause request lands while row 1 is in flight,
+    then asserts the worker stops *after* that row (no further extraction
+    while paused) and completes every candidate once resumed. Pausing must
+    not lose the rows already written.
+    """
+    import threading
+
+    import scanner
+
+    app, vireo_dir, ids = _prepare_backfill_app(
+        tmp_path, monkeypatch, ["a.jpg", "b.jpg", "c.jpg"],
+    )
+
+    real_extract = scanner.extract_working_copy
+    first_call_started = threading.Event()
+    release_first_call = threading.Event()
+    calls = []
+    calls_lock = threading.Lock()
+
+    def gated_extract(*args, **kwargs):
+        with calls_lock:
+            calls.append(args[0])
+            is_first = len(calls) == 1
+        if is_first:
+            first_call_started.set()
+            # Hold row 1 inside the extractor so the test can request the
+            # pause while the worker is past its checkpoint for this row.
+            assert release_first_call.wait(timeout=30), "test never released row 1"
+        return real_extract(*args, **kwargs)
+
+    monkeypatch.setattr(scanner, "extract_working_copy", gated_extract)
+
+    app._kickoff_working_copy_backfill()
+
+    assert first_call_started.wait(timeout=30), "backfill never started extracting"
+    job_id = [
+        j for j in app._job_runner.list_jobs()
+        if j["type"] == "working_copy_backfill"
+    ][0]["id"]
+
+    assert app._job_runner.pause_job(job_id) is True, (
+        "pause_job refused the backfill — pausable flag missing?"
+    )
+    release_first_call.set()
+
+    paused = _wait_for_backfill_status(app._job_runner, {"paused"})
+    assert paused["id"] == job_id
+
+    # Parked, not merely slow: no further row is extracted while paused.
+    import time
+    time.sleep(0.5)
+    with calls_lock:
+        assert len(calls) == 1, (
+            f"worker kept extracting while paused: {calls}"
+        )
+
+    # Row 1's result survives the pause rather than being rolled back.
+    assert (vireo_dir / "working" / f"{ids[0]}.jpg").exists()
+
+    assert app._job_runner.resume_job(job_id) is True
+
+    job = _wait_for_backfill_terminal(app._job_runner)
+    assert job["status"] == "completed", f"job: {job}"
+    with calls_lock:
+        assert len(calls) == 3, f"not every candidate was extracted: {calls}"
+    for pid in ids:
+        assert (vireo_dir / "working" / f"{pid}.jpg").exists()
+
+
 def _make_noisy_jpeg(path, width, height):
     """A high-entropy JPEG so extracted working copies stay large enough to
     exercise the quota tracker (uniform-gray JPEGs compress to a few KB)."""

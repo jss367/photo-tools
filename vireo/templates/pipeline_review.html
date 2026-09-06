@@ -2932,16 +2932,16 @@ function analyzePhotoSpeciesConflict(photo, expectedSpecies, normalizeSpecies, e
     if (!entry || entry.length < 2) return;
     var display = String(entry[0] || '').trim();
     var species = entry[3] || normalizeSpecies(display);
-    // Two identity keys can carry the same display name when one side is
-    // taxon-linked and the other was never identified — a catalog whose
-    // taxonomy never recorded its common-name provenance leaves every
+    // A prediction the resolver could not identify is bare text: a catalog
+    // whose taxonomy never recorded its common-name provenance leaves every
     // predicted name at "name:mallard" while the confirmed keyword holds
-    // "taxon:6930". One name and no competing evidence is one species, so
-    // count it as support for the current suggestion instead of evidence
-    // against it. Two identified taxa that merely share a name stay distinct:
-    // those are homonyms, and the difference is real.
-    if (species !== expectedKey && speciesDisplayKey(display) === expectedDisplayKey &&
-        (speciesKeyIsUnidentified(species) || speciesKeyIsUnidentified(expectedKey))) {
+    // "taxon:6930". Under one name with no identity of its own, such a
+    // prediction supports the current suggestion instead of arguing against
+    // it. An *identified* prediction is never folded, even when the expected
+    // side is the ambiguous fallback key: a same-name taxon the source can
+    // tell apart is exactly the homonym review must keep visible.
+    if (species !== expectedKey && speciesKeyIsUnidentified(species) &&
+        speciesDisplayKey(display) === expectedDisplayKey) {
       species = expectedKey;
     }
     displayNames[species] = display;

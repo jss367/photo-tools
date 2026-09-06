@@ -1458,3 +1458,118 @@ def test_sync_resolves_paths_once_per_run_and_folder(tmp_path, monkeypatch):
     assert result["synced"] == 5
     assert len(tree_calls) == 1
     assert len([p for p in isdir_calls if str(tmp_path) in str(p)]) == 1
+
+
+def test_sync_serializes_photos_reached_through_folder_alias(tmp_path):
+    """A folder symlink and its target resolve to one sidecar, on one worker.
+
+    Two photos in two folder rows that ``realpath``-collapse to the same
+    directory used to hash to different ``by_sidecar`` keys, so parallel
+    workers parsed one .xmp, mutated it, and each atomically rewrote it --
+    the last writer's tree won and the other photo's keyword vanished even
+    though both changes were reported synced.
+    """
+    from db import Database
+    from sync import sync_to_xmp
+    from xmp import read_keywords
+
+    db = Database(str(tmp_path / "test.db"))
+    db.set_active_workspace(db.ensure_default_workspace())
+    jpeg_id, xmp_path = _setup_photo_with_xmp(tmp_path, db)
+    real_folder = os.path.dirname(xmp_path)
+    alias_folder = str(tmp_path / "alias")
+    os.symlink(real_folder, alias_folder)
+    alias_fid = db.add_folder(alias_folder, name="alias")
+    raw_id = db.add_photo(
+        folder_id=alias_fid, filename="bird.nef", extension=".nef",
+        file_size=100, file_mtime=1.0,
+    )
+    db.queue_change(jpeg_id, "keyword_add", "Osprey")
+    db.queue_change(raw_id, "keyword_add", "Kestrel")
+
+    result = sync_to_xmp(db)
+
+    assert result["synced"] == 2, result["errors"]
+    assert read_keywords(xmp_path) == {"Osprey", "Kestrel"}
+
+
+def test_sync_serializes_case_aliases_on_case_insensitive_filesystems(tmp_path, monkeypatch):
+    """Case-different sidecar paths on a case-insensitive FS are one file.
+
+    ``Bird.CR3`` and ``BIRD.JPG`` in one folder derive sidecar paths ending in
+    ``Bird.xmp`` and ``BIRD.xmp``, distinct Python strings but the same file
+    on macOS APFS or an SMB share. Without alias detection each ran on its
+    own worker and one photo's changes were overwritten.
+    """
+    import sync as sync_module
+
+    from db import Database
+    from sync import sync_to_xmp
+    from xmp import read_keywords
+
+    monkeypatch.setattr(sync_module, "_is_case_insensitive_dir", lambda folder: True)
+
+    db = Database(str(tmp_path / "test.db"))
+    db.set_active_workspace(db.ensure_default_workspace())
+    a_id, xmp_path = _setup_photo_with_xmp(tmp_path, db)
+    folder_id = db.get_photo(a_id)["folder_id"]
+    # Rename the sidecar and the photo so it looks like the mixed-case source.
+    mixed_path = os.path.join(os.path.dirname(xmp_path), "Bird.xmp")
+    os.rename(xmp_path, mixed_path)
+    db.conn.execute(
+        "UPDATE photos SET filename = ?, extension = ? WHERE id = ?",
+        ("Bird.CR3", ".CR3", a_id),
+    )
+    b_id = db.add_photo(
+        folder_id=folder_id, filename="BIRD.JPG", extension=".JPG",
+        file_size=100, file_mtime=1.0,
+    )
+    db.queue_change(a_id, "keyword_add", "Osprey")
+    db.queue_change(b_id, "keyword_add", "Kestrel")
+
+    result = sync_to_xmp(db)
+
+    assert result["synced"] == 2, result["errors"]
+    # Only one sidecar exists on disk under a case-insensitive FS emulation;
+    # both photos' keywords must be in it.
+    assert read_keywords(mixed_path) == {"Osprey", "Kestrel"}
+
+
+def test_sync_keeps_case_variant_sidecars_separate_on_case_sensitive_fs(tmp_path, monkeypatch):
+    """A case-sensitive filesystem must not merge distinct case-variant sidecars.
+
+    Guard against over-grouping: two photos whose sidecar basenames only
+    differ in case are separate files here, so their writes must not collapse
+    onto one path -- that would leave the other file untouched and drop the
+    losing photo's changes into the wrong sidecar.
+    """
+    import sync as sync_module
+
+    from db import Database
+    from sync import sync_to_xmp
+    from xmp import read_keywords
+
+    monkeypatch.setattr(sync_module, "_is_case_insensitive_dir", lambda folder: False)
+
+    db = Database(str(tmp_path / "test.db"))
+    db.set_active_workspace(db.ensure_default_workspace())
+    a_id, xmp_a = _setup_photo_with_xmp(tmp_path, db)
+    folder = os.path.dirname(xmp_a)
+    folder_id = db.get_photo(a_id)["folder_id"]
+    # Second photo whose sidecar is the same basename with the case flipped.
+    b_id = db.add_photo(
+        folder_id=folder_id, filename="BIRD.JPG", extension=".JPG",
+        file_size=100, file_mtime=1.0,
+    )
+    xmp_b = os.path.join(folder, "BIRD.xmp")
+    from xmp import write_sidecar
+    write_sidecar(xmp_b, flat_keywords=set(), hierarchical_keywords=set())
+
+    db.queue_change(a_id, "keyword_add", "Osprey")
+    db.queue_change(b_id, "keyword_add", "Kestrel")
+
+    result = sync_to_xmp(db)
+
+    assert result["synced"] == 2, result["errors"]
+    assert read_keywords(xmp_a) == {"Osprey"}
+    assert read_keywords(xmp_b) == {"Kestrel"}

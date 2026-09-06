@@ -68,6 +68,30 @@ def _write_assigned_location_to_xmp_enabled(db):
 _KEYWORD_CHANGE_TYPES = ("keyword_add", "keyword_remove", "keyword_remove_flat")
 
 
+def _is_case_insensitive_dir(folder):
+    """Detect whether the filesystem holding ``folder`` is case-insensitive.
+
+    macOS APFS's default variant, NTFS, and SMB shares treat ``Bird.xmp`` and
+    ``BIRD.xmp`` as the same file, but ``os.path.normcase`` only lowercases on
+    Windows. Probe by asking whether the folder's own path with an ancestor
+    segment's case flipped still resolves to the same directory. Walks up the
+    ancestry until it finds a segment with letters to flip, and returns False
+    when no letters are available or the probe raises.
+    """
+    head = os.path.abspath(folder)
+    while True:
+        parent, name = os.path.split(head)
+        if not name or parent == head:
+            return False
+        swapped = name.swapcase()
+        if swapped != name:
+            try:
+                return os.path.samefile(head, os.path.join(parent, swapped))
+            except OSError:
+                return False
+        head = parent
+
+
 def _select_changes(changes, change_ids):
     """Restrict ``changes`` to ``change_ids`` plus their paired keyword changes.
 
@@ -350,6 +374,8 @@ def sync_to_xmp(db, progress_callback=None, change_ids=None):
     prepare_failures = {}
     plans = {}
     folder_accessible = {}
+    canonical_folders = {}
+    folder_case_insensitive = {}
     for photo_id, photo_changes in by_photo.items():
         xmp_path = xmp_paths.get(photo_id)
         if not xmp_path:
@@ -360,10 +386,18 @@ def sync_to_xmp(db, progress_callback=None, change_ids=None):
 
         # Check if the folder exists (NAS might be offline). Cache the answer
         # per folder: on a slow or offline mount this is a network round trip,
-        # and a folder holds thousands of photos.
+        # and a folder holds thousands of photos. Resolve symlinks and probe
+        # case sensitivity here too so the sidecar-grouping below sees one
+        # canonical answer per folder rather than one syscall per photo.
         folder = os.path.dirname(xmp_path)
         if folder not in folder_accessible:
             folder_accessible[folder] = os.path.isdir(folder)
+            if folder_accessible[folder]:
+                try:
+                    canonical_folders[folder] = os.path.realpath(folder)
+                except OSError:
+                    canonical_folders[folder] = folder
+                folder_case_insensitive[folder] = _is_case_insensitive_dir(folder)
         if not folder_accessible[folder]:
             prepare_failures[photo_id] = {
                 "photo_id": photo_id,
@@ -396,15 +430,32 @@ def sync_to_xmp(db, progress_callback=None, change_ids=None):
 
     # Group by sidecar, not by photo: a RAW and a JPEG sharing a basename
     # share one .xmp, and two threads publishing the same file would clobber
-    # each other. Photos on one sidecar stay on one worker, in queue order.
+    # each other. Aliases produce different Python strings for the same file
+    # -- symlinked folders, and case variants on case-insensitive filesystems
+    # (macOS APFS, SMB, NTFS) -- so canonicalize the key: the folder resolved
+    # once via ``realpath``, ``normcase`` for Windows, and a case-folded
+    # basename when the filesystem probe says the folder is case-insensitive.
+    # Keep any one of the alias paths for the write itself; on the filesystems
+    # that make them aliases they all open the same file. Photos on one
+    # sidecar stay on one worker, in queue order.
     by_sidecar = defaultdict(list)
+    sidecar_write_path = {}
     for photo_id in plans:
-        by_sidecar[xmp_paths[photo_id]].append(photo_id)
+        xmp_path = xmp_paths[photo_id]
+        folder = os.path.dirname(xmp_path)
+        canonical_folder = canonical_folders.get(folder, folder)
+        basename = os.path.basename(xmp_path)
+        if folder_case_insensitive.get(folder, False):
+            basename = basename.casefold()
+        canonical_key = os.path.normcase(os.path.join(canonical_folder, basename))
+        by_sidecar[canonical_key].append(photo_id)
+        sidecar_write_path.setdefault(canonical_key, xmp_path)
 
-    def write_sidecar_group(xmp_path):
+    def write_sidecar_group(canonical_key):
         """Write every photo queued against one sidecar; never raises."""
+        xmp_path = sidecar_write_path[canonical_key]
         outcomes = {}
-        for photo_id in by_sidecar[xmp_path]:
+        for photo_id in by_sidecar[canonical_key]:
             try:
                 _write_photo_sync(
                     xmp_path, plans[photo_id], locations.get(photo_id),

@@ -29635,6 +29635,42 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                         # requests fail fast instead of retrying both sources
                         # on every hit.
                         _record_working_copy_failure(db, photo, raw_source_path)
+            if img is None and edit_source_is_working_copy:
+                # Quota enforcement can unlink the selected working copy
+                # after the existence check but before ``load_image`` opens
+                # it — a window this branch leaves open deliberately, since
+                # holding the process-wide publication guard across a
+                # full-resolution decode would serialize every zoomed view
+                # in the app. Retry the original source once so an
+                # otherwise healthy view does not become a transient 500
+                # during eviction, and do not record a working-copy failure
+                # for it: nothing is wrong with the source, the cache entry
+                # merely went away. Mirrors the recovery ``/edit-preview``,
+                # ``/crop`` and the preview materializer already have; this
+                # branch was the only reader without one.
+                original_retry_path = os.path.join(
+                    folder["path"], photo["filename"],
+                )
+                if original_retry_path != image_path:
+                    log.info(
+                        "Working copy for photo %s vanished before decode "
+                        "(quota eviction); retrying original source",
+                        photo_id,
+                    )
+                    retry_ext = os.path.splitext(
+                        original_retry_path
+                    )[1].lower()
+                    retry_kwargs = (
+                        {"raw_decode": RAW_DECODE_PRESERVE_HIGHLIGHTS}
+                        if retry_ext in RAW_EXTENSIONS
+                        else {}
+                    )
+                    img = load_image(
+                        original_retry_path, max_size=None, **retry_kwargs,
+                    )
+                    if img is not None:
+                        image_path = original_retry_path
+                        resolved_ext = retry_ext
             if img is None:
                 _record_working_copy_failure(db, photo, image_path)
                 return "Could not load image", 500

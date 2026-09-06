@@ -2037,6 +2037,82 @@ def test_original_serves_full_res_working_copy(app_and_db):
     assert resp.status_code == 200
 
 
+def test_edited_original_retries_source_when_working_copy_is_evicted(
+    app_and_db, monkeypatch,
+):
+    """A copy evicted mid-request must not turn a photo view into a 500.
+
+    The edited ``/original`` branch decodes outside the publication guard
+    on purpose — holding a process-wide lock across a full-resolution
+    decode would serialize every zoomed view — so quota enforcement can
+    unlink the working copy between the existence check and the open.
+    ``/edit-preview``, ``/crop`` and the preview materializer all retry the
+    original source in that window; this branch did not, so an eviction
+    during a backfill surfaced as a failed photo view.
+    """
+    import image_loader
+    from PIL import Image
+
+    app, db = app_and_db
+    client = app.test_client()
+    photo = db.get_photos()[0]
+    photo_id = photo["id"]
+
+    vireo_dir = os.path.dirname(app.config["THUMB_CACHE_DIR"])
+    source_dir = os.path.join(vireo_dir, "retry-source")
+    os.makedirs(source_dir, exist_ok=True)
+    original_path = os.path.join(source_dir, "shot.jpg")
+    Image.new("RGB", (800, 600), (12, 34, 56)).save(original_path, "JPEG")
+
+    working_dir = os.path.join(vireo_dir, "working")
+    os.makedirs(working_dir, exist_ok=True)
+    wc_path = os.path.join(working_dir, f"{photo_id}.jpg")
+    Image.new("RGB", (800, 600), (200, 200, 200)).save(wc_path, "JPEG")
+
+    db.conn.execute(
+        "UPDATE folders SET path=? WHERE id=?",
+        (source_dir, photo["folder_id"]),
+    )
+    db.conn.execute(
+        """UPDATE photos
+           SET filename='shot.jpg', extension='.jpg',
+               width=800, height=600, companion_path=NULL,
+               working_copy_path=?
+           WHERE id=?""",
+        (f"working/{photo_id}.jpg", photo_id),
+    )
+    db.conn.commit()
+    db.set_photo_edit_recipe(photo_id, {"rotation": 90})
+    assert db.get_photo_edit_recipe(photo_id), (
+        "precondition: the edited-original branch only runs with a recipe"
+    )
+
+    # Stand in for quota eviction winning the exists/open race: the copy
+    # disappears at the moment the decode reaches for it.
+    real_load = image_loader.load_image
+    calls = []
+
+    def load_after_eviction(path, *args, **kwargs):
+        calls.append(os.path.basename(path))
+        if os.path.abspath(path) == os.path.abspath(wc_path):
+            with contextlib.suppress(OSError):
+                os.remove(wc_path)
+            return None
+        return real_load(path, *args, **kwargs)
+
+    monkeypatch.setattr(image_loader, "load_image", load_after_eviction)
+
+    resp = client.get(f"/photos/{photo_id}/original")
+    assert calls, (
+        "the request never decoded the working copy, so this test does not "
+        f"exercise the eviction window at all (calls={calls})"
+    )
+    assert resp.status_code == 200, (
+        "an eviction in the exists/open window turned a healthy photo view "
+        "into a 500 instead of falling back to the original source"
+    )
+
+
 def test_original_stamps_the_working_copy_it_serves(app_and_db):
     """Serving a working copy marks it as recently used.
 

@@ -654,6 +654,18 @@ def load_working_image(
             # back to whatever it was; a concurrent publisher shows
             # up as an mtime change, and we skip the restore in that
             # case so their write isn't erased.
+            #
+            # Known residual: if an interactive read stamps this same
+            # copy between our snapshot and our restore, the restore
+            # puts the older value back and that stamp is lost, so a
+            # photo the user just viewed can look staler than it is and
+            # be evicted early (it regenerates on demand — no data loss).
+            # Not worth a third layer of compensation on top of an
+            # overload we intend to remove: the fix is to stop deriving
+            # recency from stat metadata at all and keep it in a
+            # ``working_copy_access(photo_id, accessed_at)`` table, the
+            # shape the preview cache already uses. Tracked as a
+            # follow-up rather than grown here.
             preserved_times_ns = None
             if not record_access:
                 try:

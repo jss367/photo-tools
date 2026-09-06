@@ -756,3 +756,53 @@ def test_group_review_modal_reads_the_same_conflict_as_the_card(db, tmp_path):
               + helpers + "\nvar html = '';\n" + modal + "\nprocess.stdout.write(html);")
     result = subprocess.run([node, "-e", script], capture_output=True, text=True, check=True, timeout=15)
     assert "Strong classification conflict" in result.stdout
+
+
+def test_partial_encounter_keeps_identified_predictions_distinct_from_homonym(db, tmp_path):
+    """A mixed-confirmation encounter with two identified taxa sharing one
+    display name leaves ``species_identities`` on the ambiguous ``name:``
+    fallback (``source_keys`` collides), and ``speciesCandidateKeyForReviewUnit``
+    returns nothing because ``enc.confirmed_species`` is set from the tagged
+    frame. An untagged frame whose own source-backed prediction picks out a
+    *different* identified taxon is a genuine cross-species disagreement:
+    folding it into the unresolved expected key would silence a strong
+    conflict.
+    """
+    from encounters import encounter_species_label
+    from pipeline import attach_species_identities, serialize_results
+
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("Node is required to execute the review comparison")
+    display = "Sharedus species"
+    db.conn.execute("UPDATE taxa SET name = ?, common_name = NULL WHERE inat_id IN (18976, 18997)", (display,))
+    pids = []
+    for i, tid in enumerate((18976, 18997)):
+        pid, det = _photo(db, tmp_path, f"partial-homonym-{i}.jpg")
+        pids.append(pid)
+        db.add_prediction(det, display, .99, "BioCLIP", labels_fingerprint="custom", taxonomy={"taxon_id": tid})
+    # Tag only the first photo with taxon-A: the encounter is now mixed.
+    kid = db.conn.execute(
+        "INSERT INTO keywords (name, is_species, type, taxon_id, source_taxon_id) "
+        "SELECT ?, 1, 'taxonomy', id, inat_id FROM taxa WHERE inat_id = ?", (display, 18976),
+    ).lastrowid
+    db.tag_photo(pids[0], kid)
+
+    photos = load_photo_features(db)
+    data = serialize_results({"photos": photos, "summary": {}, "encounters": [
+        {"photos": photos, "species": encounter_species_label(photos), "bursts": [photos]},
+    ]})
+    data = json.loads(json.dumps(data))
+    attach_species_identities(data, SpeciesResolver(db=db))
+    assert data["species_identities"][display]["key"].startswith("name:")
+    assert data["encounters"][0]["confirmed_species"] == display
+    assert data["encounters"][0]["species_confirmed"] is False
+
+    html = (Path(__file__).parents[1] / "templates/pipeline_review.html").read_text()
+    source = html[html.index("var SPECIES_CONFLICT_THRESHOLDS"):html.index("function formatSpeciesConfidence")]
+    script = ("var pipelineResults = " + json.dumps(data) + ";\n" + source
+              + "\nvar photoMap = {}; pipelineResults.photos.forEach(function(p) { photoMap[p.id] = p; });"
+                "process.stdout.write(JSON.stringify(buildSpeciesConflictEvidence(photoMap)));")
+    result = subprocess.run([node, "-e", script], capture_output=True, text=True, check=True, timeout=15)
+    evidence = json.loads(result.stdout)
+    assert evidence[str(pids[1])]["severity"] == "strong"

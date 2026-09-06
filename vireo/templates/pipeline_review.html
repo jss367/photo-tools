@@ -2936,12 +2936,17 @@ function analyzePhotoSpeciesConflict(photo, expectedSpecies, normalizeSpecies, e
     // taxon-linked and the other was never identified — a catalog whose
     // taxonomy never recorded its common-name provenance leaves every
     // predicted name at "name:mallard" while the confirmed keyword holds
-    // "taxon:6930". One name and no competing evidence is one species, so
-    // count it as support for the current suggestion instead of evidence
-    // against it. Two identified taxa that merely share a name stay distinct:
-    // those are homonyms, and the difference is real.
+    // "taxon:6930". A prediction the resolver could not identify is not
+    // evidence of a distinct taxon, so count it as support for the current
+    // suggestion instead of arguing against it. A prediction that names its
+    // own taxon (a source-backed "taxon:"/"scientific:" key) is real
+    // evidence and must stay distinct — including when the expected side is
+    // itself unresolved (a partially-confirmed encounter with two identified
+    // homonyms leaves species_identities on the ambiguous "name:" fallback),
+    // otherwise a taxon-A tagged frame beside an untagged taxon-B prediction
+    // reads as full support instead of the strong conflict it is.
     if (species !== expectedKey && speciesDisplayKey(display) === expectedDisplayKey &&
-        (speciesKeyIsUnidentified(species) || speciesKeyIsUnidentified(expectedKey))) {
+        speciesKeyIsUnidentified(species)) {
       species = expectedKey;
     }
     displayNames[species] = display;

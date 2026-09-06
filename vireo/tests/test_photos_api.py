@@ -13197,3 +13197,85 @@ def test_edit_render_touches_working_copy_source_under_guard(
             "instead of reclaiming it, silently overshooting a lowered "
             f"quota: {path}"
         )
+
+
+def test_edit_preview_touches_working_copy_under_guard(
+    client_with_photo, monkeypatch,
+):
+    """`/photos/<id>/edit-preview` must touch the WC source under the guard.
+
+    Regression for a P2 codex review finding on PR #1607 against
+    ``44a1fb58``: the earlier fix landed the touch on ``/original``'s
+    recipe branch, but the editor's interactive ``/edit-preview``
+    endpoint has its own render path (``_recipe_render_source`` +
+    ``load_image`` inside ``_select_and_load_source``) that selects the
+    WC and decodes it without touching. Repeated slider updates on an
+    actively edited photo never advance the WC's mtime, so the photo
+    stays the oldest eviction candidate. And per the same review, the
+    touch must run inside ``working_copy_publication_guard`` — an
+    unguarded touch races ``_evict_once``'s identity check and lets
+    the cache sit above a lowered quota.
+    """
+    import os
+    import time
+
+    import app as app_module
+    import working_copy_cache
+    from PIL import Image
+
+    app, db, photo_id = client_with_photo
+    vireo_dir = os.path.dirname(app.config["THUMB_CACHE_DIR"])
+    working_dir = os.path.join(vireo_dir, "working")
+    os.makedirs(working_dir, exist_ok=True)
+    wc_path = os.path.join(working_dir, f"{photo_id}.jpg")
+    Image.new("RGB", (800, 600), (200, 60, 40)).save(
+        wc_path, "JPEG", quality=90,
+    )
+    db.conn.execute(
+        "UPDATE photos SET working_copy_path=? WHERE id=?",
+        (f"working/{photo_id}.jpg", photo_id),
+    )
+    db.conn.commit()
+    db.set_photo_edit_recipe(photo_id, {"rotation": 90})
+
+    aged = time.time() - 24 * 3600
+    os.utime(wc_path, (aged, aged))
+    aged_mtime = os.path.getmtime(wc_path)
+
+    lock_held_when_touched = []
+    real_touch = working_copy_cache.touch_working_copy_access
+
+    def spy_touch(path):
+        held = working_copy_cache._eviction_lock._is_owned()
+        lock_held_when_touched.append((os.fspath(path), held))
+        return real_touch(path)
+
+    monkeypatch.setattr(app_module, "touch_working_copy_access", spy_touch)
+
+    resp = app.test_client().get(f"/photos/{photo_id}/edit-preview?size=800")
+    assert resp.status_code == 200, resp.data
+
+    # The touch must have happened at least once for the WC path.
+    edit_source_touches = [
+        (path, held)
+        for path, held in lock_held_when_touched
+        if os.path.samefile(path, wc_path)
+    ]
+    assert edit_source_touches, (
+        "edit-preview render did not touch the working copy source: "
+        f"observed touches were {lock_held_when_touched!r}"
+    )
+    for path, held in edit_source_touches:
+        assert held, (
+            "edit-preview touch of the WC source ran OUTSIDE "
+            "``working_copy_publication_guard`` — an eviction pass "
+            "racing this touch would identity-skip the file instead of "
+            f"reclaiming it, overshooting a lowered quota: {path}"
+        )
+
+    now_mtime = os.path.getmtime(wc_path)
+    assert now_mtime > aged_mtime, (
+        "edit-preview render did not advance the WC's mtime; an "
+        f"actively edited photo would stay first in the eviction queue: "
+        f"mtime is still {now_mtime} (aged {aged_mtime})"
+    )

@@ -28863,9 +28863,34 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                         load_max_size = None
                 img = None
                 if not source_failure_current:
-                    img = load_image(
-                        canonical, max_size=load_max_size, **load_kwargs,
-                    )
+                    if using_working_copy:
+                        # Record access on the working copy whenever we
+                        # read it as an edit-preview source and hold
+                        # the publication guard through touch + decode.
+                        # Without the guard the touch races
+                        # ``_evict_once``'s identity check (which then
+                        # skips this file as "replaced," silently
+                        # overshooting a lowered quota); without the
+                        # touch the interactive editor's repeated
+                        # ``/edit-preview`` requests never advance the
+                        # WC's mtime and an actively edited photo stays
+                        # the oldest eviction candidate. Mirrors the
+                        # ``/original`` recipe-render fix and the
+                        # ``_serve_trusted_working_copy`` caller
+                        # contract. The guard is an RLock, so
+                        # reentering it from inside the offline-only
+                        # ``source_guard`` below is safe.
+                        with working_copy_publication_guard():
+                            touch_working_copy_access(canonical)
+                            img = load_image(
+                                canonical, max_size=load_max_size,
+                                **load_kwargs,
+                            )
+                    else:
+                        img = load_image(
+                            canonical, max_size=load_max_size,
+                            **load_kwargs,
+                        )
                 return (
                     canonical, using_working_copy, selected_ext,
                     load_max_size, native_dims, img, source_failure_current,

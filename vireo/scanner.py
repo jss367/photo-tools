@@ -1656,11 +1656,40 @@ def _extract_working_copies(db, vireo_dir, progress_callback=None,
             source = primary_path
             failure_source = "source"
 
+        # Fingerprint the file each successful ``extract_working_copy``
+        # atomically publishes, so the orphan cleanup at the bottom of
+        # this loop can distinguish "our bytes stayed put" from "a
+        # replacement publisher atomically replaced ``wc_abs`` in the
+        # gap between extract's guard release and our reacquire." The
+        # capture runs WHILE extract still holds the publication guard
+        # (via ``on_publish``); a post-return stat is racy — a
+        # competing publisher for a recycled id can atomically replace
+        # ``wc_abs`` before we can stat, so we sample their identity as
+        # ours, the cleanup below sees no catalog owner yet (their
+        # UPDATE is still waiting on our guard), and deletes their
+        # valid bytes. Their extract then observes ``publication_lost``
+        # and cannot commit its otherwise-valid output.
+        from working_copy_cache import _file_identity as _wc_file_identity
+        captured_wc_identity = []
+
+        # Default-arg binds ``sink`` at def-time to this iteration's list
+        # so ruff's B023 loop-closure warning doesn't fire. The callable
+        # is only invoked synchronously by ``extract_working_copy`` (via
+        # ``on_publish``), so the closure never outlives the iteration.
+        def _capture_wc_identity(
+            published_path, sink=captured_wc_identity,
+        ):
+            try:
+                sink.append(_wc_file_identity(os.stat(published_path)))
+            except OSError:
+                sink.append(None)
+
         # extract_working_copy is slow (RAW decode + JPEG encode); run it
         # before any DB write so no transaction is open while it runs.
         ok = extract_working_copy(
             source, wc_abs, max_size=wc_max_size, quality=wc_quality,
             publication_guard=working_copy_publication_guard,
+            on_publish=_capture_wc_identity,
         )
         # Card-side override failed but the verified archive copy exists
         # — retry from the archive before falling through to the RAW→
@@ -1785,25 +1814,13 @@ def _extract_working_copies(db, vireo_dir, progress_callback=None,
                     source, wc_abs,
                     max_size=wc_max_size, quality=wc_quality,
                     publication_guard=working_copy_publication_guard,
+                    on_publish=_capture_wc_identity,
                 )
             raw_failed_then_companion = ok
         publication_lost = False
         publication_orphaned = False
         quota_lowered_during_extraction = False
         retained_before_quota_lowering = set()
-        # Fingerprint the file we just atomically replaced so the orphan
-        # cleanup below cannot delete a replacement publisher's newer bytes
-        # in the gap between extract's guard release and our reacquire. If
-        # ``_file_identity`` on the current file no longer matches this
-        # fingerprint, another publisher has replaced ``wc_abs`` and any
-        # unlink would clobber their file rather than our orphan.
-        from working_copy_cache import _file_identity as _wc_file_identity
-        published_identity = None
-        if ok:
-            try:
-                published_identity = _wc_file_identity(os.stat(wc_abs))
-            except OSError:
-                published_identity = None
         if ok:
             # ``extract_working_copy`` guards its atomic replace, but its
             # guard ends before returning. A competing job may already have
@@ -1923,16 +1940,24 @@ def _extract_working_copies(db, vireo_dir, progress_callback=None,
                 ):
                     publication_orphaned = True
                     # The publication guard released between our extract's
-                    # atomic replace and this reacquire, so a publisher for
-                    # a replacement row (id reuse, on-demand render) could
-                    # have already atomically replaced ``wc_abs`` with its
-                    # own bytes and committed its ``working_copy_path``.
+                    # atomic replace and this reacquire, so a publisher
+                    # for a replacement row (id reuse, on-demand render)
+                    # could have already atomically replaced ``wc_abs``
+                    # with its own bytes — and its own extract may still
+                    # be running (its post-extract UPDATE waiting on our
+                    # guard), so no catalog row yet claims ``wc_rel``.
                     # Unlinking unconditionally would delete that valid
-                    # replacement and leave its committed path pointing at
-                    # a missing file. Compare the current file's identity
-                    # against the one we captured immediately after our
-                    # extract so a mismatched file (or one now claimed by
-                    # another row) survives.
+                    # replacement, and the ``row_owned_by_replacement``
+                    # SELECT alone cannot see it either. Compare the
+                    # current file's identity against the one captured
+                    # INSIDE the extract's guard (via the ``on_publish``
+                    # callback) so the replacement's bytes survive
+                    # whether it has committed yet or not.
+                    published_identity = (
+                        captured_wc_identity[-1]
+                        if captured_wc_identity
+                        else None
+                    )
                     file_still_ours = False
                     if published_identity is not None:
                         try:
@@ -2342,6 +2367,47 @@ def _extract_working_copies(db, vireo_dir, progress_callback=None,
                     stop_after_current = False
                     continue
             break
+
+    # The ``sum(retained_new_files.values()) >= quota_bytes`` stop above
+    # fires as soon as the batch's own footprint hits the ceiling, but
+    # can leave a one-file overshoot when generated sizes don't divide
+    # the ceiling evenly (ten ~110 KB files under a 1 MB quota, say).
+    # If we defer to the unconditional ``evict_if_over_quota`` below,
+    # it sorts by ascending mtime and reclaims the first-generated,
+    # highest-ID copy — the newest import — undoing the DESC-ID
+    # priority the batch was built around. Trim the overshoot ourselves
+    # in ascending-ID order (lowest-priority batch files first) so the
+    # newest imports survive. ``evict_if_over_quota`` reconciles the
+    # now-missing ``working_copy_path`` rows on its next pass.
+    def _wc_id_from_batch_path(path):
+        try:
+            stem, _ = os.path.splitext(os.path.basename(path))
+            return int(stem)
+        except (ValueError, TypeError):
+            return -1
+
+    if retained_new_files and quota_bytes > 0:
+        batch_over = sum(retained_new_files.values()) - quota_bytes
+        if batch_over > 0:
+            for path, size in sorted(
+                list(retained_new_files.items()),
+                key=lambda kv: _wc_id_from_batch_path(kv[0]),
+            ):
+                if batch_over <= 0:
+                    break
+                try:
+                    os.remove(path)
+                except FileNotFoundError:
+                    retained_new_files.pop(path, None)
+                    continue
+                except OSError:
+                    log.warning(
+                        "Post-loop DESC-priority trim could not remove %s",
+                        path, exc_info=True,
+                    )
+                    continue
+                retained_new_files.pop(path, None)
+                batch_over -= size
 
     # A scan/import may add a large batch at once. Enforce once after the
     # batch so the quota stays a hard steady-state ceiling without rescanning

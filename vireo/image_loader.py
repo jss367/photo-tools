@@ -609,6 +609,7 @@ def extract_working_copy(
     quality=92,
     raw_decode=RAW_DECODE_PRESERVE_HIGHLIGHTS,
     publication_guard=None,
+    on_publish=None,
 ):
     """Extract a JPEG working copy from an image file.
 
@@ -622,6 +623,15 @@ def extract_working_copy(
             RAW_DECODE_CAMERA_RENDERED without changing that edit source.
         publication_guard: optional context-manager factory that serializes
             publication to a shared canonical cache path with eviction.
+        on_publish: optional callback ``on_publish(output_path)`` invoked
+            immediately after the atomic replace, WHILE the publication
+            guard is still held. Callers use this to capture the file's
+            fingerprint (mtime, inode, size) as part of the atomic publish
+            step — a post-return stat would be racy, because another
+            publisher can atomically replace the same canonical path in
+            the gap between guard release and the caller's next action.
+            Exceptions from the callback are swallowed with a warning so
+            they cannot fail an otherwise successful publish.
 
     Returns:
         True on success, False on failure
@@ -648,6 +658,14 @@ def extract_working_copy(
         guard = publication_guard() if publication_guard else contextlib.nullcontext()
         with guard:
             os.replace(tmp_path, output_path)
+            if on_publish is not None:
+                try:
+                    on_publish(output_path)
+                except Exception:
+                    log.warning(
+                        "extract_working_copy on_publish callback raised for %s",
+                        output_path, exc_info=True,
+                    )
         tmp_path = None
         return True
     except Exception:

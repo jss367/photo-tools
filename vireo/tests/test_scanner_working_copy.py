@@ -2814,3 +2814,185 @@ def test_desc_batch_protects_own_newest_import_from_mid_batch_eviction(
         "the newest imports uncovered"
     )
     db.close()
+
+
+def test_orphan_cleanup_preserves_racing_publisher_uncommitted_bytes(
+    tmp_path, monkeypatch,
+):
+    """Do not delete a racing publisher's bytes while their UPDATE is queued.
+
+    Regression for a P2 codex review finding on PR #1607: the fingerprint
+    capture used to happen AFTER ``extract_working_copy`` returned (outside
+    the publication guard), so a second publisher racing us for a recycled
+    id could atomically replace ``wc_abs`` between extract's release and
+    our stat, and we would sample THEIR identity as our own
+    ``published_identity``. Our orphan cleanup then found an "identity
+    match" and — with the second publisher's UPDATE still queued on the
+    guard, so no row yet claimed ``working_copy_path`` — deleted their
+    valid bytes. Their extract then observed ``publication_lost`` and
+    could never commit its otherwise-valid output.
+
+    The fix captures the identity via ``extract_working_copy``'s
+    ``on_publish`` callback while it still holds the guard. Simulate the
+    race by atomically replacing ``wc_abs`` with a different file
+    identity in the gate between extract's return and the scanner's
+    guard reacquire; the DB row for the reused id is left with no
+    ``working_copy_path`` (mirroring the queued-UPDATE case). Then check
+    that the file survives — the identity captured under the guard did
+    NOT match the replacement, so cleanup stood down.
+    """
+    import threading
+
+    import scanner
+
+    app, vireo_dir, ids = _prepare_backfill_app(
+        tmp_path, monkeypatch, ["target.jpg"],
+    )
+    target_id = ids[0]
+
+    real_extract = scanner.extract_working_copy
+    extract_returned = threading.Event()
+    release_after_race = threading.Event()
+
+    def gated_extract(*args, **kwargs):
+        result = real_extract(*args, **kwargs)
+        extract_returned.set()
+        # Hold BEFORE the scanner's guard reacquire so the test can
+        # simulate a racing publisher atomically replacing ``wc_abs``
+        # in the exact window this fix closes.
+        assert release_after_race.wait(timeout=30), (
+            "test never released post-extract"
+        )
+        return result
+
+    monkeypatch.setattr(scanner, "extract_working_copy", gated_extract)
+
+    app._kickoff_working_copy_backfill()
+    assert extract_returned.wait(timeout=30), "extraction never returned"
+
+    from db import Database
+    db_path = app.config["DB_PATH"]
+    admin_db = Database(db_path)
+    target_row = admin_db.conn.execute(
+        "SELECT p.folder_id, f.path AS folder_path"
+        " FROM photos p JOIN folders f ON f.id=p.folder_id"
+        " WHERE p.id=?",
+        (target_id,),
+    ).fetchone()
+    folder_id = target_row["folder_id"]
+    photos_dir = target_row["folder_path"]
+    admin_db.conn.execute("DELETE FROM photos WHERE id=?", (target_id,))
+    admin_db.conn.commit()
+
+    # Reinsert to reuse the id — this is the "racing publisher's row"
+    # (still queued behind our guard, so ``working_copy_path`` NULL).
+    replacement_src = os.path.join(photos_dir, "replacement.jpg")
+    _make_jpeg(replacement_src, 1600, 1200)
+    new_id = admin_db.add_photo(
+        folder_id, "replacement.jpg", ".jpg",
+        file_size=os.path.getsize(replacement_src),
+        file_mtime=os.path.getmtime(replacement_src),
+        width=1600, height=1200,
+    )
+    assert new_id == target_id, (
+        f"id reuse setup failed: {new_id} != {target_id}"
+    )
+
+    # Atomically replace ``wc_abs`` with the racing publisher's bytes.
+    wc_abs = vireo_dir / "working" / f"{target_id}.jpg"
+    racing_bytes = b"RACING PUBLISHER BYTES DIFFERENT FROM OURS"
+    tmp_replace = wc_abs.parent / f".{target_id}.repl.jpg.tmp"
+    tmp_replace.write_bytes(racing_bytes)
+    os.replace(str(tmp_replace), str(wc_abs))
+
+    # Do NOT commit the racing publisher's ``working_copy_path`` — this
+    # is the case where their UPDATE is still queued behind our guard.
+    admin_db.conn.close()
+
+    release_after_race.set()
+    job = _wait_for_backfill_terminal(app._job_runner)
+    assert job["status"] == "completed", f"job: {job}"
+
+    assert wc_abs.exists(), (
+        "orphan cleanup deleted the racing publisher's uncommitted "
+        "bytes — the fingerprint captured outside the extract guard "
+        "matched the replacement's identity, so cleanup thought the "
+        "file was still ours"
+    )
+    assert wc_abs.read_bytes() == racing_bytes, (
+        "wc_abs was clobbered — orphan cleanup did not preserve the "
+        "racing publisher's file identity"
+    )
+
+
+def test_post_loop_trim_evicts_lowest_id_first_preserving_newest(
+    tmp_path, monkeypatch,
+):
+    """Post-batch quota trim must respect DESC-ID ordering, not ASC mtime.
+
+    Regression for a P2 codex review finding on PR #1607: when generated
+    sizes do not divide the quota evenly, ``sum(retained_new_files) >=
+    quota_bytes`` fires on a one-file overshoot but the unconditional
+    final ``evict_if_over_quota`` sorted by ASC mtime and reclaimed the
+    first-generated, highest-ID copy — the very newest import. Ten
+    ~110 KB files under a 1 MB quota is the canonical reproducer.
+    """
+    import config as cfg
+    from db import Database
+    from scanner import _extract_working_copies
+
+    monkeypatch.setattr(cfg, "CONFIG_PATH", str(tmp_path / "config.json"))
+    cfg.save({
+        **cfg.DEFAULTS,
+        "working_copy_max_size": 1000,
+        "working_copy_quality": 90,
+        "working_copy_cache_max_mb": 1,
+    })
+
+    folder = tmp_path / "photos"
+    folder.mkdir()
+    vireo_dir = tmp_path / "vireo"
+    vireo_dir.mkdir()
+    working_dir = vireo_dir / "working"
+    working_dir.mkdir()
+    db = Database(str(vireo_dir / "test.db"))
+    folder_id = db.add_folder(str(folder))
+
+    imported_ids = []
+    for i in range(10):
+        src = folder / f"photo-{i:02d}.jpg"
+        _make_jpeg(str(src), 2000, 1500)
+        imported_ids.append(
+            _photo_id_of_file(db, folder_id, f"photo-{i:02d}.jpg", src)
+        )
+
+    highest_id = max(imported_ids)
+
+    import scanner as _scanner_mod
+
+    def fixed_extract(_source, output, **_kwargs):
+        # Pack each generated file to ~110 KB — deterministic sizes so
+        # ten files land at ~1100 KB, above a 1 MB quota by exactly one
+        # file. This is the "one-file overshoot" the review flagged.
+        with open(output, "wb") as handle:
+            handle.truncate(110 * 1024)
+        return True
+
+    monkeypatch.setattr(_scanner_mod, "extract_working_copy", fixed_extract)
+
+    _extract_working_copies(db, str(vireo_dir))
+
+    highest_copy = working_dir / f"{highest_id}.jpg"
+    lowest_copy = working_dir / f"{min(imported_ids)}.jpg"
+    assert highest_copy.exists(), (
+        "post-loop trim evicted the newest import (highest id, oldest "
+        "wall-clock mtime); the DESC-priority trim was not applied — "
+        "the final unprotected ``evict_if_over_quota`` picked the "
+        "oldest mtime as it always would"
+    )
+    assert not lowest_copy.exists(), (
+        "post-loop trim did not reclaim the lowest-priority batch "
+        "file (lowest id); the batch is over quota with no lowest-id "
+        "eviction, so the ceiling is not enforced"
+    )
+    db.close()

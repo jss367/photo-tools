@@ -1635,3 +1635,57 @@ def test_sync_reports_a_malformed_queue_row_without_aborting_the_run(tmp_path):
     assert read_keywords(good_xmp) == {"Osprey"}
     # The good photo's row is retired; the malformed one stays queued.
     assert [c["photo_id"] for c in db.get_pending_changes()] == [bad_id]
+
+
+def test_sync_serializes_folder_rows_that_differ_only_in_case(tmp_path):
+    """Two folder rows spelled differently in case are one directory.
+
+    A share mounted case-insensitively can be catalogued twice --
+    ``/mnt/Photos`` and ``/mnt/PHOTOS`` -- and ``realpath`` preserves each
+    spelling while ``normcase`` does nothing off Windows, so folding only the
+    basename left the two spellings in separate groups holding separate
+    locks. Their photos could then publish over the same sidecar at once.
+    """
+    import threading
+
+    import xmp as xmp_module
+    from db import Database
+    from sync import sync_to_xmp
+    from xmp import read_keywords, write_sidecar
+
+    db = Database(str(tmp_path / "test.db"))
+    db.set_active_workspace(db.ensure_default_workspace())
+    a_id, xmp_a = _setup_photo_with_xmp(tmp_path, db)
+    lower_folder = os.path.dirname(xmp_a)
+    upper_folder = os.path.join(os.path.dirname(lower_folder), "PHOTOS")
+    # The same directory on a case-insensitive host, a sibling on a
+    # case-sensitive one; either way the two rows must share a worker.
+    os.makedirs(upper_folder, exist_ok=True)
+    upper_fid = db.add_folder(upper_folder, name="PHOTOS")
+    # Same basename as the photo in the lower-case row, so the two sidecar
+    # paths differ only in the folder's spelling.
+    b_id = db.add_photo(folder_id=upper_fid, filename="bird.nef",
+                        extension=".nef", file_size=100, file_mtime=1.0)
+    xmp_b = os.path.join(upper_folder, "bird.xmp")
+    write_sidecar(xmp_b, flat_keywords=set(), hierarchical_keywords=set())
+
+    db.queue_change(a_id, "keyword_add", "Osprey")
+    db.queue_change(b_id, "keyword_add", "Kestrel")
+
+    threads = []
+    original = xmp_module._write_tree_atomic
+
+    def record_thread(tree, path):
+        threads.append(threading.current_thread().name)
+        return original(tree, path)
+
+    xmp_module._write_tree_atomic = record_thread
+    try:
+        result = sync_to_xmp(db)
+    finally:
+        xmp_module._write_tree_atomic = original
+
+    assert result["synced"] == 2, result["errors"]
+    assert len(set(threads)) == 1, threads
+    assert "Osprey" in read_keywords(xmp_a)
+    assert "Kestrel" in read_keywords(xmp_b)

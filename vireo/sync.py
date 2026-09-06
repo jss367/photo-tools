@@ -419,9 +419,12 @@ def sync_to_xmp(db, progress_callback=None, change_ids=None):
     # Group photos that may share a sidecar, so no two threads publish the
     # same file: a RAW and a JPEG with one basename share one .xmp, and
     # aliases spell the same file differently -- a folder reached through a
-    # symlink, or basenames differing only in case on APFS/SMB/NTFS. The key
-    # is the realpath'd folder plus a normcase'd, case-folded basename, so
-    # every alias lands in one group.
+    # symlink, or components differing only in case on APFS/SMB/NTFS. The key
+    # is the realpath'd folder joined to the basename, then case-folded whole:
+    # ``realpath`` preserves the spelling of every component and ``normcase``
+    # only lowercases on Windows, so folding the basename alone would leave
+    # two folder rows spelled ``/mnt/Photos`` and ``/mnt/PHOTOS`` in separate
+    # groups even though the share treats them as one directory.
     #
     # Grouping decides ordering only; each photo is still written through its
     # own path. That makes an over-grouping harmless: two names a
@@ -440,8 +443,8 @@ def sync_to_xmp(db, progress_callback=None, change_ids=None):
             os.path.dirname(xmp_path), os.path.dirname(xmp_path),
         )
         canonical_key = os.path.normcase(
-            os.path.join(canonical_folder, os.path.basename(xmp_path).casefold())
-        )
+            os.path.join(canonical_folder, os.path.basename(xmp_path))
+        ).casefold()
         by_sidecar[canonical_key].append((photo_id, xmp_path))
 
     sidecar_locks = {}
@@ -458,9 +461,11 @@ def sync_to_xmp(db, progress_callback=None, change_ids=None):
         ``_write_tree_atomic`` resolves the link and replaces the same file.
         Resolving here costs nothing the publish was not already paying (it
         resolves too) and it happens on the pool thread, not in the serial
-        prepare loop.
+        prepare loop. The key is case-folded for the same reason the group key
+        is: ``realpath`` keeps each component's spelling, so two case
+        spellings of one directory would otherwise take different locks.
         """
-        key = os.path.normcase(os.path.realpath(xmp_path))
+        key = os.path.normcase(os.path.realpath(xmp_path)).casefold()
         with sidecar_locks_guard:
             lock = sidecar_locks.get(key)
             if lock is None:

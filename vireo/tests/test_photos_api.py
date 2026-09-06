@@ -13302,3 +13302,92 @@ def test_edit_preview_touches_working_copy_under_guard(
         "edit handoff would treat this as a content change and "
         "overwrite the file the external editor saved into"
     )
+
+
+def test_crop_preview_touches_working_copy_under_guard(
+    client_with_photo, monkeypatch,
+):
+    """`/photos/<id>/crop` must touch the WC source under the guard.
+
+    Regression for a P2 codex review finding on PR #1607 against
+    ``37285d8a``: the earlier fixes landed the touch on ``/original``'s
+    recipe branch and ``/edit-preview``'s ``_select_and_load_source``,
+    but ``serve_crop_preview`` at ``app.py:~28199-28212`` also selects
+    ``working_copy_path`` and decodes it directly without touching. A
+    session that repeatedly reads BioCLIP-input crops of the same
+    photo never advances the WC's atime; the file therefore stays
+    first in the quota eviction queue (sort key: ``max(mtime, atime)``)
+    even while it is actively being used. The touch must run inside
+    ``working_copy_publication_guard`` so an ``_evict_once`` racing it
+    cannot identity-skip a file whose atime just moved and leave the
+    cache above a lowered quota.
+    """
+    import os
+    import time
+
+    import app as app_module
+    import working_copy_cache
+    from PIL import Image
+
+    app, db, photo_id = client_with_photo
+    vireo_dir = os.path.dirname(app.config["THUMB_CACHE_DIR"])
+    working_dir = os.path.join(vireo_dir, "working")
+    os.makedirs(working_dir, exist_ok=True)
+    wc_path = os.path.join(working_dir, f"{photo_id}.jpg")
+    Image.new("RGB", (800, 600), (200, 60, 40)).save(
+        wc_path, "JPEG", quality=90,
+    )
+    db.conn.execute(
+        "UPDATE photos SET working_copy_path=? WHERE id=?",
+        (f"working/{photo_id}.jpg", photo_id),
+    )
+    db.conn.commit()
+
+    aged = time.time() - 24 * 3600
+    os.utime(wc_path, (aged, aged))
+    aged_atime = os.stat(wc_path).st_atime
+    aged_mtime = os.stat(wc_path).st_mtime
+
+    lock_held_when_touched = []
+    real_touch = working_copy_cache.touch_working_copy_access
+
+    def spy_touch(path):
+        held = working_copy_cache._eviction_lock._is_owned()
+        lock_held_when_touched.append((os.fspath(path), held))
+        return real_touch(path)
+
+    monkeypatch.setattr(app_module, "touch_working_copy_access", spy_touch)
+
+    resp = app.test_client().get(f"/photos/{photo_id}/crop")
+    assert resp.status_code == 200, resp.data
+    assert resp.content_type == "image/jpeg"
+
+    crop_source_touches = [
+        (path, held)
+        for path, held in lock_held_when_touched
+        if os.path.samefile(path, wc_path)
+    ]
+    assert crop_source_touches, (
+        "crop-preview render did not touch the working copy source: "
+        f"observed touches were {lock_held_when_touched!r}"
+    )
+    for path, held in crop_source_touches:
+        assert held, (
+            "crop-preview touch of the WC source ran OUTSIDE "
+            "``working_copy_publication_guard`` — an eviction pass "
+            "racing this touch would identity-skip the file instead of "
+            f"reclaiming it, overshooting a lowered quota: {path}"
+        )
+
+    stat_after = os.stat(wc_path)
+    assert stat_after.st_atime > aged_atime, (
+        "crop-preview render did not advance the WC's atime; a photo "
+        "whose crops are repeatedly requested would stay first in the "
+        f"eviction queue (sort key: max(mtime, atime)): atime is still "
+        f"{stat_after.st_atime} (aged {aged_atime})"
+    )
+    assert stat_after.st_mtime == aged_mtime, (
+        "crop-preview render advanced the WC's mtime — the external-"
+        "edit handoff would treat this as a content change and "
+        "overwrite the file the external editor saved into"
+    )

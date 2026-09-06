@@ -28209,7 +28209,20 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 return "Not found", 404
             image_path = os.path.join(folder["path"], photo["filename"])
 
-        img = load_image(image_path, max_size=None)
+        if using_working_copy:
+            # Stamp access recency and hold the publication guard across
+            # the decode — same pattern as ``/photos/<id>/original`` and
+            # ``/photos/<id>/edit-preview``. Without this, repeated
+            # interactive crop previews leave the working copy's atime
+            # unchanged and it stays first in the quota eviction queue
+            # even while the user is actively working on the photo. The
+            # guard also prevents ``_evict_once`` from unlinking the
+            # source bytes between the touch and the decode.
+            with working_copy_publication_guard():
+                touch_working_copy_access(image_path)
+                img = load_image(image_path, max_size=None)
+        else:
+            img = load_image(image_path, max_size=None)
         if img is None and using_working_copy:
             # Quota enforcement can unlink the working copy after the
             # existence check above but before Pillow opens it. Re-resolve

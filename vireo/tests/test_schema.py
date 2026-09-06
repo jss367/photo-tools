@@ -13,7 +13,7 @@ def test_ensure_schema_applies_registry_and_validation(tmp_path):
     schema.ensure_schema(db_path)
 
     with sqlite3.connect(db_path) as conn:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 9
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 10
         assert conn.execute(
             "SELECT value FROM db_meta WHERE key='schema_manager'"
         ).fetchone()[0] == "registry-v1"
@@ -41,14 +41,14 @@ def test_failed_registry_migration_rolls_back_version_and_data(tmp_path, monkeyp
         )
         raise RuntimeError("simulated interruption")
 
-    migration = schema.Migration(10, "interrupted", fail_after_write)
+    migration = schema.Migration(11, "interrupted", fail_after_write)
     monkeypatch.setattr(schema, "MIGRATIONS", (*schema.MIGRATIONS, migration))
 
     with pytest.raises(RuntimeError, match="simulated interruption"):
         schema.ensure_schema(db_path)
 
     with sqlite3.connect(db_path) as conn:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 9
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 10
         assert conn.execute(
             "SELECT 1 FROM db_meta WHERE key='partial_migration'"
         ).fetchone() is None
@@ -73,7 +73,7 @@ def test_concurrent_schema_startup_is_serialized(tmp_path):
     assert not errors
     assert all(not thread.is_alive() for thread in threads)
     with sqlite3.connect(db_path) as conn:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 9
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 10
 
 
 def test_navigation_restore_changes_only_consolidated_default(tmp_path):
@@ -460,7 +460,7 @@ def test_legacy_megadetector_alias_merge_preserves_predictions_and_reviews(tmp_p
             (photo_id, "megadetector-v6", 2),
             (empty_photo_id, "megadetector-v6", 0),
         ]
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 9
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 10
         assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
 
     with Database(db_path, initialize_schema=False) as migrated_db:
@@ -1107,7 +1107,7 @@ def test_legacy_megadetector_zero_box_run_is_normalized_without_detections(tmp_p
             """,
             (photo_id,),
         ).fetchone() == ("megadetector-v6", 0)
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 9
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 10
 
 
 def test_legacy_merge_prompt_remap_skips_when_other_detection_matches(tmp_path):
@@ -1593,3 +1593,78 @@ def test_ensure_schema_keeps_later_version_snapshots(tmp_path):
     assert not os.path.exists(older_backup)
     # The later-version backup must survive — it may be irreplaceable.
     assert os.path.exists(newer_backup)
+
+
+def test_split_grouping_history_snapshots_migration(tmp_path):
+    """v10 moves inline pipeline_grouping snapshots to edit_history_payloads.
+
+    Each such row carried the workspace's whole before/after encounter
+    lists in ``edit_history.new_value``, so every undo-status poll and
+    history prune scanned those blobs.
+    """
+    import json
+
+    from services.grouping_history import load_grouping_change
+
+    db_path = str(tmp_path / "vireo.db")
+    snapshot = {
+        "before": [{"photo_ids": [1, 2, 3], "bursts": [{"photo_ids": [1, 2, 3]}]}],
+        "after": [
+            {"photo_ids": [1, 2], "bursts": [{"photo_ids": [1, 2]}]},
+            {"photo_ids": [3], "bursts": [{"photo_ids": [3]}]},
+        ],
+    }
+    photo_edit = {"action_type": "flag", "new_value": "flagged"}
+    with Database(db_path) as db:
+        ws_id = db._ws_id()
+        db.conn.execute(
+            "INSERT INTO edit_history (workspace_id, action_type, description, new_value) "
+            "VALUES (?, 'pipeline_grouping', 'Detached burst', ?)",
+            (ws_id, json.dumps({**snapshot, "photo_edit": photo_edit})),
+        )
+        db.conn.execute(
+            "INSERT INTO edit_history (workspace_id, action_type, description, new_value) "
+            "VALUES (?, 'pipeline_grouping', 'Retired', ?)",
+            (ws_id, json.dumps({"photo_edit": photo_edit, "photo_only": True})),
+        )
+        db.conn.execute(
+            "INSERT INTO edit_history (workspace_id, action_type, description, new_value) "
+            "VALUES (?, 'flag', 'Set flag to flagged', 'flagged')",
+            (ws_id,),
+        )
+        db.conn.commit()
+        db.conn.execute("PRAGMA user_version = 9")
+
+    schema.ensure_schema(db_path)
+
+    with sqlite3.connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 10
+        rows = conn.execute(
+            "SELECT eh.id, eh.action_type, eh.new_value, p.payload "
+            "FROM edit_history eh LEFT JOIN edit_history_payloads p ON p.edit_id = eh.id "
+            "ORDER BY eh.id"
+        ).fetchall()
+        split, retired, flag = rows
+        assert json.loads(split["new_value"]) == {"photo_edit": photo_edit}
+        assert json.loads(split["payload"]) == snapshot
+        # Already-small rows are left alone.
+        assert json.loads(retired["new_value"]) == {"photo_edit": photo_edit, "photo_only": True}
+        assert retired["payload"] is None
+        assert flag["new_value"] == "flagged" and flag["payload"] is None
+        indexes = {r[1] for r in conn.execute("PRAGMA index_list(edit_history)")}
+        assert "idx_edit_history_ws_undone_created" in indexes
+        item_indexes = {r[1] for r in conn.execute("PRAGMA index_list(edit_history_items)")}
+        assert "idx_edit_history_items_edit" in item_indexes
+
+    with Database(db_path, initialize_schema=False) as db:
+        entry = db.conn.execute(
+            "SELECT * FROM edit_history WHERE description = 'Detached burst'"
+        ).fetchone()
+        assert load_grouping_change(db, entry) == {**snapshot, "photo_edit": photo_edit}
+        # Deleting the history row removes its snapshot with it.
+        db.conn.execute("DELETE FROM edit_history WHERE id = ?", (entry["id"],))
+        db.conn.commit()
+        assert db.conn.execute(
+            "SELECT COUNT(*) FROM edit_history_payloads"
+        ).fetchone()[0] == 0

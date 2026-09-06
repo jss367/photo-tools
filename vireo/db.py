@@ -1088,6 +1088,18 @@ class Database:
                 new_value TEXT
             );
 
+            -- Large per-edit blobs (the before/after encounter snapshots a
+            -- ``pipeline_grouping`` edit restores from) live here, not in
+            -- ``edit_history.new_value``. Those snapshots run to tens of MB
+            -- each; kept inline they made every scan of ``edit_history``
+            -- (undo status after each flag, the prune inside every
+            -- record_edit) walk gigabytes of overflow pages. Loaded only by
+            -- an actual undo/redo; deleted with the parent row.
+            CREATE TABLE IF NOT EXISTS edit_history_payloads (
+                edit_id  INTEGER PRIMARY KEY REFERENCES edit_history(id) ON DELETE CASCADE,
+                payload  TEXT NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS taxa_common_names (
                 taxon_id    INTEGER REFERENCES taxa(id) ON DELETE CASCADE,
                 name        TEXT NOT NULL,
@@ -1250,6 +1262,15 @@ class Database:
 
             CREATE INDEX IF NOT EXISTS idx_photos_timestamp ON photos(timestamp);
             CREATE INDEX IF NOT EXISTS idx_photos_folder ON photos(folder_id);
+
+            -- Undo/redo status, undo_last_edit, and _prune_edit_history all
+            -- filter on (workspace_id, undone) and order by (created_at, id);
+            -- the prune's NOT EXISTS and every cascade/retarget look items
+            -- up by edit_id.
+            CREATE INDEX IF NOT EXISTS idx_edit_history_ws_undone_created
+                ON edit_history(workspace_id, undone, created_at, id);
+            CREATE INDEX IF NOT EXISTS idx_edit_history_items_edit
+                ON edit_history_items(edit_id);
             CREATE INDEX IF NOT EXISTS idx_photos_rating ON photos(rating);
             CREATE INDEX IF NOT EXISTS idx_photos_file_hash ON photos(file_hash);
 
@@ -21157,6 +21178,10 @@ class Database:
                     "UPDATE edit_history SET new_value = ?, description = ? WHERE id = ?",
                     (json.dumps({'photo_edit': photo_edit, 'photo_only': True}),
                      "Photo changes from: " + row["description"], entry_id),
+                )
+                # The stale snapshot is never restored again; drop its blob.
+                self.conn.execute(
+                    "DELETE FROM edit_history_payloads WHERE edit_id = ?", (entry_id,),
                 )
                 return
         self.conn.execute("DELETE FROM edit_history WHERE id = ?", (entry_id,))

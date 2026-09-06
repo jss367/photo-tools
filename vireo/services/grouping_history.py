@@ -127,6 +127,79 @@ def _restored_summary(current_summary, encounters):
     return summary
 
 
+# Keys of a ``pipeline_grouping`` change that hold whole-workspace encounter
+# snapshots. They are stored in ``edit_history_payloads``; everything else
+# (``photo_edit``, ``label_edit``, ``photo_only``) stays in the small
+# ``edit_history.new_value`` so status/list/retire paths never load a snapshot.
+GROUPING_SNAPSHOT_KEYS = ("before", "after")
+
+
+def split_grouping_change(change):
+    """Return ``(meta, snapshot)`` halves of a grouping change dict."""
+    snapshot = {k: change[k] for k in GROUPING_SNAPSHOT_KEYS if k in change}
+    meta = {k: v for k, v in change.items() if k not in GROUPING_SNAPSHOT_KEYS}
+    return meta, snapshot
+
+
+def store_grouping_snapshot(db, edit_id, snapshot):
+    """Attach ``snapshot`` to history row ``edit_id`` (replacing any prior one)."""
+    if not snapshot:
+        db.conn.execute(
+            "DELETE FROM edit_history_payloads WHERE edit_id = ?", (edit_id,),
+        )
+        return
+    db.conn.execute(
+        "INSERT OR REPLACE INTO edit_history_payloads (edit_id, payload) VALUES (?, ?)",
+        (edit_id, json.dumps(snapshot)),
+    )
+
+
+def record_grouping_edit(db, description, change, items=(), *, _commit=False):
+    """Record a ``pipeline_grouping`` edit, snapshot in the payload table.
+
+    Same transaction contract as ``Database.record_edit``: with
+    ``_commit=False`` the caller owns the commit and the later prune.
+    """
+    meta, snapshot = split_grouping_change(change)
+    edit_id = db.record_edit(
+        "pipeline_grouping", description, json.dumps(meta), items, _commit=False,
+    )
+    store_grouping_snapshot(db, edit_id, snapshot)
+    if _commit:
+        db.conn.commit()
+        db._prune_edit_history()
+    return edit_id
+
+
+def convert_to_grouping_edit(db, edit_id, change):
+    """Rewrite an existing photo edit as the grouping edit that wraps it."""
+    meta, snapshot = split_grouping_change(change)
+    db.conn.execute(
+        "UPDATE edit_history SET action_type = 'pipeline_grouping', new_value = ? WHERE id = ?",
+        (json.dumps(meta), edit_id),
+    )
+    store_grouping_snapshot(db, edit_id, snapshot)
+
+
+def load_grouping_change(db, entry):
+    """Return the full change dict for a ``pipeline_grouping`` history row.
+
+    Merges the snapshot half back in from ``edit_history_payloads``. Rows
+    written before the split still carry the snapshot inline and are read
+    as-is, so an unmigrated database keeps undoing correctly.
+    """
+    change = json.loads(entry["new_value"] or "{}")
+    if change.get("photo_only") or any(k in change for k in GROUPING_SNAPSHOT_KEYS):
+        return change
+    row = db.conn.execute(
+        "SELECT payload FROM edit_history_payloads WHERE edit_id = ?",
+        (entry["id"],),
+    ).fetchone()
+    if row is not None:
+        change.update(json.loads(row[0]))
+    return change
+
+
 def save_grouping_edit(db, before, after, description, *, photo_edit=None, items=(), label_edit=False):
     """Save a detach and its history together, restoring the cache on failure.
 
@@ -144,9 +217,7 @@ def save_grouping_edit(db, before, after, description, *, photo_edit=None, items
         change["label_edit"] = True
     if photo_edit:
         change["photo_edit"] = photo_edit
-    db.record_edit(
-        "pipeline_grouping", description, json.dumps(change), items, _commit=False,
-    )
+    record_grouping_edit(db, description, change, items)
     saved = False
     try:
         save_results_raw(after, cache_dir, db._ws_id())
@@ -373,7 +444,7 @@ def restore_grouping_edit(db, entry, *, undo):
     from pipeline import load_results_raw, save_results_raw
     from pipeline_locks import acquire_workspace_regroup
 
-    change = json.loads(entry["new_value"])
+    change = load_grouping_change(db, entry)
     if change.get("photo_only"):
         # A stale grouping snapshot was retired; its photo half still uses
         # the non-committing replay below and the caller's writer transaction.

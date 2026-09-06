@@ -943,6 +943,73 @@ def _validate_portable_cache_identity(conn):
             )
 
 
+def _split_grouping_history_snapshots(conn):
+    """Move inline ``pipeline_grouping`` snapshots into ``edit_history_payloads``.
+
+    Before this, each grouping edit stored its whole-workspace before/after
+    encounter lists (tens of MB per edit) in ``edit_history.new_value``.
+    ``edit_history`` has no other large columns, so those rows turned every
+    undo-status poll and every history prune into a multi-gigabyte scan.
+    Rows are processed one at a time to bound memory; the parent row keeps
+    only the small metadata half (``photo_edit`` / ``label_edit``).
+    """
+    from services.grouping_history import split_grouping_change
+
+    ids = [
+        row[0] for row in conn.execute(
+            "SELECT id FROM edit_history "
+            "WHERE action_type = 'pipeline_grouping' AND new_value IS NOT NULL "
+            "ORDER BY id"
+        ).fetchall()
+    ]
+    for edit_id in ids:
+        row = conn.execute(
+            "SELECT new_value FROM edit_history WHERE id = ?", (edit_id,),
+        ).fetchone()
+        if row is None or not row[0]:
+            continue
+        try:
+            change = json.loads(row[0])
+        except ValueError:
+            continue
+        if not isinstance(change, dict):
+            continue
+        meta, snapshot = split_grouping_change(change)
+        if not snapshot:
+            continue
+        conn.execute(
+            "INSERT OR REPLACE INTO edit_history_payloads (edit_id, payload) VALUES (?, ?)",
+            (edit_id, json.dumps(snapshot)),
+        )
+        conn.execute(
+            "UPDATE edit_history SET new_value = ? WHERE id = ?",
+            (json.dumps(meta), edit_id),
+        )
+
+
+def _validate_grouping_history_snapshots_split(conn):
+    from services.grouping_history import GROUPING_SNAPSHOT_KEYS
+
+    for edit_id, new_value in conn.execute(
+        "SELECT id, new_value FROM edit_history "
+        "WHERE action_type = 'pipeline_grouping' AND new_value IS NOT NULL"
+    ).fetchall():
+        try:
+            change = json.loads(new_value)
+        except ValueError:
+            continue
+        if isinstance(change, dict) and any(k in change for k in GROUPING_SNAPSHOT_KEYS):
+            raise RuntimeError(
+                "schema migration validation failed: grouping snapshot still "
+                f"inline on edit_history row {edit_id}"
+            )
+    fk_errors = conn.execute("PRAGMA foreign_key_check(edit_history_payloads)").fetchall()
+    if fk_errors:
+        raise RuntimeError(
+            "schema migration validation failed: orphaned edit_history_payloads rows"
+        )
+
+
 MIGRATIONS = (
     Migration(
         version=5,
@@ -971,6 +1038,12 @@ MIGRATIONS = (
         name="add-portable-computation-cache-identity",
         apply=_add_portable_cache_identity,
         validate=_validate_portable_cache_identity,
+    ),
+    Migration(
+        version=10,
+        name="split-grouping-history-snapshots",
+        apply=_split_grouping_history_snapshots,
+        validate=_validate_grouping_history_snapshots_split,
     ),
 )
 

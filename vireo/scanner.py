@@ -1539,6 +1539,13 @@ def _extract_working_copies(db, vireo_dir, progress_callback=None,
     incremental_threshold = _incremental_threshold(quota_bytes)
     new_bytes_since_enforce = 0
     retained_new_files = {}
+    # Parallel to ``retained_new_files``: {abs_path: _file_identity} of the
+    # bytes THIS batch published. The post-loop DESC-priority trim verifies
+    # each candidate against this fingerprint before unlinking so a
+    # competing publisher (on-demand render, id reuse) that atomically
+    # replaced our file between record time and guard acquisition survives
+    # — the same identity check ``_evict_once`` and the orphan cleanup use.
+    retained_new_identities = {}
     stop_after_current = False
 
     # Commit per row so the writer lock is released between iterations.
@@ -2102,6 +2109,11 @@ def _extract_working_copies(db, vireo_dir, progress_callback=None,
                 for path, size in retained_new_files.items()
                 if os.path.isfile(path)
             }
+            retained_new_identities = {
+                path: identity
+                for path, identity in retained_new_identities.items()
+                if path in retained_new_files
+            }
             removed_batch_files = (
                 retained_before_quota_lowering - set(retained_new_files)
             )
@@ -2121,6 +2133,23 @@ def _extract_working_copies(db, vireo_dir, progress_callback=None,
             new_bytes_since_enforce += new_bytes
             if new_bytes:
                 retained_new_files[wc_abs] = new_bytes
+                # Record the identity captured under extract's guard
+                # (via ``on_publish``) so the post-loop trim can tell
+                # our bytes apart from a competing publisher's later
+                # atomic replace. Falls back to a post-return stat if
+                # the callback didn't fire — a minor regression window
+                # but never worse than the pre-fingerprint behavior.
+                if captured_wc_identity:
+                    retained_new_identities[wc_abs] = (
+                        captured_wc_identity[-1]
+                    )
+                else:
+                    try:
+                        retained_new_identities[wc_abs] = (
+                            _wc_file_identity(os.stat(wc_abs))
+                        )
+                    except OSError:
+                        retained_new_identities[wc_abs] = None
 
             if new_bytes_since_enforce >= incremental_threshold:
                 retained_before_enforce = set(retained_new_files)
@@ -2163,6 +2192,11 @@ def _extract_working_copies(db, vireo_dir, progress_callback=None,
                     path: size
                     for path, size in retained_new_files.items()
                     if os.path.isfile(path)
+                }
+                retained_new_identities = {
+                    path: identity
+                    for path, identity in retained_new_identities.items()
+                    if path in retained_new_files
                 }
                 # Once enforcement removes an earlier fitting rendition from
                 # this same batch to keep the current one, retained capacity
@@ -2324,10 +2358,21 @@ def _extract_working_copies(db, vireo_dir, progress_callback=None,
             # the candidate snapshot through both writes; an id-only UPDATE
             # would otherwise stamp the replacement row's current mtime as
             # evicted and suppress its startup backfill.
+            # Full source-identity tuple, mirroring the success and failure
+            # UPDATEs above: (folder_id, filename, companion_path, file_size,
+            # file_mtime) plus a scalar ``(SELECT path FROM folders …)``.
+            # A row that was re-paired to a different companion or whose
+            # folder was relocated while this batch ran has different
+            # extraction inputs; deferring under the old snapshot would
+            # stamp ``working_copy_evicted_mtime`` on those new inputs
+            # and suppress backfill of the row's current source until the
+            # quota or the primary mtime changes.
             deferred_rows = [
                 (
                     row["file_mtime"], row["id"], row["folder_id"],
-                    row["filename"], row["file_size"], row["file_mtime"],
+                    row["filename"], row["companion_path"],
+                    row["file_size"], row["file_mtime"],
+                    row["folder_path"],
                 )
                 for row in rows[i:]
             ]
@@ -2336,8 +2381,11 @@ def _extract_working_copies(db, vireo_dir, progress_callback=None,
                     "UPDATE photos SET"
                     " working_copy_evicted_mtime=COALESCE(?, -1)"
                     " WHERE id=? AND folder_id=? AND filename=?"
+                    " AND companion_path IS ?"
                     " AND file_size IS ? AND file_mtime IS ?"
-                    " AND working_copy_path IS NULL",
+                    " AND working_copy_path IS NULL"
+                    " AND (SELECT path FROM folders"
+                    "        WHERE id = photos.folder_id) IS ?",
                     deferred_rows,
                 )
                 commit_with_retry(db.conn)
@@ -2361,17 +2409,22 @@ def _extract_working_copies(db, vireo_dir, progress_callback=None,
                     deferred_marker_rows = [
                         (
                             row["id"], row["folder_id"], row["filename"],
+                            row["companion_path"],
                             row["file_size"], row["file_mtime"],
                             row["file_mtime"],
+                            row["folder_path"],
                         )
                         for row in rows[i:]
                     ]
                     db.conn.executemany(
                         "UPDATE photos SET working_copy_evicted_mtime=NULL "
                         "WHERE id=? AND folder_id=? AND filename=?"
+                        " AND companion_path IS ?"
                         " AND file_size IS ? AND file_mtime IS ?"
                         " AND working_copy_path IS NULL"
-                        " AND working_copy_evicted_mtime IS COALESCE(?, -1)",
+                        " AND working_copy_evicted_mtime IS COALESCE(?, -1)"
+                        " AND (SELECT path FROM folders"
+                        "        WHERE id = photos.folder_id) IS ?",
                         deferred_marker_rows,
                     )
                     commit_with_retry(db.conn)
@@ -2447,6 +2500,9 @@ def _extract_working_copies(db, vireo_dir, progress_callback=None,
             # ``working_copy_evicted_mtime``, silently suppressing the
             # replacement's own backfill until its source mtime or the
             # quota changes.
+            from working_copy_cache import (
+                _file_identity as _trim_file_identity,
+            )
             with working_copy_publication_guard():
                 for path, size in sorted(
                     list(retained_new_files.items()),
@@ -2454,10 +2510,46 @@ def _extract_working_copies(db, vireo_dir, progress_callback=None,
                 ):
                     if batch_over <= 0:
                         break
+                    # Verify the file on disk is STILL the one this
+                    # batch published. Between the moment we recorded
+                    # it in ``retained_new_files`` and this point,
+                    # another publisher (on-demand render, id reuse)
+                    # could have atomically replaced ``path`` and
+                    # committed its own ``working_copy_path``.
+                    # ``retained_new_files`` alone stored only the
+                    # size, so even with the publication guard held we
+                    # would happily unlink their newer rendition and
+                    # then clear its valid catalog entry via the
+                    # id+path UPDATE below. Compare identity the same
+                    # way ``_evict_once`` and the orphan cleanup do; a
+                    # mismatch means our bytes are gone and the file
+                    # now belongs to someone else, so skip.
+                    expected_identity = retained_new_identities.get(path)
+                    try:
+                        current_identity = _trim_file_identity(
+                            os.stat(path)
+                        )
+                    except OSError:
+                        current_identity = None
+                    if (
+                        expected_identity is not None
+                        and current_identity is not None
+                        and current_identity != expected_identity
+                    ):
+                        log.info(
+                            "Post-loop DESC-priority trim skipping %s: "
+                            "identity changed since publish (a competing "
+                            "publisher has replaced this canonical path)",
+                            path,
+                        )
+                        retained_new_files.pop(path, None)
+                        retained_new_identities.pop(path, None)
+                        continue
                     try:
                         os.remove(path)
                     except FileNotFoundError:
                         retained_new_files.pop(path, None)
+                        retained_new_identities.pop(path, None)
                         continue
                     except OSError:
                         log.warning(
@@ -2466,6 +2558,7 @@ def _extract_working_copies(db, vireo_dir, progress_callback=None,
                         )
                         continue
                     retained_new_files.pop(path, None)
+                    retained_new_identities.pop(path, None)
                     batch_over -= size
                     trimmed_ids.append(_wc_id_from_batch_path(path))
 

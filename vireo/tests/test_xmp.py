@@ -582,6 +582,45 @@ def test_failed_access_metadata_copy_preserves_sidecar(sample_xmp, monkeypatch):
     assert set(path.parent.iterdir()) == {path}
 
 
+@pytest.mark.skipif(sys.platform != "darwin", reason="macOS ACL API")
+def test_atomic_sidecar_preserves_xattrs_under_writeextattr_deny(sample_xmp):
+    """The ordering rule, exercised against a real deny-writeextattr ACL.
+
+    The stub test below pins the call order everywhere; this one proves the
+    OS behaviour the order exists for. With the ACL applied first, setxattr
+    against the temp file returns EACCES, ``_copy_xattrs`` skips the
+    attribute as non-critical, and the published sidecar silently loses the
+    source's metadata.
+    """
+    import subprocess
+
+    subprocess.run(["xattr", "-w", "com.vireo.test", "shared metadata",
+                    sample_xmp], check=True)
+    user = subprocess.check_output(["id", "-un"], text=True).strip()
+    subprocess.run(["chmod", "+a", f"{user} deny writeextattr", sample_xmp],
+                   check=True)
+    try:
+        subprocess.run(["xattr", "-w", "com.vireo.probe", "x", sample_xmp],
+                       check=True, capture_output=True)
+    except subprocess.CalledProcessError:
+        pass
+    else:
+        # The deny entry did not bind. Skip rather than assert a guarantee
+        # this machine is not actually providing.
+        subprocess.run(["xattr", "-d", "com.vireo.probe", sample_xmp],
+                       check=False)
+        pytest.skip("deny writeextattr does not bind this user")
+
+    write_rating(sample_xmp, 5)
+
+    value = subprocess.check_output(
+        ["xattr", "-p", "com.vireo.test", sample_xmp], text=True).strip()
+    assert value == "shared metadata"
+    acl = subprocess.check_output(["ls", "-le", sample_xmp], text=True)
+    assert "deny writeextattr" in acl
+    assert read_sync_preview_metadata(sample_xmp)["rating"] == "5"
+
+
 def test_preserve_sidecar_access_copies_xattrs_before_acl_on_darwin(
     monkeypatch, tmp_path,
 ):

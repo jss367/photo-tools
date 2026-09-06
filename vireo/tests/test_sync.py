@@ -1191,3 +1191,29 @@ def test_sync_result_counts_distinct_photos_not_records():
     # But the summary counts distinct photos per reason: photo 1 once, plus
     # photo 2, so the reason applies to two photos, not three.
     assert result["errors"] == ["unsupported change type: flag (2 photos)"]
+
+
+def test_sync_panel_does_not_report_zero_for_a_resultless_failure():
+    """A crashed sync must not render as "Wrote 0, failed on 0".
+
+    When ``sync_to_xmp`` raises before returning -- a failing
+    ``get_pending_changes`` or ``clear_pending`` -- the JobRunner completes the
+    job with a null result. Defaulting the counters to zero would state a
+    count the run never established, and if ``clear_pending`` is what failed,
+    sidecars had already been written. The guard is on the counters rather
+    than on ``event.status`` so a resultless completed or cancelled event
+    cannot reach the counter branches either.
+    """
+    from pathlib import Path
+
+    panel = (Path(__file__).parents[1] / "templates/_sync_panel.html").read_text()
+    handler = panel[panel.index("onComplete: function(event)"):]
+    handler = handler[:handler.index("onError:")]
+    assert "typeof result.synced === 'number'" in handler
+    assert "typeof result.failed === 'number'" in handler
+    assert "Sync failed" in handler
+    # The JobRunner's failure contract, not just the error list.
+    assert "event.failure && event.failure.message" in handler
+    # One tooltip assignment, so a stale failure detail cannot survive a
+    # later clean run and the two sites cannot drift apart.
+    assert handler.count("status.title") == 1

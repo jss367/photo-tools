@@ -213,23 +213,40 @@ async function runSync(changeIds) {
         // Report what reached the sidecars, not merely that the job ran. A
         // NAS that rejects every write finishes the job normally; saying
         // "Synced!" over it is why a stuck banner looks like a UI bug.
-        var hasResult = !!(event && event.result);
-        var result = (event && event.result) || {};
-        var synced = result.synced || 0;
-        var failed = result.failed || 0;
-        var reasons = (event && event.errors) || result.errors || [];
-        // Clear any tooltip left over from a prior failure so a subsequent
-        // completed or cancelled run does not keep pointing at old causes.
-        status.title = '';
-        if (event.status === 'failed' && !hasResult) {
-          // Fatal exception outside the per-photo handler (e.g. clear_pending
-          // failed after some writes). Show a generic failure rather than
-          // "Wrote 0, failed on 0", which contradicts the failure.
-          status.textContent = 'Sync failed'
-            + (reasons.length ? ' — ' + reasons[0] : '')
-            + '. Changes stay pending.';
-          status.style.color = 'var(--danger)';
-          status.title = reasons.join('\n');
+        var result = (event && event.result) || null;
+        // A sync that raised before returning — a failing get_pending_changes
+        // or clear_pending — completes with a null result. Defaulting the
+        // counters to zero there would claim "failed on 0" over a fatal
+        // error. Gate on the counters themselves rather than on the status,
+        // so a resultless completed or cancelled event cannot slip through
+        // either, and so a result object without them never reads as zero.
+        var counted = !!result && typeof result.synced === 'number'
+          && typeof result.failed === 'number';
+        var synced = counted ? result.synced : 0;
+        var failed = counted ? result.failed : 0;
+        var reasons = (event && event.errors && event.errors.length)
+          ? event.errors
+          : ((result && result.errors) || []);
+        // Assign unconditionally: a stale tooltip from an earlier partial
+        // failure must not survive a later clean run.
+        status.title = reasons.join('\n');
+        if (!counted) {
+          // The run never established any counts. Name the fatal cause and
+          // say only what is actually known: when clear_pending is what
+          // failed, sidecars really were written, so "Wrote 0" would be a
+          // lie and "Changes stay pending" alone would hide the writes.
+          var why = (event && event.failure && event.failure.message)
+            || reasons[0] || '';
+          if (event.status === 'cancelled') {
+            status.textContent = 'Sync cancelled before it reported results.';
+            status.style.color = 'var(--text-dim)';
+          } else {
+            status.textContent = 'Sync failed'
+              + (why ? ': ' + why : ' (no detail reported)')
+              + '. Sidecars already written stay written; everything else '
+              + 'stays pending.';
+            status.style.color = 'var(--danger)';
+          }
         } else if (event.status === 'cancelled') {
           status.textContent = 'Sync cancelled — ' + synced.toLocaleString() + ' written.';
           status.style.color = 'var(--text-dim)';
@@ -243,7 +260,6 @@ async function runSync(changeIds) {
             + failed.toLocaleString() + (reasons.length ? ' — ' + reasons[0] : '')
             + '. Changes stay pending.';
           status.style.color = 'var(--danger)';
-          status.title = reasons.join('\n');
         }
         setTimeout(checkPendingSync, 1000);
       },

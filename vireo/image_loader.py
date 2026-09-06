@@ -575,6 +575,35 @@ def _record_working_copy_access(wc_path):
         touch_working_copy_access(wc_path)
 
 
+def _restore_working_copy_access_time(wc_path, preserved_times_ns):
+    """Put a working copy's atime back after an opt-out read decoded it.
+
+    ``_evict_once`` uses ``max(mtime, atime)`` as the recency key.
+    ``load_working_image(record_access=False)`` documents that its
+    callers (background library traversals like sharpness, classify,
+    culling) want to leave that key alone — but PIL's ``open`` on a
+    strictatime or default relatime filesystem advances the atime as a
+    side effect of the read. Restoring it neutralizes that side effect
+    so a batch job that walks every working copy doesn't refresh every
+    file's recency and drown out the interactive touches from
+    ``touch_working_copy_access``.
+
+    A concurrent publisher's write shows up as an mtime change; skip
+    the restore in that case so their write isn't erased and the fresh
+    recency their publish carries is preserved. Best effort: this runs
+    on a request/job serving pixels, so a failed stat/utime costs only
+    eviction-ordering accuracy and must never fail the caller.
+    """
+    try:
+        post_stat = os.stat(wc_path)
+    except OSError:
+        return
+    if post_stat.st_mtime_ns != preserved_times_ns[1]:
+        return
+    with contextlib.suppress(OSError):
+        os.utime(wc_path, ns=preserved_times_ns)
+
+
 def load_working_image(
     photo, vireo_dir, max_size=1024, folders=None, *, return_source=False,
     record_access=False,
@@ -611,6 +640,29 @@ def load_working_image(
     if photo.get("working_copy_path"):
         wc_path = os.path.join(vireo_dir, photo["working_copy_path"])
         if os.path.exists(wc_path):
+            # Snapshot atime before the decode so a job caller that
+            # opted out of recording access does not accidentally
+            # advance the eviction key. ``_evict_once`` sorts by
+            # ``max(mtime, atime)``; on strictatime mounts (and on
+            # relatime once the daily bump condition trips) PIL's
+            # ``open`` inside ``_load_standard`` advances ``atime``
+            # even when we pass ``record_access=False``. Without a
+            # restore, a background library traversal — sharpness,
+            # classify, culling — would refresh every copy it walks
+            # and flatten the LRU signal the interactive callers
+            # rely on. Snapshot before the read so we can put atime
+            # back to whatever it was; a concurrent publisher shows
+            # up as an mtime change, and we skip the restore in that
+            # case so their write isn't erased.
+            preserved_times_ns = None
+            if not record_access:
+                try:
+                    pre_stat = os.stat(wc_path)
+                    preserved_times_ns = (
+                        pre_stat.st_atime_ns, pre_stat.st_mtime_ns,
+                    )
+                except OSError:
+                    preserved_times_ns = None
             working_image = _load_standard(wc_path, max_size)
             if working_image is not None:
                 if record_access:
@@ -633,7 +685,18 @@ def load_working_image(
                     # one misattributed recency stamp on a file that is
                     # being actively used either way.
                     _record_working_copy_access(wc_path)
+                elif preserved_times_ns is not None:
+                    _restore_working_copy_access_time(
+                        wc_path, preserved_times_ns,
+                    )
                 return _result(working_image, "working_copy")
+            if preserved_times_ns is not None:
+                # Even a failed decode may have bumped atime; put it
+                # back so eviction doesn't see a cold file as fresh
+                # just because we tried to read it.
+                _restore_working_copy_access_time(
+                    wc_path, preserved_times_ns,
+                )
 
     # No usable working copy — load original (may be JPEG or RAW). This also
     # closes the exists/open race with quota eviction: a failed working-copy

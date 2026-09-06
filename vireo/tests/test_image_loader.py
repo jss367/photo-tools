@@ -1577,6 +1577,135 @@ def test_load_working_image_does_not_stamp_by_default(tmp_path):
     )
 
 
+def test_load_working_image_restores_atime_after_unmarked_decode(
+    tmp_path, monkeypatch,
+):
+    """A ``record_access=False`` read must not leak an atime bump.
+
+    Regression for a P2 codex finding on PR #1607 against ``3d625e07``.
+    ``_evict_once`` uses ``max(mtime_ns, atime_ns)`` as its recency
+    key. On strictatime and default relatime filesystems, PIL's
+    ``open`` inside ``_load_standard`` advances ``atime`` as a side
+    effect of the decode — so every job-path walk of the library
+    (sharpness, classify, culling) would refresh every working copy
+    it processed and flatten the LRU signal that the interactive
+    touches from ``touch_working_copy_access`` are meant to buy.
+
+    ``tmp_path`` in CI is typically on a filesystem where a passive
+    read doesn't visibly bump atime, so simulate the OS behavior by
+    stamping atime forward from inside ``_load_standard``. Without
+    the restore, ``st_atime`` after the call would reflect the
+    simulated bump; with the fix, it is restored to the pre-read
+    value.
+    """
+    import os
+    import time
+
+    import image_loader
+    from image_loader import load_working_image
+    from PIL import Image
+
+    vireo_dir = tmp_path / "vireo"
+    working = vireo_dir / "working"
+    working.mkdir(parents=True)
+    wc = working / "7.jpg"
+    Image.new("RGB", (64, 48), (10, 20, 30)).save(str(wc), "JPEG")
+    stale = time.time() - 30 * 24 * 3600
+    os.utime(str(wc), (stale, stale))
+
+    real_load_standard = image_loader._load_standard
+
+    def atime_bumping_load(path, max_size):
+        image = real_load_standard(path, max_size)
+        # Simulate a strictatime FS: the read bumped atime to "now".
+        # Mtime stays as extract left it.
+        now = time.time()
+        try:
+            current_mtime = os.stat(path).st_mtime
+        except OSError:
+            current_mtime = stale
+        os.utime(path, (now, current_mtime))
+        return image
+
+    monkeypatch.setattr(image_loader, "_load_standard", atime_bumping_load)
+
+    photo = {"id": 7, "working_copy_path": "working/7.jpg", "folder_id": 1}
+    image = load_working_image(photo, str(vireo_dir), max_size=32)
+
+    assert image is not None
+    stat_after = os.stat(str(wc))
+    assert stat_after.st_atime == stale, (
+        "``record_access=False`` did not neutralize the read's atime "
+        f"bump: atime is {stat_after.st_atime} (expected {stale}). A "
+        "background library traversal would refresh every working "
+        "copy's recency, defeating the opt-in contract this parameter "
+        "documents"
+    )
+    assert stat_after.st_mtime == stale, (
+        "restore also advanced mtime; that key must stay stable so "
+        "the external-edit handoff and display-cache freshness gates "
+        "don't see spurious content changes"
+    )
+
+
+def test_load_working_image_preserves_publisher_write_over_restore(
+    tmp_path, monkeypatch,
+):
+    """The restore must not overwrite a concurrent publisher's fresh mtime.
+
+    If a publisher atomically replaces the working copy during our
+    decode, the file's mtime advances to the publisher's write time.
+    Restoring atime to the pre-read snapshot when mtime has moved
+    would peg the file's recency back to the stale pre-read value,
+    letting the fresh publish look older than it is — and eviction
+    would then reclaim their newly-published bytes ahead of files
+    that really are cold. Skip the restore whenever the observed
+    mtime no longer matches what we captured.
+    """
+    import os
+    import time
+
+    import image_loader
+    from image_loader import load_working_image
+    from PIL import Image
+
+    vireo_dir = tmp_path / "vireo"
+    working = vireo_dir / "working"
+    working.mkdir(parents=True)
+    wc = working / "7.jpg"
+    Image.new("RGB", (64, 48), (10, 20, 30)).save(str(wc), "JPEG")
+    stale = time.time() - 30 * 24 * 3600
+    os.utime(str(wc), (stale, stale))
+
+    real_load_standard = image_loader._load_standard
+    publisher_mtime = time.time() - 60
+
+    def publish_over_load(path, max_size):
+        image = real_load_standard(path, max_size)
+        # Simulate a competing publisher writing over the file while we
+        # decoded: their write set a fresh mtime AND atime.
+        os.utime(path, (publisher_mtime, publisher_mtime))
+        return image
+
+    monkeypatch.setattr(image_loader, "_load_standard", publish_over_load)
+
+    photo = {"id": 7, "working_copy_path": "working/7.jpg", "folder_id": 1}
+    image = load_working_image(photo, str(vireo_dir), max_size=32)
+
+    assert image is not None
+    stat_after = os.stat(str(wc))
+    assert stat_after.st_mtime == publisher_mtime, (
+        "restore erased the concurrent publisher's mtime — their "
+        "fresh write would then look older than the pre-read stale "
+        "value and be reclaimed ahead of really-cold files: "
+        f"mtime={stat_after.st_mtime} (publisher wrote {publisher_mtime})"
+    )
+    assert stat_after.st_atime == publisher_mtime, (
+        "restore erased the publisher's atime too: "
+        f"atime={stat_after.st_atime} (publisher wrote {publisher_mtime})"
+    )
+
+
 def test_load_working_image_stamps_when_access_is_recorded(tmp_path):
     """Request paths opt in and the stamp lands on atime, not mtime."""
     import os

@@ -2465,59 +2465,70 @@ def _extract_working_copies(db, vireo_dir, progress_callback=None,
     trimmed_ids = []
     if retained_new_files and quota_bytes > 0:
         batch_bytes = sum(retained_new_files.values())
-        existing_bytes = 0
-        if scope is None:
-            # Measure what was already cached before this batch. Comparing
-            # only the batch against the whole ceiling reports no overshoot
-            # whenever the batch alone fits — but a sweep landing on a cache
-            # that is already near the ceiling still pushes total usage over
-            # it, and the final pass then pays for the batch's new coverage
-            # with somebody's pre-existing coverage. That is the exact trade
-            # ``displaced_existing`` refuses mid-batch, and it must not sneak
-            # back in after the loop. A batch smaller than
-            # ``incremental_threshold`` never runs the guarded mid-batch
-            # enforcement at all, so this is the only place the guarantee can
-            # be honoured for small sweeps.
-            #
-            # Protecting the batch on the final pass does not achieve this on
-            # its own: it makes pre-existing files the *only* eviction
-            # candidates. The batch has to give up its own lowest-priority
-            # output instead.
-            try:
-                existing_bytes = max(
-                    0, working_copy_stats(vireo_dir)["size"] - batch_bytes,
-                )
-            except Exception:
-                # Accounting failure must not strand the batch; fall back to
-                # the batch-only comparison the trim used before.
-                log.exception(
-                    "Working-copy usage accounting failed; trimming against "
-                    "the batch footprint alone"
-                )
-                existing_bytes = 0
-        # Re-read the ceiling rather than trusting the value this batch
-        # started with. A settings save that *raises* the quota runs
-        # ``_settings_post_save_side_effects``, which clears every capacity
-        # marker; if the trim then measures against the old lower number it
-        # deletes output that now fits and stamps fresh markers, so the
-        # capacity the user just added sits unused until some later quota or
-        # source-mtime change unblocks those rows. The mid-batch stop path
-        # already re-reads for exactly this reason.
+        # Take the usage snapshot AND the quota re-read AND the trim
+        # decision all under ``working_copy_publication_guard``. Every
+        # concurrent path that touches the cache — on-demand
+        # publishers, quota eviction, ``_settings_post_save_side_
+        # effects`` — takes that same lock, so holding it here makes
+        # the (existing_bytes, quota_bytes, batch_over) triple atomic
+        # with those concurrent mutations.
         #
-        # The re-read has to run INSIDE ``working_copy_publication_guard``
-        # for the same reason. ``_settings_post_save_side_effects``
-        # takes that same lock to clear its capacity markers on a
-        # quota raise; a re-read outside the guard could still see the
-        # stale lower value if the raise lands between our read and
-        # our guard acquisition — the settings-side clear would then
-        # complete first, and this trim would delete files and re-
-        # stamp markers on rows the user's raise was meant to cover.
-        # Take the guard, refresh, decide, and act — all atomic with
-        # the settings-side clear.
+        # Without this: an on-demand render publishing after an
+        # unguarded ``working_copy_stats`` but before the guard
+        # acquisition would leave ``existing_bytes`` short, ``batch_
+        # over`` could go negative, the trim declines to act, and the
+        # final ``evict_if_over_quota`` — which protects the batch —
+        # then reclaims the unaccounted bytes from pre-existing
+        # coverage. That is the exact cannibalization this path is
+        # meant to prevent.
         from working_copy_cache import (
             _file_identity as _trim_file_identity,
         )
         with working_copy_publication_guard():
+            existing_bytes = 0
+            if scope is None:
+                # Measure what was already cached before this batch.
+                # Comparing only the batch against the whole ceiling
+                # reports no overshoot whenever the batch alone fits —
+                # but a sweep landing on a cache that is already near
+                # the ceiling still pushes total usage over it, and
+                # the final pass then pays for the batch's new
+                # coverage with somebody's pre-existing coverage.
+                # That is the exact trade ``displaced_existing``
+                # refuses mid-batch, and it must not sneak back in
+                # after the loop. A batch smaller than
+                # ``incremental_threshold`` never runs the guarded
+                # mid-batch enforcement at all, so this is the only
+                # place the guarantee can be honoured for small sweeps.
+                #
+                # Protecting the batch on the final pass does not
+                # achieve this on its own: it makes pre-existing
+                # files the *only* eviction candidates. The batch has
+                # to give up its own lowest-priority output instead.
+                try:
+                    existing_bytes = max(
+                        0,
+                        working_copy_stats(vireo_dir)["size"] - batch_bytes,
+                    )
+                except Exception:
+                    # Accounting failure must not strand the batch;
+                    # fall back to the batch-only comparison the trim
+                    # used before.
+                    log.exception(
+                        "Working-copy usage accounting failed; trimming "
+                        "against the batch footprint alone"
+                    )
+                    existing_bytes = 0
+            # Re-read the ceiling under the same guard. A settings
+            # save that *raises* the quota runs ``_settings_post_save
+            # _side_effects``, which clears every capacity marker; a
+            # read outside the guard could see the stale lower value
+            # if the raise lands between our read and our guard
+            # acquisition — the settings-side clear would then
+            # complete first and this trim would delete files and
+            # re-stamp markers on rows the user's raise was meant to
+            # cover. The mid-batch stop path already re-reads for
+            # exactly this reason.
             refreshed_quota_mb = _configured_quota_mb()
             if refreshed_quota_mb > 0:
                 quota_bytes = max(0, refreshed_quota_mb) * 1024 * 1024

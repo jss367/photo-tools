@@ -4189,3 +4189,87 @@ def test_post_loop_trim_quota_refresh_runs_under_publication_guard(
         "acquisition would then re-stamp fresh markers on rows the "
         f"user's raise was meant to cover: {lock_held_when_refreshed!r}"
     )
+
+
+def test_post_loop_trim_usage_snapshot_under_publication_guard(
+    tmp_path, monkeypatch,
+):
+    """The trim's ``existing_bytes`` snapshot must be taken under the guard.
+
+    Regression for a P2 codex review finding on PR #1607 against
+    ``85af143b``: with the snapshot outside ``working_copy_publication
+    _guard``, an on-demand render publishing between the stat and the
+    guard acquisition leaves ``existing_bytes`` short. ``batch_over``
+    then goes negative, the trim declines to act, and the final
+    ``evict_if_over_quota`` (which protects the batch) reclaims the
+    unaccounted bytes from pre-existing coverage — reintroducing the
+    exact cannibalization this path is meant to prevent.
+
+    Asserts ``_eviction_lock._is_owned()`` at the moment
+    ``working_copy_stats`` runs during the trim.
+    """
+    import config as cfg
+    import working_copy_cache
+    from db import Database
+    from scanner import _extract_working_copies
+
+    monkeypatch.setattr(cfg, "CONFIG_PATH", str(tmp_path / "config.json"))
+    cfg.save({
+        **cfg.DEFAULTS,
+        "working_copy_max_size": 1000,
+        "working_copy_quality": 90,
+        "working_copy_cache_max_mb": 1,
+    })
+
+    folder = tmp_path / "photos"
+    folder.mkdir()
+    vireo_dir = tmp_path / "vireo"
+    vireo_dir.mkdir()
+    (vireo_dir / "working").mkdir()
+    db = Database(str(vireo_dir / "test.db"))
+    folder_id = db.add_folder(str(folder))
+    src = folder / "photo.jpg"
+    _make_jpeg(str(src), 2000, 1500)
+    _photo_id_of_file(db, folder_id, "photo.jpg", src)
+    db.conn.close()
+
+    import scanner as _scanner_mod
+
+    def fixed_extract(_source, output, **_kwargs):
+        with open(output, "wb") as handle:
+            handle.truncate(200 * 1024)
+        return True
+
+    monkeypatch.setattr(
+        _scanner_mod, "extract_working_copy", fixed_extract,
+    )
+
+    real_stats = working_copy_cache.working_copy_stats
+    stats_lock_states = []
+
+    def spy_stats(*args, **kwargs):
+        stats_lock_states.append(
+            working_copy_cache._eviction_lock._is_owned()
+        )
+        return real_stats(*args, **kwargs)
+
+    monkeypatch.setattr(
+        working_copy_cache, "working_copy_stats", spy_stats,
+    )
+
+    verify_db = Database(str(vireo_dir / "test.db"))
+    _extract_working_copies(verify_db, str(vireo_dir))
+    verify_db.conn.close()
+
+    assert stats_lock_states, (
+        "expected the trim to call ``working_copy_stats`` for its "
+        "``existing_bytes`` snapshot"
+    )
+    assert stats_lock_states[0], (
+        "trim's ``working_copy_stats`` call ran OUTSIDE "
+        "``working_copy_publication_guard`` — an on-demand publisher "
+        "racing between the snapshot and the guard acquisition would "
+        "leave ``existing_bytes`` short, letting the final enforce "
+        "cannibalize pre-existing coverage to reclaim the unaccounted "
+        f"bytes: {stats_lock_states!r}"
+    )

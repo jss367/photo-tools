@@ -2,6 +2,7 @@
 
 import logging
 import os
+import tempfile
 from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
@@ -73,23 +74,57 @@ def _is_case_insensitive_dir(folder):
 
     macOS APFS's default variant, NTFS, and SMB shares treat ``Bird.xmp`` and
     ``BIRD.xmp`` as the same file, but ``os.path.normcase`` only lowercases on
-    Windows. Probe by asking whether the folder's own path with an ancestor
-    segment's case flipped still resolves to the same directory. Walks up the
-    ancestry until it finds a segment with letters to flip, and returns False
-    when no letters are available or the probe raises.
+    Windows. Probe the filesystem that owns ``folder`` itself: an SMB share
+    mounted at ``/mnt/share`` may sit on a case-sensitive Linux parent, so an
+    ancestor-spelling probe (``/mnt/share`` vs ``/mnt/SHARE``) reads the
+    parent filesystem's case rules and misses that the mount inside is
+    case-insensitive, which reintroduces the alias race for a numerics-only
+    path like ``/mnt/share/2026/09/06``. Look for an existing alphabetic
+    entry inside ``folder`` and probe its case-swapped path; if none exists,
+    create a short-lived temp file with an alphabetic name so the probe still
+    exercises the folder's own filesystem. Returns False when the folder is
+    missing, unreadable, unwritable, or the probe raises.
     """
-    head = os.path.abspath(folder)
-    while True:
-        parent, name = os.path.split(head)
-        if not name or parent == head:
+    folder = os.path.abspath(folder)
+    try:
+        with os.scandir(folder) as it:
+            for entry in it:
+                name = entry.name
+                swapped = name.swapcase()
+                if swapped == name:
+                    continue
+                try:
+                    return os.path.samefile(
+                        os.path.join(folder, name),
+                        os.path.join(folder, swapped),
+                    )
+                except OSError:
+                    return False
+    except OSError:
+        return False
+
+    # Empty folder, or every entry's name is caseless (digits, symbols).
+    # Drop a probe file whose prefix is guaranteed to contain letters so a
+    # numerics-only path like ``/mnt/share/2026/09/06`` still gets its own
+    # filesystem probed rather than an ancestor's.
+    try:
+        fd, probe = tempfile.mkstemp(
+            prefix="vireo-case-probe-", suffix=".tmp", dir=folder,
+        )
+    except OSError:
+        return False
+    os.close(fd)
+    try:
+        swapped_path = os.path.join(folder, os.path.basename(probe).swapcase())
+        try:
+            return os.path.samefile(probe, swapped_path)
+        except OSError:
             return False
-        swapped = name.swapcase()
-        if swapped != name:
-            try:
-                return os.path.samefile(head, os.path.join(parent, swapped))
-            except OSError:
-                return False
-        head = parent
+    finally:
+        try:
+            os.remove(probe)
+        except OSError:
+            pass
 
 
 def _select_changes(changes, change_ids):

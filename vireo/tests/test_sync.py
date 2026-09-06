@@ -1573,3 +1573,53 @@ def test_sync_keeps_case_variant_sidecars_separate_on_case_sensitive_fs(tmp_path
     assert result["synced"] == 2, result["errors"]
     assert read_keywords(xmp_a) == {"Osprey"}
     assert read_keywords(xmp_b) == {"Kestrel"}
+
+
+def test_is_case_insensitive_dir_probes_folder_not_ancestors(tmp_path, monkeypatch):
+    """Probe the folder's own filesystem, not an ancestor with letters.
+
+    A numerics-only path like ``/mnt/share/2026/09/06`` used to walk up to
+    ``share`` (a mount-point entry on the parent filesystem) and probe its
+    case there. On a case-sensitive Linux parent with a case-insensitive SMB
+    mount inside, that probe returned False and the alias race for
+    ``bird.CR3`` / ``BIRD.JPG`` came back. The probe now stays inside
+    ``folder`` — either an existing letter-bearing child or a short-lived
+    temp file — so a case-insensitive mount is detected regardless of how the
+    outer ancestor spelling behaves.
+    """
+    from sync import _is_case_insensitive_dir
+
+    # An all-numeric ancestry that would answer False on a case-sensitive
+    # filesystem if we walked up out of it; the folder itself is a normal
+    # case-sensitive tmpfs on Linux CI, so the detector must report False
+    # regardless of what ``2026`` would resolve to.
+    numeric_folder = tmp_path / "2026" / "09" / "06"
+    numeric_folder.mkdir(parents=True)
+    assert _is_case_insensitive_dir(str(numeric_folder)) is False
+
+    # Existing alphabetic entry inside the folder: the probe must consult
+    # that entry, not any ancestor. Force ``os.path.samefile`` to return True
+    # to prove the detector is actually reaching into ``folder`` for the
+    # answer rather than short-circuiting on ancestor spelling.
+    import sync as sync_module
+
+    (numeric_folder / "sample.txt").write_text("x")
+    calls = []
+
+    def fake_samefile(a, b):
+        calls.append((a, b))
+        return True
+
+    monkeypatch.setattr(sync_module.os.path, "samefile", fake_samefile)
+    assert _is_case_insensitive_dir(str(numeric_folder)) is True
+    assert calls, "detector must probe inside the folder"
+    probed_left, probed_right = calls[0]
+    assert os.path.dirname(probed_left) == os.path.abspath(str(numeric_folder))
+    assert os.path.dirname(probed_right) == os.path.abspath(str(numeric_folder))
+
+
+def test_is_case_insensitive_dir_returns_false_when_folder_missing(tmp_path):
+    """An unreadable or missing folder cannot be probed; report False."""
+    from sync import _is_case_insensitive_dir
+
+    assert _is_case_insensitive_dir(str(tmp_path / "does-not-exist")) is False

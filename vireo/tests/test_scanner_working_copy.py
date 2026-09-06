@@ -1487,6 +1487,123 @@ def test_startup_backfill_skips_row_when_id_reused_during_pause(
     )
 
 
+def test_startup_backfill_discards_orphan_when_id_reused_during_extraction(
+    tmp_path, monkeypatch,
+):
+    """A row whose id is reused *during* extraction must not leave an orphan.
+
+    Regression for a P2 codex review finding on PR #1607: the
+    identity-guarded UPDATE correctly matches zero rows when the row was
+    deleted (and its id reused for a new import) between the pre-extraction
+    snapshot check and the post-extraction commit — but the just-written
+    ``working/<reused-id>.jpg`` was left on disk. A later quota pass would
+    treat those bytes as the replacement row's rendition, and if
+    ``_evict_once`` reclaimed the file it would stamp
+    ``working_copy_evicted_mtime`` on the replacement, suppressing its own
+    backfill.
+
+    Holds the extractor *after* it writes ``wc_abs`` so the test can swap
+    the row's identity (delete + reinsert to reuse the id) before releasing
+    it. After the job completes, the orphan file must be gone and the
+    replacement row's ``working_copy_path`` must remain NULL.
+    """
+    import threading
+
+    import scanner
+    from db import Database
+
+    app, vireo_dir, ids = _prepare_backfill_app(
+        tmp_path, monkeypatch, ["target.jpg"],
+    )
+    target_id = ids[0]
+
+    real_extract = scanner.extract_working_copy
+    extract_started = threading.Event()
+    release_extract = threading.Event()
+
+    def gated_extract(*args, **kwargs):
+        # Let real extraction write ``wc_abs`` atomically.
+        result = real_extract(*args, **kwargs)
+        extract_started.set()
+        # Hold here so the test can delete the row and reinsert a
+        # different file at the same reused id before the guarded
+        # UPDATE runs — the exact window this fix closes.
+        assert release_extract.wait(timeout=30), (
+            "test never released extraction"
+        )
+        return result
+
+    monkeypatch.setattr(scanner, "extract_working_copy", gated_extract)
+
+    app._kickoff_working_copy_backfill()
+
+    assert extract_started.wait(timeout=30), "extraction never started"
+
+    # Row was written; now swap the identity while the worker is parked
+    # between the write and the guarded UPDATE. INTEGER PRIMARY KEY
+    # without AUTOINCREMENT reuses the freed id for the next INSERT.
+    db_path = app.config["DB_PATH"]
+    admin_db = Database(db_path)
+    target_row = admin_db.conn.execute(
+        "SELECT p.folder_id, f.path AS folder_path"
+        " FROM photos p JOIN folders f ON f.id=p.folder_id"
+        " WHERE p.id=?",
+        (target_id,),
+    ).fetchone()
+    assert target_row is not None
+    folder_id = target_row["folder_id"]
+    photos_dir = target_row["folder_path"]
+    admin_db.conn.execute("DELETE FROM photos WHERE id=?", (target_id,))
+    admin_db.conn.commit()
+
+    replacement = os.path.join(photos_dir, "replacement.jpg")
+    # Different dimensions → guaranteed different file_size so the
+    # identity guard flags the mismatch even if the two saves land in
+    # the same coarse mtime bucket on this filesystem.
+    _make_jpeg(replacement, 1600, 1200)
+    new_id = admin_db.add_photo(
+        folder_id, "replacement.jpg", ".jpg",
+        file_size=os.path.getsize(replacement),
+        file_mtime=os.path.getmtime(replacement),
+        width=1600, height=1200,
+    )
+    admin_db.conn.close()
+    assert new_id == target_id, (
+        f"test setup: expected id reuse (freed {target_id}, got {new_id})"
+    )
+
+    wc_abs = vireo_dir / "working" / f"{target_id}.jpg"
+    assert wc_abs.exists(), (
+        "extraction should have atomically published wc_abs before "
+        "the gate held it"
+    )
+
+    release_extract.set()
+
+    job = _wait_for_backfill_terminal(app._job_runner)
+    assert job["status"] == "completed", f"job: {job}"
+
+    # The orphan bytes at working/<reused-id>.jpg must have been removed
+    # under the publication guard; otherwise a later quota pass would
+    # attribute them to the replacement row.
+    assert not wc_abs.exists(), (
+        f"orphan working copy at {wc_abs} was not cleaned up after the "
+        "identity-guarded UPDATE matched no row"
+    )
+
+    # And the replacement row's working_copy_path must remain NULL —
+    # the just-extracted bytes are from the deleted photo, not this one.
+    verify_db = Database(db_path)
+    wc_path = verify_db.conn.execute(
+        "SELECT working_copy_path FROM photos WHERE id=?", (target_id,),
+    ).fetchone()["working_copy_path"]
+    verify_db.conn.close()
+    assert wc_path is None, (
+        f"replacement photo (id={target_id}) received a working_copy_path "
+        f"from the stale snapshot: {wc_path!r}"
+    )
+
+
 def _make_noisy_jpeg(path, width, height):
     """A high-entropy JPEG so extracted working copies stay large enough to
     exercise the quota tracker (uniform-gray JPEGs compress to a few KB)."""

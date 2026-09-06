@@ -1754,6 +1754,7 @@ def _extract_working_copies(db, vireo_dir, progress_callback=None,
                 )
             raw_failed_then_companion = ok
         publication_lost = False
+        publication_orphaned = False
         quota_lowered_during_extraction = False
         retained_before_quota_lowering = set()
         if ok:
@@ -1795,12 +1796,13 @@ def _extract_working_copies(db, vireo_dir, progress_callback=None,
                 # cannot stamp the deleted row's working_copy_path onto the
                 # replacement. Same NULL-safe (folder_id, filename,
                 # file_size, file_mtime) guard used for deferred rows below.
+                update_cursor = None
                 if not publication_lost and raw_failed_then_companion:
                     # The companion-derived working copy is usable, but
                     # request paths still need to know the RAW itself failed:
                     # edited RAW render paths gate companion selection on a
                     # present "source" failure marker.
-                    db.conn.execute(
+                    update_cursor = db.conn.execute(
                         "UPDATE photos SET working_copy_path=?,"
                         " working_copy_evicted_mtime=NULL,"
                         " working_copy_failed_at=datetime('now'),"
@@ -1815,7 +1817,7 @@ def _extract_working_copies(db, vireo_dir, progress_callback=None,
                         ),
                     )
                 elif not publication_lost:
-                    db.conn.execute(
+                    update_cursor = db.conn.execute(
                         "UPDATE photos SET working_copy_path=?,"
                         " working_copy_evicted_mtime=NULL,"
                         " working_copy_failed_at=NULL,"
@@ -1829,7 +1831,41 @@ def _extract_working_copies(db, vireo_dir, progress_callback=None,
                             row["file_mtime"],
                         ),
                     )
-                if not publication_lost:
+                # Identity-guarded UPDATE matched no row: the snapshot's
+                # (folder_id, filename, file_size, file_mtime) no longer
+                # matches the row at ``id``. Either the row was deleted
+                # (id possibly reused by a new import) or the file was
+                # rewritten during the slow decode. The just-published
+                # bytes at ``working/<id>.jpg`` don't belong to whatever
+                # row now owns that id, so a later quota pass would treat
+                # them as the replacement's rendition — and if
+                # ``_evict_once`` then reclaims the file, it would stamp
+                # ``working_copy_evicted_mtime`` on the replacement,
+                # suppressing its own backfill until its source mtime or
+                # the quota changes. Remove the orphan under the same
+                # publication guard that would run eviction, and roll
+                # back the empty UPDATE so it doesn't hold an implicit
+                # transaction open.
+                if (
+                    update_cursor is not None
+                    and update_cursor.rowcount == 0
+                ):
+                    publication_orphaned = True
+                    try:
+                        os.remove(wc_abs)
+                    except OSError:
+                        pass
+                    try:
+                        db.conn.rollback()
+                    except Exception:
+                        pass
+                    log.info(
+                        "Discarding orphaned working-copy output for "
+                        "photo %s: row identity changed during extraction "
+                        "(deleted or reused for a new import); removed %s",
+                        row["id"], wc_abs,
+                    )
+                if not publication_lost and not publication_orphaned:
                     commit_with_retry(db.conn)
                     if quota_lowered_during_extraction:
                         evict_if_over_quota(
@@ -1871,6 +1907,14 @@ def _extract_working_copies(db, vireo_dir, progress_callback=None,
                 "commit; leaving the eviction marker intact",
                 row["id"],
             )
+            _emit_working_copy_progress(i)
+            continue
+
+        if publication_orphaned:
+            # The bytes were removed under the guard above; skip quota
+            # tracking (nothing published) and move on. No eviction
+            # marker to leave — the row that owned this id is gone,
+            # and the reused-id replacement (if any) starts clean.
             _emit_working_copy_progress(i)
             continue
 

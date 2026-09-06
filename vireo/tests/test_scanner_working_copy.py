@@ -2925,6 +2925,84 @@ def test_orphan_cleanup_preserves_racing_publisher_uncommitted_bytes(
     )
 
 
+def test_post_loop_trim_marks_trimmed_rows_capacity_deferred(
+    tmp_path, monkeypatch,
+):
+    """A trimmed row must not come straight back as a candidate.
+
+    The DESC-priority trim removes the lowest-priority batch files to land
+    inside the ceiling, but the row it removes is only reconciled later by
+    ``_evict_once``'s stale-tracked path, which deliberately clears
+    ``working_copy_path`` *without* a marker so a lost DB transition can
+    regenerate. Left that way the startup gate's candidate count can never
+    reach zero: every launch relaunches the backfill, re-decodes the same
+    lowest-priority rows, trims them again, and repeats — the loop the
+    capacity-deferred marker exists to prevent.
+    """
+    import config as cfg
+    import scanner
+    from db import Database
+    from scanner import _extract_working_copies
+
+    monkeypatch.setattr(cfg, "CONFIG_PATH", str(tmp_path / "config.json"))
+    cfg.save({
+        **cfg.DEFAULTS,
+        "working_copy_max_size": 1000,
+        "working_copy_quality": 90,
+        "working_copy_cache_max_mb": 1,
+    })
+
+    folder = tmp_path / "photos"
+    folder.mkdir()
+    vireo_dir = tmp_path / "vireo"
+    vireo_dir.mkdir()
+    working_dir = vireo_dir / "working"
+    working_dir.mkdir()
+    db = Database(str(vireo_dir / "test.db"))
+    folder_id = db.add_folder(str(folder))
+
+    imported_ids = []
+    for i in range(10):
+        src = folder / f"photo-{i:02d}.jpg"
+        _make_jpeg(str(src), 2000, 1500)
+        imported_ids.append(
+            _photo_id_of_file(db, folder_id, f"photo-{i:02d}.jpg", src)
+        )
+
+    def fixed_extract(_source, output, **_kwargs):
+        # ~110 KB each: ten files overshoot a 1 MB quota by one file.
+        with open(output, "wb") as handle:
+            handle.truncate(110 * 1024)
+        return True
+
+    monkeypatch.setattr(scanner, "extract_working_copy", fixed_extract)
+
+    _extract_working_copies(db, str(vireo_dir))
+
+    trimmed_id = min(imported_ids)
+    assert not (working_dir / f"{trimmed_id}.jpg").exists(), (
+        "precondition: the lowest-priority batch file should have been "
+        "trimmed to land inside the ceiling"
+    )
+    trimmed = db.conn.execute(
+        "SELECT working_copy_path, working_copy_evicted_mtime"
+        " FROM photos WHERE id=?",
+        (trimmed_id,),
+    ).fetchone()
+    assert trimmed["working_copy_path"] is None
+    assert trimmed["working_copy_evicted_mtime"] is not None, (
+        "the trimmed row carries no capacity-deferred marker, so it is "
+        "still a backfill candidate — the next launch will re-decode it "
+        "only to trim it again"
+    )
+    assert scanner.working_copy_backfill_candidate_count(db) == 0, (
+        "candidate count must reach zero once the batch has filled the "
+        "quota; otherwise the startup gate relaunches the backfill on "
+        "every app start forever"
+    )
+    db.close()
+
+
 def test_post_loop_trim_evicts_lowest_id_first_preserving_newest(
     tmp_path, monkeypatch,
 ):

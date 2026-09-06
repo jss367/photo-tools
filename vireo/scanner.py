@@ -2386,6 +2386,7 @@ def _extract_working_copies(db, vireo_dir, progress_callback=None,
         except (ValueError, TypeError):
             return -1
 
+    trimmed_ids = []
     if retained_new_files and quota_bytes > 0:
         batch_over = sum(retained_new_files.values()) - quota_bytes
         if batch_over > 0:
@@ -2408,6 +2409,32 @@ def _extract_working_copies(db, vireo_dir, progress_callback=None,
                     continue
                 retained_new_files.pop(path, None)
                 batch_over -= size
+                trimmed_ids.append(_wc_id_from_batch_path(path))
+
+        if trimmed_ids:
+            # Mark the trimmed rows capacity-deferred, exactly like the
+            # candidates the batch never reached. Without this the rows
+            # come back as ``working_copy_path IS NULL`` with no marker —
+            # ``_evict_once``'s stale-tracked reconciliation deliberately
+            # clears the path so a lost DB transition can regenerate — and
+            # the startup gate's candidate count can never reach zero. The
+            # backfill would then relaunch on every app start, re-decode
+            # the same lowest-priority rows, and trim them again: the exact
+            # "decode a quota-sized batch only to evict it, and repeat
+            # indefinitely" loop the deferred marker exists to prevent.
+            # Guard on the path we just committed so a recycled id whose
+            # replacement row never published this rendition is untouched.
+            db.conn.executemany(
+                "UPDATE photos SET working_copy_path=NULL,"
+                " working_copy_evicted_mtime=COALESCE(file_mtime, -1)"
+                " WHERE id=? AND working_copy_path=?",
+                [
+                    (photo_id, f"working/{photo_id}.jpg")
+                    for photo_id in trimmed_ids
+                    if photo_id >= 0
+                ],
+            )
+            commit_with_retry(db.conn)
 
     # A scan/import may add a large batch at once. Enforce once after the
     # batch so the quota stays a hard steady-state ceiling without rescanning

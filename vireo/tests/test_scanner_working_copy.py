@@ -4584,17 +4584,27 @@ def test_trim_revalidation_rejects_candidates_without_publisher_fingerprint(
     import scanner as _scanner_mod
     import working_copy_cache
 
+    target_id = min(imported_ids)
+    target_wc_basename = f"{target_id}.jpg"
+
     def fingerprint_failing_extract(
         _source, output, on_publish=None, **_kwargs,
     ):
         with open(output, "wb") as handle:
             handle.truncate(110 * 1024)
         if on_publish is not None:
-            # Force ``_capture_wc_identity`` to record ``None`` for
-            # this publish by handing it a path whose ``os.stat``
-            # fails — the same no-fingerprint state scanner records
-            # when the callback's own stat can't observe the file.
-            on_publish("/vireo/nonexistent/fingerprint-capture-failed")
+            if os.path.basename(output) == target_wc_basename:
+                # Force ``_capture_wc_identity`` to record ``None``
+                # for this specific publish by handing it a path
+                # whose ``os.stat`` fails — the same no-fingerprint
+                # state scanner records when the callback's own stat
+                # can't observe the file. Other publishes get their
+                # real identity captured so the mid-batch retention
+                # filter cannot drop the whole batch before the
+                # target row is even processed.
+                on_publish("/vireo/nonexistent/fingerprint-capture-failed")
+            else:
+                on_publish(output)
         return True
 
     monkeypatch.setattr(
@@ -4608,13 +4618,8 @@ def test_trim_revalidation_rejects_candidates_without_publisher_fingerprint(
     # the guard — that's the first slot the trim iterates (ASC by
     # id, "lowest priority" of the batch's DESC-id set), so without
     # the fix the trim unlinks the replacement's bytes on its very
-    # first iteration. Overwriting also bumps the wc's wall-clock
-    # mtime to "now", making it the NEWEST wc mtime, so the
-    # unprotected final ``evict_if_over_quota`` (ASC by mtime)
-    # picks a different file to reclaim. If the trim leaves this
-    # file alone, its replacement bytes survive the whole extract.
-    target_id = min(imported_ids)
-    target_path = str(working_dir / f"{target_id}.jpg")
+    # first iteration.
+    target_path = str(working_dir / target_wc_basename)
     replacement_bytes = b"COMPETING_PUBLISHER_BYTES" * 100
     real_guard = working_copy_cache.working_copy_publication_guard
     guard_calls = {"count": 0, "fired": False}

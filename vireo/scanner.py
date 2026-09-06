@@ -2113,10 +2113,19 @@ def _extract_working_copies(db, vireo_dir, progress_callback=None,
 
         if quota_lowered_during_extraction:
             new_bytes_since_enforce = 0
+            # Also drop entries with no captured fingerprint — same
+            # reason as the post-loop trim's revalidation. Without a
+            # fingerprint we cannot prove the bytes are ours, so we
+            # must NOT keep the path in the retained set: keeping it
+            # would also keep it in ``protect_paths`` on the next
+            # ``evict_if_over_quota``, which would then reclaim
+            # pre-existing coverage to stay under the ceiling rather
+            # than the untrusted path.
             retained_new_files = {
                 path: size
                 for path, size in retained_new_files.items()
                 if os.path.isfile(path)
+                and retained_new_identities.get(path) is not None
             }
             retained_new_identities = {
                 path: identity
@@ -2218,11 +2227,19 @@ def _extract_working_copies(db, vireo_dir, progress_callback=None,
                 # the whole budget) or an earlier file from this batch. Only
                 # retained bytes should move the batch toward its stop point;
                 # otherwise one oversized file defers every later candidate,
-                # including copies that would fit in the cache.
+                # including copies that would fit in the cache. Also drop
+                # entries with no captured fingerprint — same reason as the
+                # post-loop trim's revalidation: without a fingerprint we
+                # cannot prove the bytes are ours, and keeping them in the
+                # retained set would also keep them in ``protect_paths`` on
+                # the next ``evict_if_over_quota``, which would then reclaim
+                # pre-existing coverage to stay under the ceiling rather than
+                # the untrusted path.
                 retained_new_files = {
                     path: size
                     for path, size in retained_new_files.items()
                     if os.path.isfile(path)
+                    and retained_new_identities.get(path) is not None
                 }
                 retained_new_identities = {
                     path: identity

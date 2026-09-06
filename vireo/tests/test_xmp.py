@@ -580,3 +580,116 @@ def test_failed_access_metadata_copy_preserves_sidecar(sample_xmp, monkeypatch):
         write_rating(sample_xmp, 5)
     assert path.read_bytes() == original
     assert set(path.parent.iterdir()) == {path}
+
+
+# ── Extended-attribute preservation ─────────────────────────────────────
+
+def _fake_xattr_store(source_attrs, refuse=None, refuse_errno=None):
+    """Build list/get/set/remove callables over in-memory xattr dicts."""
+    import errno as errno_module
+
+    store = {"source": dict(source_attrs), "dest": {}}
+
+    def which(path):
+        return store[path]
+
+    def list_xattrs(path):
+        return list(which(path))
+
+    def get_xattr(path, name):
+        return which(path)[name]
+
+    def set_xattr(path, name, value):
+        if name == refuse:
+            code = refuse_errno or errno_module.EACCES
+            raise OSError(code, os.strerror(code), str(path))
+        which(path)[name] = value
+
+    def remove_xattr(path, name):
+        which(path).pop(name, None)
+
+    return store, list_xattrs, get_xattr, set_xattr, remove_xattr
+
+
+def test_copy_xattrs_skips_attributes_no_process_may_set():
+    """A kernel-owned xattr must not sink the whole sidecar write.
+
+    macOS stamps ``com.apple.provenance`` on written files and refuses every
+    attempt to set it. Copying attributes as a block made each already-written
+    sidecar on an SMB share permanently unwritable.
+    """
+    import xmp
+
+    store, *api = _fake_xattr_store(
+        {"com.apple.provenance": b"", "com.vireo.keep": b"value"},
+        refuse="com.apple.provenance",
+    )
+    xmp._copy_xattrs("source", "dest", *api)
+    assert store["dest"] == {"com.vireo.keep": b"value"}
+
+
+def test_copy_xattrs_raises_on_errors_that_are_not_structural():
+    """A full disk is a real failure — do not publish a half-copied sidecar."""
+    import errno
+
+    import xmp
+
+    _, *api = _fake_xattr_store(
+        {"com.vireo.keep": b"value"}, refuse="com.vireo.keep",
+        refuse_errno=errno.ENOSPC,
+    )
+    with pytest.raises(OSError):
+        xmp._copy_xattrs("source", "dest", *api)
+
+
+def test_copy_xattrs_never_skips_access_control_attributes():
+    """Linux stores ACLs as xattrs; dropping one would widen access."""
+    import xmp
+
+    _, *api = _fake_xattr_store(
+        {"system.posix_acl_access": b"acl"}, refuse="system.posix_acl_access",
+    )
+    with pytest.raises(PermissionError):
+        xmp._copy_xattrs("source", "dest", *api)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX extended attributes")
+def test_sidecar_update_survives_unsettable_source_xattr(sample_xmp, monkeypatch):
+    """End to end: an uncopyable source attribute still rewrites the sidecar."""
+    import errno
+
+    import xmp
+
+    name = "com.apple.provenance"
+    if sys.platform == "darwin":
+        target, list_fn, get_fn, set_fn = (
+            xmp, "_darwin_list_xattrs", "_darwin_get_xattr", "_darwin_set_xattr",
+        )
+    else:
+        target, list_fn, get_fn, set_fn = (
+            os, "listxattr", "getxattr", "setxattr",
+        )
+    real_list = getattr(target, list_fn)
+    real_get = getattr(target, get_fn)
+    real_set = getattr(target, set_fn)
+
+    def listing(path, *args, **kwargs):
+        names = list(real_list(path, *args, **kwargs))
+        return names + [name] if str(path) == str(sample_xmp) else names
+
+    def reading(path, attr, *args, **kwargs):
+        if attr == name:
+            return b""
+        return real_get(path, attr, *args, **kwargs)
+
+    def writing(path, attr, value, *args, **kwargs):
+        if attr == name:
+            raise OSError(errno.EACCES, "Permission denied", str(path))
+        return real_set(path, attr, value, *args, **kwargs)
+
+    monkeypatch.setattr(target, list_fn, listing)
+    monkeypatch.setattr(target, get_fn, reading)
+    monkeypatch.setattr(target, set_fn, writing)
+
+    write_rating(sample_xmp, 5)
+    assert read_sync_preview_metadata(sample_xmp)["rating"] == "5"

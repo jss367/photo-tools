@@ -209,15 +209,30 @@ async function runSync(changeIds) {
           status.textContent = p.current_file || p.phase;
         }
       },
-      onComplete: function(result) {
-        if (result.status === 'completed') {
-          status.textContent = 'Synced!';
+      onComplete: function(event) {
+        // Report what reached the sidecars, not merely that the job ran. A
+        // NAS that rejects every write finishes the job normally; saying
+        // "Synced!" over it is why a stuck banner looks like a UI bug.
+        var result = (event && event.result) || {};
+        var synced = result.synced || 0;
+        var failed = result.failed || 0;
+        var reasons = (event && event.errors) || result.errors || [];
+        if (event.status === 'cancelled') {
+          status.textContent = 'Sync cancelled — ' + synced.toLocaleString() + ' written.';
+          status.style.color = 'var(--text-dim)';
+        } else if (failed === 0 && event.status === 'completed') {
+          status.textContent = synced > 0
+            ? 'Synced ' + synced.toLocaleString() + ' photo' + (synced === 1 ? '' : 's') + '!'
+            : 'Nothing to sync.';
           status.style.color = 'var(--accent)';
-          setTimeout(checkPendingSync, 1000);
         } else {
-          status.textContent = 'Failed';
+          status.textContent = 'Wrote ' + synced.toLocaleString() + ', failed on '
+            + failed.toLocaleString() + (reasons.length ? ' — ' + reasons[0] : '')
+            + '. Changes stay pending.';
           status.style.color = 'var(--danger)';
+          status.title = reasons.join('\n');
         }
+        setTimeout(checkPendingSync, 1000);
       },
       onError: function() {
         status.textContent = 'Connection lost';

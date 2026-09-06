@@ -2,7 +2,7 @@
 
 import logging
 import os
-from collections import defaultdict
+from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 
 from db import KEYWORD_SOURCE_UNKNOWN
@@ -234,6 +234,37 @@ def _write_photo_sync(db, photo_id, xmp_path, plan):
         write_rating(xmp_path, plan.rating)
 
 
+# How many distinct failure reasons a sync reports up to the job layer. A NAS
+# that rejects every write produces one reason repeated thousands of times;
+# the summary exists to name the cause, not to reproduce the log.
+_MAX_REPORTED_FAILURE_REASONS = 5
+
+
+def _sync_result(synced, failures):
+    """Build the sync result, telling the job layer whether it actually worked.
+
+    ``ok`` / ``errors`` are the JobRunner's partial-failure convention: a run
+    that wrote 10 sidecars and failed on 2,230 must land in history as
+    "failed", not "completed", so the UI cannot report success over a NAS
+    that rejected every write.
+    """
+    counts = Counter(f["error"] for f in failures)
+    reasons = [
+        f"{error} ({count} photo{'s' if count != 1 else ''})"
+        for error, count in counts.most_common(_MAX_REPORTED_FAILURE_REASONS)
+    ]
+    remaining = len(counts) - len(reasons)
+    if remaining > 0:
+        reasons.append(f"...and {remaining} more distinct error(s)")
+    return {
+        "synced": synced,
+        "failed": len(failures),
+        "failures": failures,
+        "ok": not failures,
+        "errors": reasons,
+    }
+
+
 def sync_to_xmp(db, progress_callback=None, change_ids=None):
     """Write pending changes to XMP sidecars.
 
@@ -250,7 +281,7 @@ def sync_to_xmp(db, progress_callback=None, change_ids=None):
     if change_ids is not None:
         changes = _select_changes(changes, change_ids)
     if not changes:
-        return {"synced": 0, "failed": 0, "failures": []}
+        return _sync_result(0, [])
 
     by_photo = defaultdict(list)
     for c in changes:
@@ -303,9 +334,8 @@ def sync_to_xmp(db, progress_callback=None, change_ids=None):
             synced_ids, clear_equivalent_flat_removals=True,
         )
 
-    failed = len(failures)
-    log.info("Sync complete: %d synced, %d failed", synced, failed)
-    return {"synced": synced, "failed": failed, "failures": failures}
+    log.info("Sync complete: %d synced, %d failed", synced, len(failures))
+    return _sync_result(synced, failures)
 
 
 def sync_from_xmp(db, photo_ids):

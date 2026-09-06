@@ -50,7 +50,8 @@ def test_rating_return_to_previous_value_syncs_latest(tmp_path, db, batch, histo
 
     expected_rating = 2 if history == "undo" else 1
     assert db.get_photo(pid)["rating"] == expected_rating
-    assert sync_to_xmp(db) == {"synced": 1, "failed": 0, "failures": []}
+    assert sync_to_xmp(db) == {"synced": 1, "failed": 0, "failures": [],
+                               "ok": True, "errors": []}
     assert read_sync_preview_metadata(xmp_path)["rating"] == str(expected_rating)
     assert not db.get_pending_changes()
 
@@ -1068,3 +1069,50 @@ def test_sync_from_xmp_preserves_cross_slot_homonyms(tmp_path):
     surviving_ids = {kw['id'] for kw in keywords}
     assert kid_by_type['taxonomy'] in surviving_ids
     assert kid_by_type['individual'] in surviving_ids
+
+
+def test_sync_result_reports_partial_failure_to_the_job_layer(tmp_path, monkeypatch):
+    """A run that fails on most photos must not land in history as a success."""
+    import xmp as xmp_module
+    from db import Database
+    from sync import sync_to_xmp
+
+    db = Database(str(tmp_path / "test.db"))
+    db.set_active_workspace(db.ensure_default_workspace())
+    pid, _ = _setup_photo_with_xmp(tmp_path, db)
+    db.queue_change(pid, 'keyword_add', 'Test')
+
+    def refuse(*args, **kwargs):
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(xmp_module, "write_sidecar", refuse)
+    monkeypatch.setattr("sync.write_sidecar", refuse)
+
+    result = sync_to_xmp(db)
+    assert result["synced"] == 0
+    assert result["failed"] == 1
+    assert result["ok"] is False
+    assert result["errors"] and "Permission denied" in result["errors"][0]
+    # The count belongs in the summary so one NAS-wide cause reads as one line.
+    assert "(1 photo)" in result["errors"][0]
+    assert len(db.get_pending_changes()) == 1
+
+
+def test_sync_failure_reasons_are_deduplicated(tmp_path, monkeypatch):
+    """Thousands of identical failures collapse into one named cause."""
+    from db import Database
+    from sync import sync_to_xmp
+
+    db = Database(str(tmp_path / "test.db"))
+    db.set_active_workspace(db.ensure_default_workspace())
+    fid = db.add_folder('/nonexistent', name='gone')
+    for i in range(3):
+        pid = db.add_photo(folder_id=fid, filename=f'missing{i}.jpg',
+                           extension='.jpg', file_size=100, file_mtime=1.0)
+        db.queue_change(pid, 'keyword_add', 'Test')
+
+    result = sync_to_xmp(db)
+    assert result["failed"] == 3
+    assert result["ok"] is False
+    assert len(result["errors"]) == 1
+    assert "(3 photos)" in result["errors"][0]

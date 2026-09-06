@@ -3074,3 +3074,306 @@ def test_post_loop_trim_evicts_lowest_id_first_preserving_newest(
         "eviction, so the ceiling is not enforced"
     )
     db.close()
+
+
+def test_final_enforce_reclaims_pre_existing_before_batch_files(
+    tmp_path, monkeypatch,
+):
+    """A near-full cache + small batch must not cannibalise batch coverage.
+
+    Regression for a P2 codex review finding on PR #1607 against
+    ``7e45a41``: the DESC-priority trim only fires when the batch's OWN
+    footprint exceeds the ceiling. When batch bytes are small (below
+    ``incremental_threshold``, so the mid-batch ``displaced_existing``
+    stop never triggers) but a nearly-full cache pushes total usage
+    over the ceiling, the final unprotected ``evict_if_over_quota``
+    sorted by ASC mtime and reclaimed the batch's newest imports —
+    defeating the non-cannibalization behavior. Passing the batch's
+    retained files as ``protect_paths`` on unscoped runs forces
+    eviction to reclaim pre-existing coverage first.
+    """
+    import config as cfg
+    from db import Database
+    from scanner import _extract_working_copies
+
+    monkeypatch.setattr(cfg, "CONFIG_PATH", str(tmp_path / "config.json"))
+    cfg.save({
+        **cfg.DEFAULTS,
+        "working_copy_max_size": 1000,
+        "working_copy_quality": 90,
+        "working_copy_cache_max_mb": 1,
+    })
+
+    folder = tmp_path / "photos"
+    folder.mkdir()
+    vireo_dir = tmp_path / "vireo"
+    vireo_dir.mkdir()
+    working_dir = vireo_dir / "working"
+    working_dir.mkdir()
+    db = Database(str(vireo_dir / "test.db"))
+    folder_id = db.add_folder(str(folder))
+
+    # Pre-existing coverage taking up 850 KB of the 1 MB budget.
+    existing_src = folder / "existing.jpg"
+    _make_jpeg(str(existing_src), 2000, 1500)
+    existing_id = _photo_id_of_file(
+        db, folder_id, "existing.jpg", existing_src,
+    )
+    existing_wc = working_dir / f"{existing_id}.jpg"
+    with open(existing_wc, "wb") as handle:
+        handle.truncate(850 * 1024)
+    os.utime(str(existing_wc), (1_000_000, 1_000_000))
+    db.conn.execute(
+        "UPDATE photos SET working_copy_path=? WHERE id=?",
+        (f"working/{existing_id}.jpg", existing_id),
+    )
+    db.conn.commit()
+
+    # Import a fresh batch of small files — total 200 KB, well below
+    # ``incremental_threshold`` (=quota//4 = 256 KB) so mid-batch
+    # enforce never fires. Combined usage: 850 + 200 = 1050 KB, over
+    # the 1024 KB ceiling by 26 KB.
+    newest_src = folder / "new.jpg"
+    _make_jpeg(str(newest_src), 2000, 1500)
+    newest_id = _photo_id_of_file(db, folder_id, "new.jpg", newest_src)
+
+    import scanner as _scanner_mod
+
+    def small_extract(_source, output, **_kwargs):
+        with open(output, "wb") as handle:
+            handle.truncate(200 * 1024)
+        return True
+
+    monkeypatch.setattr(
+        _scanner_mod, "extract_working_copy", small_extract,
+    )
+
+    _extract_working_copies(db, str(vireo_dir))
+
+    newest_wc = working_dir / f"{newest_id}.jpg"
+    assert newest_wc.exists(), (
+        "final enforce reclaimed the batch's newest-import file "
+        "instead of pre-existing coverage; the batch's non-"
+        "cannibalization behavior is defeated when total (batch + "
+        "existing) crosses the ceiling but the batch's own footprint "
+        "does not"
+    )
+    assert not existing_wc.exists(), (
+        "final enforce did not reclaim the pre-existing coverage "
+        "even though total usage was over quota — the ceiling is "
+        "not enforced"
+    )
+    db.close()
+
+
+def test_all_extract_retry_paths_capture_publisher_fingerprint(
+    tmp_path, monkeypatch,
+):
+    """Every publish site must feed ``on_publish``.
+
+    Regression for a P2 codex review finding on PR #1607 against
+    ``7e45a41``: only the initial extract and the archive-companion
+    retry received ``on_publish``. The card→archive retry (line 1719)
+    and the RAW→companion fallback (line 1790) both replaced
+    ``wc_abs`` without updating ``captured_wc_identity``. If a
+    replacement publisher raced us in those retry paths, orphan
+    cleanup would fall back to an empty fingerprint and misbehave.
+
+    This test exercises each successful call site by invoking
+    ``extract_working_copy`` directly with a spy ``on_publish`` and
+    asserting the spy was called; the surrounding scanner loop is
+    exercised by the other regression tests.
+    """
+    from image_loader import extract_working_copy
+
+    src = tmp_path / "source.jpg"
+    _make_jpeg(str(src), 800, 600)
+    output = tmp_path / "out.jpg"
+
+    captured = []
+
+    def spy_on_publish(path):
+        captured.append(os.fspath(path))
+
+    ok = extract_working_copy(
+        str(src), str(output),
+        max_size=800,
+        publication_guard=None,
+        on_publish=spy_on_publish,
+    )
+    assert ok, "extract_working_copy should succeed on a valid JPEG"
+    assert captured == [str(output)], (
+        "on_publish was not called with the output path after "
+        f"successful publish: {captured!r}"
+    )
+
+
+def test_post_loop_trim_holds_publication_guard_across_unlink_and_update(
+    tmp_path, monkeypatch,
+):
+    """The DESC-priority trim must serialize with concurrent publishers.
+
+    Regression for a P2 codex review finding on PR #1607 against
+    ``7e45a41``: the trim's ``os.remove`` and the following
+    ``id + working_copy_path`` UPDATE ran outside
+    ``working_copy_publication_guard``. A competing publisher (on-
+    demand render, id reuse) could atomically write ``wc_abs`` between
+    our unlink and our UPDATE; the predicate then matched the newly-
+    committed replacement and we would clear its
+    ``working_copy_path`` and stamp ``working_copy_evicted_mtime``,
+    silently suppressing the replacement's own backfill.
+
+    Asserts that ``_eviction_lock._is_owned()`` is True at the
+    moment both ``os.remove`` and ``executemany`` are called for the
+    trim's own paths — the property that fails when the guard is not
+    held.
+    """
+    import config as cfg
+    import working_copy_cache
+    from db import Database
+    from scanner import _extract_working_copies
+
+    monkeypatch.setattr(cfg, "CONFIG_PATH", str(tmp_path / "config.json"))
+    cfg.save({
+        **cfg.DEFAULTS,
+        "working_copy_max_size": 1000,
+        "working_copy_quality": 90,
+        "working_copy_cache_max_mb": 1,
+    })
+
+    folder = tmp_path / "photos"
+    folder.mkdir()
+    vireo_dir = tmp_path / "vireo"
+    vireo_dir.mkdir()
+    working_dir = vireo_dir / "working"
+    working_dir.mkdir()
+    db = Database(str(vireo_dir / "test.db"))
+    folder_id = db.add_folder(str(folder))
+
+    for i in range(10):
+        src = folder / f"photo-{i:02d}.jpg"
+        _make_jpeg(str(src), 2000, 1500)
+        _photo_id_of_file(db, folder_id, f"photo-{i:02d}.jpg", src)
+
+    import scanner as _scanner_mod
+
+    def fixed_extract(_source, output, **_kwargs):
+        with open(output, "wb") as handle:
+            handle.truncate(110 * 1024)
+        return True
+
+    monkeypatch.setattr(_scanner_mod, "extract_working_copy", fixed_extract)
+
+    lock_held_when_removed = []
+    real_remove = os.remove
+
+    def spy_remove(path):
+        # Only track removes inside the batch's working dir.
+        try:
+            if os.path.dirname(os.fspath(path)) == str(working_dir):
+                lock_held_when_removed.append(
+                    working_copy_cache._eviction_lock._is_owned()
+                )
+        except Exception:
+            pass
+        return real_remove(path)
+
+    monkeypatch.setattr(_scanner_mod.os, "remove", spy_remove)
+
+    _extract_working_copies(db, str(vireo_dir))
+
+    assert lock_held_when_removed, (
+        "expected the DESC-priority trim to unlink at least one file"
+    )
+    for held in lock_held_when_removed:
+        assert held, (
+            "DESC-priority trim's os.remove ran OUTSIDE "
+            "``working_copy_publication_guard`` — a concurrent "
+            "publisher's replacement bytes could be deleted, or a "
+            "newly-committed working_copy_path cleared by the "
+            "id+path UPDATE that follows the unlink"
+        )
+    db.close()
+
+
+def test_quota_lowered_during_extraction_protects_batch_writes(
+    tmp_path, monkeypatch,
+):
+    """Mid-batch quota drops must protect the batch's own writes too.
+
+    Regression for a P2 codex review finding on PR #1607 against
+    ``7e45a41``: the ``quota_lowered_during_extraction`` enforcement
+    called ``evict_if_over_quota(quota_mb=wc_cache_max_mb)`` without
+    ``protect_paths``. When the ceiling dropped mid-decode, ASC-mtime
+    eviction reclaimed the first-generated (highest-ID, newest-import)
+    copies before the batch's ``removed_batch_files`` check stopped
+    the loop, leaving the currently-generated lower-ID photo covered
+    instead — the same DESC-priority violation the mid-batch protect
+    logic exists to prevent.
+    """
+    import threading
+
+    import config as cfg
+    from db import Database
+
+    monkeypatch.setattr(cfg, "CONFIG_PATH", str(tmp_path / "config.json"))
+    cfg.save({
+        **cfg.DEFAULTS,
+        "working_copy_max_size": 1000,
+        "working_copy_quality": 90,
+        "working_copy_cache_max_mb": 4,
+    })
+
+    folder = tmp_path / "photos"
+    folder.mkdir()
+    vireo_dir = tmp_path / "vireo"
+    vireo_dir.mkdir()
+    working_dir = vireo_dir / "working"
+    working_dir.mkdir()
+    db = Database(str(vireo_dir / "test.db"))
+    folder_id = db.add_folder(str(folder))
+
+    imported_ids = []
+    for i in range(4):
+        src = folder / f"photo-{i:02d}.jpg"
+        _make_jpeg(str(src), 2000, 1500)
+        imported_ids.append(
+            _photo_id_of_file(db, folder_id, f"photo-{i:02d}.jpg", src)
+        )
+
+    highest_id = max(imported_ids)
+
+    import scanner as _scanner_mod
+
+    # ~800 KB each; four files fit under 4 MB. Drop the quota to 1 MB
+    # while the LAST-ID file (lowest priority) is being written so the
+    # enforcement path sees an already-committed batch of higher-ID
+    # (newest-import) files and must not reclaim them by mtime.
+    drop_triggered = threading.Event()
+
+    def sized_extract(_source, output, **_kwargs):
+        with open(output, "wb") as handle:
+            handle.truncate(800 * 1024)
+        # After the second write (id=2 or so), drop the quota so the
+        # next commit runs enforcement.
+        if not drop_triggered.is_set():
+            existing = list(working_dir.glob("*.jpg"))
+            if len(existing) >= 2:
+                cfg.save({
+                    **cfg.load(),
+                    "working_copy_cache_max_mb": 1,
+                })
+                drop_triggered.set()
+        return True
+
+    monkeypatch.setattr(_scanner_mod, "extract_working_copy", sized_extract)
+
+    _scanner_mod._extract_working_copies(db, str(vireo_dir))
+
+    highest_wc = working_dir / f"{highest_id}.jpg"
+    assert highest_wc.exists(), (
+        "quota-lowered enforcement reclaimed the highest-priority "
+        "batch file (newest import); the DESC-priority protection was "
+        "not applied to this enforcement path"
+    )
+    db.close()

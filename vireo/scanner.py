@@ -1719,6 +1719,7 @@ def _extract_working_copies(db, vireo_dir, progress_callback=None,
                 ok = extract_working_copy(
                     source, wc_abs, max_size=wc_max_size, quality=wc_quality,
                     publication_guard=working_copy_publication_guard,
+                    on_publish=_capture_wc_identity,
                 )
         raw_failed_then_companion = False
         # libraw returns an embedded JPEG when it can't demosaic a RAW; that
@@ -1790,6 +1791,7 @@ def _extract_working_copies(db, vireo_dir, progress_callback=None,
             ok = extract_working_copy(
                 source, wc_abs, max_size=wc_max_size, quality=wc_quality,
                 publication_guard=working_copy_publication_guard,
+                on_publish=_capture_wc_identity,
             )
             # Companion attempt used a card override and failed — retry
             # from the verified archive companion before recording failure.
@@ -2018,8 +2020,21 @@ def _extract_working_copies(db, vireo_dir, progress_callback=None,
                 if not publication_lost and not publication_orphaned:
                     commit_with_retry(db.conn)
                     if quota_lowered_during_extraction:
+                        # Protect the batch's own writes here too — same
+                        # reason as the mid-batch enforce. Without it, a
+                        # settings drop mid-decode would sort by ASC
+                        # mtime and reclaim the first-generated (highest-
+                        # ID, newest-import) copies before the batch's
+                        # ``removed_batch_files`` check stops the loop,
+                        # leaving the currently-generated lower-ID photo
+                        # covered instead. Leave ``wc_abs`` unprotected
+                        # for the individually-oversized case, matching
+                        # the mid-batch call above.
                         evict_if_over_quota(
                             db, vireo_dir, quota_mb=wc_cache_max_mb,
+                            protect_paths=(
+                                set(retained_new_files) - {wc_abs}
+                            ),
                         )
         else:
             # Mark failure gated on current file_mtime so a future content
@@ -2390,57 +2405,91 @@ def _extract_working_copies(db, vireo_dir, progress_callback=None,
     if retained_new_files and quota_bytes > 0:
         batch_over = sum(retained_new_files.values()) - quota_bytes
         if batch_over > 0:
-            for path, size in sorted(
-                list(retained_new_files.items()),
-                key=lambda kv: _wc_id_from_batch_path(kv[0]),
-            ):
-                if batch_over <= 0:
-                    break
-                try:
-                    os.remove(path)
-                except FileNotFoundError:
+            # Serialize the unlink and the deferred-marker UPDATE with
+            # ``working_copy_publication_guard`` — the same lock quota
+            # eviction takes. Without it, a competing publisher (on-
+            # demand render, id reuse) can atomically write ``wc_abs``
+            # between our unlink and our UPDATE; the ``id + path``
+            # predicate then matches the newly-committed replacement
+            # and we would clear its ``working_copy_path`` and stamp
+            # ``working_copy_evicted_mtime``, silently suppressing the
+            # replacement's own backfill until its source mtime or the
+            # quota changes.
+            with working_copy_publication_guard():
+                for path, size in sorted(
+                    list(retained_new_files.items()),
+                    key=lambda kv: _wc_id_from_batch_path(kv[0]),
+                ):
+                    if batch_over <= 0:
+                        break
+                    try:
+                        os.remove(path)
+                    except FileNotFoundError:
+                        retained_new_files.pop(path, None)
+                        continue
+                    except OSError:
+                        log.warning(
+                            "Post-loop DESC-priority trim could not remove %s",
+                            path, exc_info=True,
+                        )
+                        continue
                     retained_new_files.pop(path, None)
-                    continue
-                except OSError:
-                    log.warning(
-                        "Post-loop DESC-priority trim could not remove %s",
-                        path, exc_info=True,
+                    batch_over -= size
+                    trimmed_ids.append(_wc_id_from_batch_path(path))
+
+                if trimmed_ids:
+                    # Mark the trimmed rows capacity-deferred, exactly
+                    # like the candidates the batch never reached.
+                    # Without this the rows come back as
+                    # ``working_copy_path IS NULL`` with no marker —
+                    # ``_evict_once``'s stale-tracked reconciliation
+                    # deliberately clears the path so a lost DB
+                    # transition can regenerate — and the startup
+                    # gate's candidate count can never reach zero. The
+                    # backfill would then relaunch on every app start,
+                    # re-decode the same lowest-priority rows, and
+                    # trim them again: the exact "decode a quota-sized
+                    # batch only to evict it, and repeat indefinitely"
+                    # loop the deferred marker exists to prevent. The
+                    # ``id + path`` guard prevents stamping the marker
+                    # on a replacement row that reused the id and never
+                    # published this rendition, and is also what serves
+                    # the concurrent-publisher case above once we hold
+                    # the publication guard.
+                    db.conn.executemany(
+                        "UPDATE photos SET working_copy_path=NULL,"
+                        " working_copy_evicted_mtime=COALESCE(file_mtime, -1)"
+                        " WHERE id=? AND working_copy_path=?",
+                        [
+                            (photo_id, f"working/{photo_id}.jpg")
+                            for photo_id in trimmed_ids
+                            if photo_id >= 0
+                        ],
                     )
-                    continue
-                retained_new_files.pop(path, None)
-                batch_over -= size
-                trimmed_ids.append(_wc_id_from_batch_path(path))
+                    commit_with_retry(db.conn)
 
-        if trimmed_ids:
-            # Mark the trimmed rows capacity-deferred, exactly like the
-            # candidates the batch never reached. Without this the rows
-            # come back as ``working_copy_path IS NULL`` with no marker —
-            # ``_evict_once``'s stale-tracked reconciliation deliberately
-            # clears the path so a lost DB transition can regenerate — and
-            # the startup gate's candidate count can never reach zero. The
-            # backfill would then relaunch on every app start, re-decode
-            # the same lowest-priority rows, and trim them again: the exact
-            # "decode a quota-sized batch only to evict it, and repeat
-            # indefinitely" loop the deferred marker exists to prevent.
-            # Guard on the path we just committed so a recycled id whose
-            # replacement row never published this rendition is untouched.
-            db.conn.executemany(
-                "UPDATE photos SET working_copy_path=NULL,"
-                " working_copy_evicted_mtime=COALESCE(file_mtime, -1)"
-                " WHERE id=? AND working_copy_path=?",
-                [
-                    (photo_id, f"working/{photo_id}.jpg")
-                    for photo_id in trimmed_ids
-                    if photo_id >= 0
-                ],
-            )
-            commit_with_retry(db.conn)
-
-    # A scan/import may add a large batch at once. Enforce once after the
-    # batch so the quota stays a hard steady-state ceiling without rescanning
-    # the working directory after every generated file.
+    # A scan/import may add a large batch at once. Enforce once after
+    # the batch so the quota stays a hard steady-state ceiling without
+    # rescanning the working directory after every generated file.
+    #
+    # Protect the batch's own retained files for unscoped runs so pre-
+    # existing coverage gets reclaimed before the newest imports we
+    # just wrote. Without this, a batch whose own footprint stays under
+    # ``incremental_threshold`` never runs the mid-batch enforcement
+    # (and never trips ``displaced_existing``), the DESC-priority trim
+    # above only fires when the batch alone overshoots, and this final
+    # unprotected pass would then sort by ASC mtime and reclaim
+    # hundreds of MB of pre-existing coverage — defeating the batch's
+    # non-cannibalization behavior. Scoped runs keep the old semantics
+    # (import shoots are explicitly allowed to displace older cache).
     try:
-        evict_if_over_quota(db, vireo_dir)
+        if scope is None and retained_new_files:
+            evict_if_over_quota(
+                db, vireo_dir,
+                protect_paths=set(retained_new_files),
+            )
+        else:
+            evict_if_over_quota(db, vireo_dir)
     except Exception:
         # The working copies themselves are valid even if quota maintenance
         # hits a transient filesystem/database error. Keep the scan result and

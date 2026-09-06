@@ -164,6 +164,7 @@ from working_copy_cache import (
     evict_if_over_quota as evict_working_copy_cache_if_over_quota,
 )
 from working_copy_cache import (
+    touch_working_copy_access,
     working_copy_publication_guard,
     working_copy_quota_bytes,
     working_copy_stats,
@@ -4331,9 +4332,28 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 continue
         if not mtimes:
             return
-        peg = max(mtimes)
+        # Satisfy the gate without backdating the file. ``max(mtimes)`` alone
+        # stamps a render of a 2019 RAW with a 2019 mtime, and working-copy
+        # quota eviction reads mtime as recency — so a copy generated on
+        # demand for an old source would be born at the head of the eviction
+        # queue and reclaimed before the user opened the next photo. The gate
+        # only needs ``>=``, so clamping up to the wall clock keeps it honest
+        # and leaves a usable recency stamp.
+        peg = max(max(mtimes), time.time())
         with contextlib.suppress(OSError, TypeError, ValueError):
             os.utime(cache_path, (peg, peg))
+
+    def _serve_trusted_working_copy(path):
+        """Serve a working-copy cache hit and stamp it as recently used.
+
+        Callers hold ``working_copy_publication_guard`` — the same lock the
+        quota pass takes — so the stamp cannot land between eviction's
+        directory scan and its unlink.
+        """
+        from flask import send_file
+
+        touch_working_copy_access(path)
+        return send_file(path, mimetype="image/jpeg")
 
     def _prepared_full_resolution_render(
         vireo_dir, photo, recipe, file_state=None,
@@ -5050,6 +5070,17 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 "working_copy_backfill", work,
                 ephemeral=True,
                 config={"trigger": "startup"},
+                # A library with tens of thousands of un-backfilled RAWs
+                # takes days of sequential decode, so the user needs a way
+                # to stand it down while they work without losing the
+                # progress made so far. ``cancel_check`` above already
+                # routes through ``runner.is_cancelled``, which parks on a
+                # pause request before reporting cancellation, and the
+                # extractor polls it at the top of each row — after that
+                # row's commit and before the next file read, so nothing
+                # is held while parked (no open write transaction, no
+                # publication guard, no in-flight extraction).
+                pausable=True,
             )
         except Exception:
             log.exception("Failed to start working-copy backfill job")
@@ -17585,7 +17616,13 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
 
             photo_dict = dict(photo)
             folders = {folder["id"]: folder["path"]}
-            img = load_working_image(photo_dict, vireo_dir, max_size=1024, folders=folders)
+            # A user reviewing a burst is actively using these working
+            # copies; stamp them so quota eviction does not treat them as
+            # the least recently used files in the cache.
+            img = load_working_image(
+                photo_dict, vireo_dir, max_size=1024, folders=folders,
+                record_access=True,
+            )
             if img is None:
                 results.append({"photo_id": photo_id, "sharpness": None, "error": "could not load image"})
                 continue
@@ -28175,6 +28212,27 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 return "Not found", 404
             image_path = os.path.join(folder["path"], photo["filename"])
 
+        if using_working_copy:
+            # Stamp access recency — same pattern as
+            # ``/photos/<id>/original`` and ``/photos/<id>/edit-preview``.
+            # Without this, repeated interactive crop previews leave the
+            # working copy's atime unchanged and it stays first in the
+            # quota eviction queue even while the user is actively
+            # working on the photo.
+            #
+            # Only the touch runs under the guard, and deliberately so.
+            # ``working_copy_publication_guard`` is a process-wide lock
+            # that the quota pass holds across a full scandir of the
+            # cache; holding it across a decode as well would serialize
+            # every interactive image read in the app against every
+            # other one and against eviction, which is exactly the
+            # stall this PR set out to remove. A `utime` under the lock
+            # costs microseconds. If eviction unlinks the file between
+            # the touch and the open, the decode returns None and the
+            # original-source fallback below handles it — that path
+            # already exists for precisely this race.
+            with working_copy_publication_guard():
+                touch_working_copy_access(image_path)
         img = load_image(image_path, max_size=None)
         if img is None and using_working_copy:
             # Quota enforcement can unlink the working copy after the
@@ -28829,6 +28887,32 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                         load_max_size = None
                 img = None
                 if not source_failure_current:
+                    if using_working_copy:
+                        # Record access on the working copy whenever we
+                        # read it as an edit-preview source. Without the
+                        # touch the interactive editor's repeated
+                        # ``/edit-preview`` requests never advance the
+                        # WC's recency and an actively edited photo
+                        # stays the oldest eviction candidate. The touch
+                        # runs under the guard because it races
+                        # ``_evict_once``'s identity check, which would
+                        # otherwise skip this file as "replaced" and
+                        # silently overshoot a lowered quota.
+                        #
+                        # The decode stays OUTSIDE the guard: it is a
+                        # process-wide lock and the editor fires these
+                        # on every slider move, so holding it across
+                        # Pillow would serialize the whole app's image
+                        # reads behind one preview. If eviction unlinks
+                        # the copy in the exists/open window, ``img`` is
+                        # None and the original-source retry below
+                        # recovers. The offline-only ``source_guard``
+                        # below still wraps the decode for the case
+                        # where the WC is the only local source; the
+                        # guard is an RLock, so the touch reentering it
+                        # from there is safe.
+                        with working_copy_publication_guard():
+                            touch_working_copy_access(canonical)
                     img = load_image(
                         canonical, max_size=load_max_size, **load_kwargs,
                     )
@@ -29438,7 +29522,49 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 else None
             )
             load_kwargs = {"raw_decode": raw_decode} if raw_decode else {}
-            img = load_image(image_path, max_size=None, **load_kwargs)
+            # Stamp the working copy as recently used whenever we read it
+            # as an edit-render source. ``_serve_trusted_working_copy``
+            # only touches when the WC JPEG itself is returned via
+            # ``send_file``, so an actively edited non-RAW photo whose
+            # renders decode from ``trusted_wc_path`` and encode to a
+            # ``prepared_full_resolution_render`` cache would retain its
+            # generation mtime and stay first in the eviction queue no
+            # matter how often it was displayed at 1:1. Recording access
+            # here keeps the LRU ordering aligned with actual use.
+            #
+            # ``touch_working_copy_access`` documents that callers hold
+            # ``working_copy_publication_guard`` — the same lock the
+            # quota pass takes — so the mtime move cannot land between
+            # ``_evict_once``'s directory scan and its unlink. Without
+            # the guard, an unlucky touch during a quota reduction
+            # changes the file's fingerprint after eviction snapshotted
+            # it; ``_file_identity(os.stat(path)) != sampled_identity``
+            # then treats the file as replaced and skips it, so the
+            # pass returns fewer freed bytes than needed. Because
+            # ``deferred=True`` only fires on ``PRAGMA data_version``
+            # invalidation (not on identity skips), the settings flow
+            # never schedules its background retry and the cache can
+            # sit above the requested quota until another write or
+            # restart.
+            #
+            # The decode stays outside the guard. This is the 1:1
+            # pixel-peeping path; the guard is process-wide and the
+            # quota pass holds it across a scandir of the whole cache,
+            # so wrapping a full-resolution Pillow decode in it would
+            # make every zoomed view queue behind every other one.
+            # Leaving the decode unguarded keeps main's behaviour for
+            # the exists/open race (a vanished copy 500s and records a
+            # failure marker) and adds only the touch.
+            edit_source_is_working_copy = (
+                trusted_wc_path is not None
+                and image_path == trusted_wc_path
+            )
+            if edit_source_is_working_copy:
+                with working_copy_publication_guard():
+                    touch_working_copy_access(trusted_wc_path)
+            img = load_image(
+                image_path, max_size=None, **load_kwargs,
+            )
             if (
                 img is not None
                 and resolved_ext in RAW_EXTENSIONS
@@ -29506,6 +29632,42 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                         # requests fail fast instead of retrying both sources
                         # on every hit.
                         _record_working_copy_failure(db, photo, raw_source_path)
+            if img is None and edit_source_is_working_copy:
+                # Quota enforcement can unlink the selected working copy
+                # after the existence check but before ``load_image`` opens
+                # it — a window this branch leaves open deliberately, since
+                # holding the process-wide publication guard across a
+                # full-resolution decode would serialize every zoomed view
+                # in the app. Retry the original source once so an
+                # otherwise healthy view does not become a transient 500
+                # during eviction, and do not record a working-copy failure
+                # for it: nothing is wrong with the source, the cache entry
+                # merely went away. Mirrors the recovery ``/edit-preview``,
+                # ``/crop`` and the preview materializer already have; this
+                # branch was the only reader without one.
+                original_retry_path = os.path.join(
+                    folder["path"], photo["filename"],
+                )
+                if original_retry_path != image_path:
+                    log.info(
+                        "Working copy for photo %s vanished before decode "
+                        "(quota eviction); retrying original source",
+                        photo_id,
+                    )
+                    retry_ext = os.path.splitext(
+                        original_retry_path
+                    )[1].lower()
+                    retry_kwargs = (
+                        {"raw_decode": RAW_DECODE_PRESERVE_HIGHLIGHTS}
+                        if retry_ext in RAW_EXTENSIONS
+                        else {}
+                    )
+                    img = load_image(
+                        original_retry_path, max_size=None, **retry_kwargs,
+                    )
+                    if img is not None:
+                        image_path = original_retry_path
+                        resolved_ext = retry_ext
             if img is None:
                 _record_working_copy_failure(db, photo, image_path)
                 return "Could not load image", 500
@@ -29552,7 +29714,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             # eviction from unlinking the open handle.
             with working_copy_publication_guard():
                 if os.path.isfile(trusted_wc_path):
-                    return send_file(trusted_wc_path, mimetype="image/jpeg")
+                    return _serve_trusted_working_copy(trusted_wc_path)
 
         # Resolve original file path
         from offline_cache import resolve_original_path
@@ -29612,7 +29774,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             # branch above.
             with working_copy_publication_guard():
                 if os.path.isfile(trusted_wc_path):
-                    return send_file(trusted_wc_path, mimetype="image/jpeg")
+                    return _serve_trusted_working_copy(trusted_wc_path)
 
         has_current_raw_failure = (
             (not using_offline_cache or resolved_ext in RAW_EXTENSIONS)
@@ -29647,9 +29809,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     # revalidate under the publication guard before opening.
                     with working_copy_publication_guard():
                         if os.path.isfile(trusted_wc_path):
-                            return send_file(
-                                trusted_wc_path, mimetype="image/jpeg",
-                            )
+                            return _serve_trusted_working_copy(trusted_wc_path)
                 log.info(
                     "Skipping original-image extraction for photo %s; RAW working-copy "
                     "extraction already failed for current source mtime",
@@ -30061,9 +30221,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                             _record_working_copy_failure(
                                 db, photo, source_for_extraction,
                             )
-                            return send_file(
-                                trusted_wc_path, mimetype="image/jpeg",
-                            )
+                            return _serve_trusted_working_copy(trusted_wc_path)
             return _serve_generated_original(tmp_path, uw, uh)
 
         # extract_working_copy failed on a RAW source: try the full-res
@@ -30159,9 +30317,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 # 500 rather than raising inside ``send_file``.
                 with working_copy_publication_guard():
                     if os.path.isfile(trusted_wc_path):
-                        return send_file(
-                            trusted_wc_path, mimetype="image/jpeg",
-                        )
+                        return _serve_trusted_working_copy(trusted_wc_path)
             return "Could not load image", 500
         if primary_is_raw:
             cache_path = display_cache_path

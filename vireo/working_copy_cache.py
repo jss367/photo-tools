@@ -67,6 +67,63 @@ def working_copy_publication_guard():
         yield
 
 
+# Working copies carry no access record of their own, so quota eviction
+# orders candidates by mtime — which on a generated file means "written
+# longest ago", not "least recently used". Left alone that inverts the
+# intent: the copies for the photos imported and reviewed most recently
+# are exactly the ones a full cache reclaims first, while a decade-old
+# archive that nobody opens survives because its copies happen to be
+# newer on disk. Stamping the serve time on a cache hit turns mtime into
+# a real recency signal without adding a second LRU table.
+#
+# Throttled: a photographer pixel-peeping one frame at 1:1 issues a burst
+# of requests for the same file, and one utime per request buys nothing
+# over one per session.
+_ACCESS_TOUCH_INTERVAL_SECONDS = 6 * 60 * 60
+
+
+def touch_working_copy_access(path):
+    """Record a working-copy cache hit for eviction ordering.
+
+    Advances the file's ATIME only, leaving its mtime stable. Callers
+    that key off the working copy's mtime treat it as a content-version
+    marker — ``_external_edit_handoff_path`` stamps the WC's mtime into
+    the handoff meta and regenerates ``external-edits/<id>.jpg`` (via
+    ``os.replace``) whenever it changes, which would overwrite anything
+    the external editor saved into that file. Advancing atime instead
+    keeps the content-version key stable while still giving
+    ``_evict_once`` an LRU signal — it sorts by ``max(mtime_ns,
+    atime_ns)`` for that reason.
+
+    Display-cache freshness (``/photos/<id>/original``) also compares
+    the render's mtime against its sources' mtimes; keeping the WC's
+    mtime stable avoids spuriously invalidating that cache on serve.
+
+    Throttled to ``_ACCESS_TOUCH_INTERVAL_SECONDS`` (using
+    ``max(atime, mtime)`` as the current recency) so a burst of 1:1
+    zoom requests costs one ``utime``. Best-effort: callers are
+    serving bytes, so a failed stat/utime costs only eviction-ordering
+    accuracy and must never fail the request. Returns True when the
+    stamp moved.
+    """
+    if not path:
+        return False
+    now = time.time()
+    try:
+        stat_result = os.stat(path)
+    except OSError:
+        return False
+    current_recency = max(stat_result.st_atime, stat_result.st_mtime)
+    if now - current_recency < _ACCESS_TOUCH_INTERVAL_SECONDS:
+        return False
+    try:
+        # Advance atime only; keep mtime as the content-version key.
+        os.utime(path, (now, stat_result.st_mtime))
+    except OSError:
+        return False
+    return True
+
+
 def _file_identity(st):
     """Return the fields that distinguish an atomically replaced file."""
     if os.name == "nt":
@@ -209,7 +266,9 @@ def working_copy_stats(vireo_dir, quota_mb=None):
     }
 
 
-def evict_if_over_quota(db, vireo_dir, quota_mb=None, *, startup=False):
+def evict_if_over_quota(
+    db, vireo_dir, quota_mb=None, *, startup=False, protect_paths=None,
+):
     """Delete oldest canonical working copies until usage is within quota.
 
     Legacy Vireo versions wrote ``working/<photo_id>.jpg`` without recording
@@ -227,6 +286,17 @@ def evict_if_over_quota(db, vireo_dir, quota_mb=None, *, startup=False):
     reclaimed on the very first quota pass instead of waiting for another
     restart after the window closes.
 
+    ``protect_paths`` is an optional iterable of absolute working-copy paths
+    that this pass must not evict — used by the scanner's mid-batch quota
+    enforcement to keep its own newly-written files from being reclaimed as
+    the batch's oldest-mtime entries. Without it, DESC-id backfill would
+    watch eviction pick off its highest-priority files first (the newest
+    imports, born with the oldest wall-clock mtime) and defer the older
+    imports the rotation was meant to preserve. Protected files still count
+    toward usage, so a batch that fills the cache with protected content
+    triggers the ``remaining_bytes > max_bytes`` stop signal without losing
+    coverage of the very rows the ordering prioritizes.
+
     Returns a small result payload useful to startup/config callers and tests.
     """
     max_bytes = working_copy_quota_bytes(quota_mb)
@@ -234,12 +304,17 @@ def evict_if_over_quota(db, vireo_dir, quota_mb=None, *, startup=False):
     if not os.path.isdir(working_dir):
         return {
             "evicted": 0, "freed_bytes": 0, "remaining_bytes": 0,
-            "quota_bytes": max_bytes,
+            "quota_bytes": max_bytes, "evicted_paths": [],
         }
+
+    protected = frozenset(protect_paths or ())
 
     with _eviction_lock:
         for _snapshot_attempt in range(_EVICTION_SNAPSHOT_RETRIES):
-            result = _evict_once(db, working_dir, max_bytes, startup=startup)
+            result = _evict_once(
+                db, working_dir, max_bytes,
+                startup=startup, protect_paths=protected,
+            )
             if result is not None:
                 return result
         # A concurrent catalog writer kept invalidating our snapshot. Report
@@ -256,11 +331,14 @@ def evict_if_over_quota(db, vireo_dir, quota_mb=None, *, startup=False):
             "freed_bytes": 0,
             "remaining_bytes": None,
             "quota_bytes": max_bytes,
+            "evicted_paths": [],
             "deferred": True,
         }
 
 
-def _evict_once(db, working_dir, max_bytes, *, startup):
+def _evict_once(
+    db, working_dir, max_bytes, *, startup, protect_paths=frozenset(),
+):
     """One snapshot-consistent eviction pass; ``None`` on data_version change.
 
     Returns the same result payload as ``evict_if_over_quota`` when the pass
@@ -270,6 +348,8 @@ def _evict_once(db, working_dir, max_bytes, *, startup):
 
     ``_eviction_lock`` must already be held by the caller so this pass stays
     serialized with canonical publication.
+
+    ``protect_paths`` — see ``evict_if_over_quota``.
     """
     catalog_data_version = db.conn.execute(
         "PRAGMA data_version"
@@ -361,9 +441,17 @@ def _evict_once(db, working_dir, max_bytes, *, startup):
             # runtime; startup bypasses the grace because no cache writer
             # can be active yet — the file is safe to reclaim.
             continue
+        # LRU key is ``max(mtime_ns, atime_ns)``: mtime is the content-
+        # version stamp (only advances on write), atime is the access-
+        # recency stamp advanced by ``touch_working_copy_access``. Taking
+        # the max means a freshly published file (whose atime tracks its
+        # own write) still reads as fresh, and a served-recently file
+        # (whose atime we advanced) also reads as fresh, without either
+        # side lying about the other.
         entries.append(
             (
-                st.st_mtime_ns, row["id"], st.st_size, path,
+                max(st.st_mtime_ns, st.st_atime_ns),
+                row["id"], st.st_size, path,
                 expected_rel, _file_identity(st),
             )
         )
@@ -382,7 +470,8 @@ def _evict_once(db, working_dir, max_bytes, *, startup):
             photo_id = int(stem)
             entries.append(
                 (
-                    st.st_mtime_ns, photo_id, st.st_size, path,
+                    max(st.st_mtime_ns, st.st_atime_ns),
+                    photo_id, st.st_size, path,
                     f"working/{photo_id}.jpg", _file_identity(st),
                 )
             )
@@ -407,7 +496,7 @@ def _evict_once(db, working_dir, max_bytes, *, startup):
     if total <= max_bytes:
         return {
             "evicted": 0, "freed_bytes": 0, "remaining_bytes": total,
-            "quota_bytes": max_bytes,
+            "quota_bytes": max_bytes, "evicted_paths": [],
         }
 
     if not _begin_stable_eviction_transaction(
@@ -429,6 +518,16 @@ def _evict_once(db, working_dir, max_bytes, *, startup):
     ) in sorted(entries):
         if total <= max_bytes:
             break
+        if path in protect_paths:
+            # Caller is the scanner's mid-batch enforcement asking us to
+            # leave its just-written newest-import file in place. It has
+            # the oldest wall-clock mtime in the batch (born first, DESC
+            # id) and would otherwise be the first thing evicted, so the
+            # backfill would lose exactly the coverage the ordering was
+            # meant to buy. Continuing here bounds the transient overshoot
+            # to the caller's own writes; the caller detects this via the
+            # ``remaining_bytes > max_bytes`` return and stops the batch.
+            continue
         try:
             if _file_identity(os.stat(path)) != sampled_identity:
                 # Atomic publication replaced the sampled candidate after
@@ -475,6 +574,11 @@ def _evict_once(db, working_dir, max_bytes, *, startup):
         "freed_bytes": freed_bytes,
         "remaining_bytes": total,
         "quota_bytes": max_bytes,
+        # Which files went, not just how many: a batch caller (the scanner's
+        # backfill) has to tell "reclaimed bytes I just wrote" from "reclaimed
+        # coverage that already existed" to decide whether it is still growing
+        # the cache or merely rotating it.
+        "evicted_paths": [path for _, _, path in evicted],
     }
 
 

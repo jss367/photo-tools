@@ -2037,6 +2037,132 @@ def test_original_serves_full_res_working_copy(app_and_db):
     assert resp.status_code == 200
 
 
+def test_edited_original_retries_source_when_working_copy_is_evicted(
+    app_and_db, monkeypatch,
+):
+    """A copy evicted mid-request must not turn a photo view into a 500.
+
+    The edited ``/original`` branch decodes outside the publication guard
+    on purpose — holding a process-wide lock across a full-resolution
+    decode would serialize every zoomed view — so quota enforcement can
+    unlink the working copy between the existence check and the open.
+    ``/edit-preview``, ``/crop`` and the preview materializer all retry the
+    original source in that window; this branch did not, so an eviction
+    during a backfill surfaced as a failed photo view.
+    """
+    import image_loader
+    from PIL import Image
+
+    app, db = app_and_db
+    client = app.test_client()
+    photo = db.get_photos()[0]
+    photo_id = photo["id"]
+
+    vireo_dir = os.path.dirname(app.config["THUMB_CACHE_DIR"])
+    source_dir = os.path.join(vireo_dir, "retry-source")
+    os.makedirs(source_dir, exist_ok=True)
+    original_path = os.path.join(source_dir, "shot.jpg")
+    Image.new("RGB", (800, 600), (12, 34, 56)).save(original_path, "JPEG")
+
+    working_dir = os.path.join(vireo_dir, "working")
+    os.makedirs(working_dir, exist_ok=True)
+    wc_path = os.path.join(working_dir, f"{photo_id}.jpg")
+    Image.new("RGB", (800, 600), (200, 200, 200)).save(wc_path, "JPEG")
+
+    db.conn.execute(
+        "UPDATE folders SET path=? WHERE id=?",
+        (source_dir, photo["folder_id"]),
+    )
+    db.conn.execute(
+        """UPDATE photos
+           SET filename='shot.jpg', extension='.jpg',
+               width=800, height=600, companion_path=NULL,
+               working_copy_path=?
+           WHERE id=?""",
+        (f"working/{photo_id}.jpg", photo_id),
+    )
+    db.conn.commit()
+    db.set_photo_edit_recipe(photo_id, {"rotation": 90})
+    assert db.get_photo_edit_recipe(photo_id), (
+        "precondition: the edited-original branch only runs with a recipe"
+    )
+
+    # Stand in for quota eviction winning the exists/open race: the copy
+    # disappears at the moment the decode reaches for it.
+    real_load = image_loader.load_image
+    calls = []
+
+    def load_after_eviction(path, *args, **kwargs):
+        calls.append(os.path.basename(path))
+        if os.path.abspath(path) == os.path.abspath(wc_path):
+            with contextlib.suppress(OSError):
+                os.remove(wc_path)
+            return None
+        return real_load(path, *args, **kwargs)
+
+    monkeypatch.setattr(image_loader, "load_image", load_after_eviction)
+
+    resp = client.get(f"/photos/{photo_id}/original")
+    assert calls, (
+        "the request never decoded the working copy, so this test does not "
+        f"exercise the eviction window at all (calls={calls})"
+    )
+    assert resp.status_code == 200, (
+        "an eviction in the exists/open window turned a healthy photo view "
+        "into a 500 instead of falling back to the original source"
+    )
+
+
+def test_original_stamps_the_working_copy_it_serves(app_and_db):
+    """Serving a working copy marks it as recently used.
+
+    Quota eviction sorts by ``max(mtime_ns, atime_ns)``. Access recency
+    is advanced via atime so the WC's mtime stays reserved as the
+    content-version key (``_external_edit_handoff_path`` regenerates
+    the external-editor handoff when it changes, which would overwrite
+    the file the external editor saved into). Without an atime advance
+    a full cache reclaims the copies for the photos being worked on
+    right now — they are the ones that have been on disk the longest
+    — while an archive nobody opens survives.
+    """
+    from PIL import Image
+
+    app, db = app_and_db
+    client = app.test_client()
+
+    pid = db.get_photos()[0]["id"]
+    db.conn.execute(
+        "UPDATE photos SET width=800, height=600 WHERE id=?", (pid,),
+    )
+    vireo_dir = os.path.dirname(app.config["THUMB_CACHE_DIR"])
+    working_dir = os.path.join(vireo_dir, "working")
+    os.makedirs(working_dir, exist_ok=True)
+    wc_path = os.path.join(working_dir, f"{pid}.jpg")
+    Image.new("RGB", (800, 600)).save(wc_path, "JPEG")
+    db.conn.execute(
+        "UPDATE photos SET working_copy_path=? WHERE id=?",
+        (f"working/{pid}.jpg", pid),
+    )
+    db.conn.commit()
+
+    stale = time.time() - 30 * 24 * 3600
+    os.utime(wc_path, (stale, stale))
+
+    resp = client.get(f"/photos/{pid}/original")
+    assert resp.status_code == 200
+    stat_after = os.stat(wc_path)
+    assert stat_after.st_atime > stale, (
+        "the served working copy kept its month-old atime, so quota "
+        "eviction (sort key: max(mtime, atime)) still reads it as the "
+        "least valuable file in the cache"
+    )
+    assert stat_after.st_mtime == stale, (
+        "the served working copy's mtime advanced — that key must stay "
+        "stable for the external-edit handoff and display-cache "
+        "freshness gates"
+    )
+
+
 def test_original_opens_full_res_working_copy_under_eviction_guard(
     app_and_db, monkeypatch,
 ):
@@ -2512,6 +2638,74 @@ def test_unedited_raw_display_cache_survives_when_companion_is_newer_than_raw_ro
     )
     with Image.open(io.BytesIO(second.data)) as rendered:
         assert rendered.getpixel((0, 0))[0] > 200
+
+
+def test_generated_rendition_is_not_born_at_the_head_of_the_eviction_queue(
+    app_and_db, monkeypatch,
+):
+    """A render of an old source gets a current mtime, not the source's.
+
+    The cache-hit gate only needs the rendition's mtime to be ``>=`` its
+    sources', but pegging it exactly *to* an old source stamps a brand new
+    file with a years-old timestamp — and working-copy quota eviction reads
+    mtime as recency, so the render would be first in line for reclamation
+    the moment the cache filled. Clamp the peg up to the wall clock.
+    """
+    import image_loader
+    from PIL import Image
+
+    app, db = app_and_db
+    client = app.test_client()
+    photo = db.get_photos()[0]
+    photo_id = photo["id"]
+
+    vireo_dir = os.path.dirname(app.config["THUMB_CACHE_DIR"])
+    source_dir = os.path.join(vireo_dir, "raw-source")
+    os.makedirs(source_dir, exist_ok=True)
+    raw_path = os.path.join(source_dir, "DSC_0001.NEF")
+    with open(raw_path, "wb") as handle:
+        handle.write(b"fake raw")
+    # A decade-old capture, which is the common shape for the archives this
+    # library keeps: eviction must not read "old photo" as "stale cache".
+    ancient = time.time() - 10 * 365 * 24 * 3600
+    os.utime(raw_path, (ancient, ancient))
+
+    db.conn.execute(
+        "UPDATE folders SET path=? WHERE id=?",
+        (source_dir, photo["folder_id"]),
+    )
+    db.conn.execute(
+        """UPDATE photos
+           SET filename='DSC_0001.NEF', extension='.nef',
+               width=800, height=600, companion_path=NULL,
+               working_copy_path=NULL, file_mtime=?
+           WHERE id=?""",
+        (ancient, photo_id),
+    )
+    db.conn.commit()
+
+    def fake_extract(source, output, **kwargs):
+        Image.new("RGB", (800, 600), (200, 200, 200)).save(output, "JPEG")
+        return True
+
+    monkeypatch.setattr(image_loader, "extract_working_copy", fake_extract)
+
+    resp = client.get(f"/photos/{photo_id}/original")
+    assert resp.status_code == 200
+
+    display_path = os.path.join(
+        vireo_dir, "originals", f"{photo_id}.display.jpg",
+    )
+    assert os.path.exists(display_path)
+    stamped = os.path.getmtime(display_path)
+    assert stamped >= ancient, (
+        "the rendition must still satisfy its own source-mtime hit check"
+    )
+    assert stamped >= time.time() - 300, (
+        f"rendition was stamped {(time.time() - stamped) / 86400:.0f} days "
+        "old at birth — quota eviction would reclaim it before anything "
+        "the user actually stopped looking at"
+    )
 
 
 def test_original_trusts_raw_working_copy_even_when_smaller_than_stored_dims(
@@ -12962,3 +13156,382 @@ def test_collection_save_and_reopen_round_trips_visual(app_and_db, monkeypatch):
     assert client.post('/api/collections', json={
         "name": "Bad", "rules": [], "visual": {"prompt": "  "},
     }).status_code == 400
+
+
+def test_edit_render_touches_working_copy_source(
+    client_with_photo, monkeypatch,
+):
+    """The recipe render path must record access on its working-copy source.
+
+    Regression for a P2 codex review finding on PR #1607: for an edited
+    non-RAW photo, ``/photos/<id>/original`` selects ``trusted_wc_path``,
+    decodes it into a ``prepared_full_resolution_render`` cache, and
+    returns that cache — never reaching ``_serve_trusted_working_copy``
+    where the touch used to live. The actively viewed WC keeps its
+    generation mtime and stays first in the eviction queue no matter how
+    often the user zooms into an edited copy. Recording access at the
+    read site (before ``load_image``) closes that hole.
+    """
+    import os
+    import time
+
+    from PIL import Image
+
+    app, db, photo_id = client_with_photo
+    vireo_dir = os.path.dirname(app.config["THUMB_CACHE_DIR"])
+    working_dir = os.path.join(vireo_dir, "working")
+    os.makedirs(working_dir, exist_ok=True)
+    wc_path = os.path.join(working_dir, f"{photo_id}.jpg")
+    Image.new("RGB", (800, 600), (200, 60, 40)).save(
+        wc_path, "JPEG", quality=90,
+    )
+    db.conn.execute(
+        "UPDATE photos SET working_copy_path=? WHERE id=?",
+        (f"working/{photo_id}.jpg", photo_id),
+    )
+    db.conn.commit()
+    db.set_photo_edit_recipe(photo_id, {"rotation": 90})
+
+    # Age the WC well past the throttle so a touch is not skipped as a
+    # recent modification.
+    aged = time.time() - 24 * 3600
+    os.utime(wc_path, (aged, aged))
+    aged_atime = os.stat(wc_path).st_atime
+    aged_mtime = os.stat(wc_path).st_mtime
+
+    resp = app.test_client().get(f"/photos/{photo_id}/original")
+    assert resp.status_code == 200, resp.data
+    stat_after = os.stat(wc_path)
+    assert stat_after.st_atime > aged_atime, (
+        "recipe render did not touch the working copy it read as source: "
+        f"atime is still {stat_after.st_atime} (aged {aged_atime}); an "
+        "actively edited WC would stay at the head of the eviction queue"
+    )
+    assert stat_after.st_mtime == aged_mtime, (
+        "recipe render advanced the WC's mtime — the external-edit "
+        "handoff would treat this as a content change and overwrite "
+        "the file the external editor saved into"
+    )
+
+
+def test_edit_render_touches_working_copy_source_under_guard(
+    client_with_photo, monkeypatch,
+):
+    """The edit-render touch must run under ``working_copy_publication_guard``.
+
+    Regression for a P2 codex review finding on PR #1607: an unguarded
+    touch can change a working copy's mtime between ``_evict_once``'s
+    directory scan and its unlink. The identity check then rejects the
+    file as replaced and skips it; because ``deferred=True`` only fires
+    on catalog invalidation (not on identity skips), the settings flow
+    schedules no retry and the cache can sit above a lowered quota until
+    another write or restart. ``touch_working_copy_access`` documents
+    that callers hold the guard for exactly this reason — the recipe
+    branch's touch has to obey the same contract.
+    """
+    import os
+    import time
+
+    import app as app_module
+    import working_copy_cache
+    from PIL import Image
+
+    app, db, photo_id = client_with_photo
+    vireo_dir = os.path.dirname(app.config["THUMB_CACHE_DIR"])
+    working_dir = os.path.join(vireo_dir, "working")
+    os.makedirs(working_dir, exist_ok=True)
+    wc_path = os.path.join(working_dir, f"{photo_id}.jpg")
+    Image.new("RGB", (800, 600), (200, 60, 40)).save(
+        wc_path, "JPEG", quality=90,
+    )
+    db.conn.execute(
+        "UPDATE photos SET working_copy_path=? WHERE id=?",
+        (f"working/{photo_id}.jpg", photo_id),
+    )
+    db.conn.commit()
+    db.set_photo_edit_recipe(photo_id, {"rotation": 90})
+
+    aged = time.time() - 24 * 3600
+    os.utime(wc_path, (aged, aged))
+
+    lock_held_when_touched = []
+    real_touch = working_copy_cache.touch_working_copy_access
+
+    def spy_touch(path):
+        # ``_eviction_lock`` is an ``RLock``; ``_is_owned`` reports
+        # whether the current thread already holds it. That is exactly
+        # the property this fix ensures — a caller inside
+        # ``working_copy_publication_guard`` sees True; an unguarded
+        # touch (the regression) sees False.
+        held = working_copy_cache._eviction_lock._is_owned()
+        lock_held_when_touched.append((os.fspath(path), held))
+        return real_touch(path)
+
+    monkeypatch.setattr(app_module, "touch_working_copy_access", spy_touch)
+
+    resp = app.test_client().get(f"/photos/{photo_id}/original")
+    assert resp.status_code == 200, resp.data
+
+    edit_source_touches = [
+        (path, held)
+        for path, held in lock_held_when_touched
+        if os.path.samefile(path, wc_path)
+    ]
+    assert edit_source_touches, (
+        "expected the recipe render to touch the working copy it read; "
+        f"observed touches: {lock_held_when_touched!r}"
+    )
+    for path, held in edit_source_touches:
+        assert held, (
+            "recipe-render touch of the working-copy source ran "
+            "OUTSIDE ``working_copy_publication_guard`` — an eviction "
+            "pass racing this touch would identity-skip the file "
+            "instead of reclaiming it, silently overshooting a lowered "
+            f"quota: {path}"
+        )
+
+
+def test_edit_preview_touches_working_copy_under_guard(
+    client_with_photo, monkeypatch,
+):
+    """`/photos/<id>/edit-preview` must touch the WC source under the guard.
+
+    Regression for a P2 codex review finding on PR #1607 against
+    ``44a1fb58``: the earlier fix landed the touch on ``/original``'s
+    recipe branch, but the editor's interactive ``/edit-preview``
+    endpoint has its own render path (``_recipe_render_source`` +
+    ``load_image`` inside ``_select_and_load_source``) that selects the
+    WC and decodes it without touching. Repeated slider updates on an
+    actively edited photo never advance the WC's mtime, so the photo
+    stays the oldest eviction candidate. And per the same review, the
+    touch must run inside ``working_copy_publication_guard`` — an
+    unguarded touch races ``_evict_once``'s identity check and lets
+    the cache sit above a lowered quota.
+    """
+    import os
+    import time
+
+    import app as app_module
+    import working_copy_cache
+    from PIL import Image
+
+    app, db, photo_id = client_with_photo
+    vireo_dir = os.path.dirname(app.config["THUMB_CACHE_DIR"])
+    working_dir = os.path.join(vireo_dir, "working")
+    os.makedirs(working_dir, exist_ok=True)
+    wc_path = os.path.join(working_dir, f"{photo_id}.jpg")
+    Image.new("RGB", (800, 600), (200, 60, 40)).save(
+        wc_path, "JPEG", quality=90,
+    )
+    db.conn.execute(
+        "UPDATE photos SET working_copy_path=? WHERE id=?",
+        (f"working/{photo_id}.jpg", photo_id),
+    )
+    db.conn.commit()
+    db.set_photo_edit_recipe(photo_id, {"rotation": 90})
+
+    aged = time.time() - 24 * 3600
+    os.utime(wc_path, (aged, aged))
+    aged_atime = os.stat(wc_path).st_atime
+    aged_mtime = os.stat(wc_path).st_mtime
+
+    lock_held_when_touched = []
+    real_touch = working_copy_cache.touch_working_copy_access
+
+    def spy_touch(path):
+        held = working_copy_cache._eviction_lock._is_owned()
+        lock_held_when_touched.append((os.fspath(path), held))
+        return real_touch(path)
+
+    monkeypatch.setattr(app_module, "touch_working_copy_access", spy_touch)
+
+    resp = app.test_client().get(f"/photos/{photo_id}/edit-preview?size=800")
+    assert resp.status_code == 200, resp.data
+
+    # The touch must have happened at least once for the WC path.
+    edit_source_touches = [
+        (path, held)
+        for path, held in lock_held_when_touched
+        if os.path.samefile(path, wc_path)
+    ]
+    assert edit_source_touches, (
+        "edit-preview render did not touch the working copy source: "
+        f"observed touches were {lock_held_when_touched!r}"
+    )
+    for path, held in edit_source_touches:
+        assert held, (
+            "edit-preview touch of the WC source ran OUTSIDE "
+            "``working_copy_publication_guard`` — an eviction pass "
+            "racing this touch would identity-skip the file instead of "
+            f"reclaiming it, overshooting a lowered quota: {path}"
+        )
+
+    stat_after = os.stat(wc_path)
+    assert stat_after.st_atime > aged_atime, (
+        "edit-preview render did not advance the WC's atime; an "
+        "actively edited photo would stay first in the eviction queue "
+        f"(sort key: max(mtime, atime)): atime is still "
+        f"{stat_after.st_atime} (aged {aged_atime})"
+    )
+    assert stat_after.st_mtime == aged_mtime, (
+        "edit-preview render advanced the WC's mtime — the external-"
+        "edit handoff would treat this as a content change and "
+        "overwrite the file the external editor saved into"
+    )
+
+
+def test_crop_preview_touches_working_copy_under_guard(
+    client_with_photo, monkeypatch,
+):
+    """`/photos/<id>/crop` must touch the WC source under the guard.
+
+    Regression for a P2 codex review finding on PR #1607 against
+    ``37285d8a``: the earlier fixes landed the touch on ``/original``'s
+    recipe branch and ``/edit-preview``'s ``_select_and_load_source``,
+    but ``serve_crop_preview`` at ``app.py:~28199-28212`` also selects
+    ``working_copy_path`` and decodes it directly without touching. A
+    session that repeatedly reads BioCLIP-input crops of the same
+    photo never advances the WC's atime; the file therefore stays
+    first in the quota eviction queue (sort key: ``max(mtime, atime)``)
+    even while it is actively being used. The touch must run inside
+    ``working_copy_publication_guard`` so an ``_evict_once`` racing it
+    cannot identity-skip a file whose atime just moved and leave the
+    cache above a lowered quota.
+    """
+    import os
+    import time
+
+    import app as app_module
+    import working_copy_cache
+    from PIL import Image
+
+    app, db, photo_id = client_with_photo
+    vireo_dir = os.path.dirname(app.config["THUMB_CACHE_DIR"])
+    working_dir = os.path.join(vireo_dir, "working")
+    os.makedirs(working_dir, exist_ok=True)
+    wc_path = os.path.join(working_dir, f"{photo_id}.jpg")
+    Image.new("RGB", (800, 600), (200, 60, 40)).save(
+        wc_path, "JPEG", quality=90,
+    )
+    db.conn.execute(
+        "UPDATE photos SET working_copy_path=? WHERE id=?",
+        (f"working/{photo_id}.jpg", photo_id),
+    )
+    db.conn.commit()
+
+    aged = time.time() - 24 * 3600
+    os.utime(wc_path, (aged, aged))
+    aged_atime = os.stat(wc_path).st_atime
+    aged_mtime = os.stat(wc_path).st_mtime
+
+    lock_held_when_touched = []
+    real_touch = working_copy_cache.touch_working_copy_access
+
+    def spy_touch(path):
+        held = working_copy_cache._eviction_lock._is_owned()
+        lock_held_when_touched.append((os.fspath(path), held))
+        return real_touch(path)
+
+    monkeypatch.setattr(app_module, "touch_working_copy_access", spy_touch)
+
+    resp = app.test_client().get(f"/photos/{photo_id}/crop")
+    assert resp.status_code == 200, resp.data
+    assert resp.content_type == "image/jpeg"
+
+    crop_source_touches = [
+        (path, held)
+        for path, held in lock_held_when_touched
+        if os.path.samefile(path, wc_path)
+    ]
+    assert crop_source_touches, (
+        "crop-preview render did not touch the working copy source: "
+        f"observed touches were {lock_held_when_touched!r}"
+    )
+    for path, held in crop_source_touches:
+        assert held, (
+            "crop-preview touch of the WC source ran OUTSIDE "
+            "``working_copy_publication_guard`` — an eviction pass "
+            "racing this touch would identity-skip the file instead of "
+            f"reclaiming it, overshooting a lowered quota: {path}"
+        )
+
+    stat_after = os.stat(wc_path)
+    assert stat_after.st_atime > aged_atime, (
+        "crop-preview render did not advance the WC's atime; a photo "
+        "whose crops are repeatedly requested would stay first in the "
+        f"eviction queue (sort key: max(mtime, atime)): atime is still "
+        f"{stat_after.st_atime} (aged {aged_atime})"
+    )
+    assert stat_after.st_mtime == aged_mtime, (
+        "crop-preview render advanced the WC's mtime — the external-"
+        "edit handoff would treat this as a content change and "
+        "overwrite the file the external editor saved into"
+    )
+
+
+def test_interactive_render_routes_decode_outside_the_eviction_guard(
+    client_with_photo, monkeypatch,
+):
+    """The render routes stamp under the guard but decode outside it.
+
+    ``working_copy_publication_guard`` is one process-wide ``RLock``,
+    and the quota pass holds it across a ``scandir`` of the whole
+    working-copy cache. Holding it across Pillow decodes as well would
+    serialize every interactive image read — 1:1 zoom, crop previews,
+    edit previews — against each other and against eviction, which is
+    the stall this PR set out to remove. The stamp is a ``utime`` and
+    costs microseconds, so it stays inside; the decode does not.
+
+    ``/crop`` stands in for the shared shape here (``/original``'s
+    recipe branch and ``/edit-preview`` were changed the same way);
+    its transient-miss recovery already re-resolves the original when
+    eviction unlinks the copy in the exists/open window.
+    """
+    import os
+
+    import image_loader
+    import working_copy_cache
+    from PIL import Image
+
+    app, db, photo_id = client_with_photo
+    vireo_dir = os.path.dirname(app.config["THUMB_CACHE_DIR"])
+    working_dir = os.path.join(vireo_dir, "working")
+    os.makedirs(working_dir, exist_ok=True)
+    wc_path = os.path.join(working_dir, f"{photo_id}.jpg")
+    Image.new("RGB", (800, 600), (200, 60, 40)).save(
+        wc_path, "JPEG", quality=90,
+    )
+    db.conn.execute(
+        "UPDATE photos SET working_copy_path=? WHERE id=?",
+        (f"working/{photo_id}.jpg", photo_id),
+    )
+    db.conn.commit()
+
+    lock_held_when_decoded = []
+    real_load_image = image_loader.load_image
+
+    def spy_load_image(path, *args, **kwargs):
+        # The route imports ``load_image`` from ``image_loader`` inside
+        # the request, so patching the module attribute is what the
+        # call actually resolves.
+        if os.path.exists(path) and os.path.samefile(path, wc_path):
+            lock_held_when_decoded.append(
+                working_copy_cache._eviction_lock._is_owned()
+            )
+        return real_load_image(path, *args, **kwargs)
+
+    monkeypatch.setattr(image_loader, "load_image", spy_load_image)
+
+    resp = app.test_client().get(f"/photos/{photo_id}/crop")
+    assert resp.status_code == 200, resp.data
+
+    assert lock_held_when_decoded, (
+        "test setup: the crop route never decoded the working copy"
+    )
+    assert not any(lock_held_when_decoded), (
+        "crop-preview decoded the working copy while holding "
+        "``working_copy_publication_guard``; that lock is process-wide "
+        "and eviction holds it across a full cache scandir, so every "
+        "other interactive image read would queue behind this decode: "
+        f"{lock_held_when_decoded!r}"
+    )

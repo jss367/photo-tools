@@ -558,8 +558,55 @@ def get_canonical_image_path(photo, vireo_dir, folders):
     return os.path.join(folder_path, photo["filename"])
 
 
+def _record_working_copy_access(wc_path):
+    """Stamp a working copy as recently used for quota-eviction ordering.
+
+    Held under ``working_copy_publication_guard`` like every other access
+    stamp, so it cannot land between the quota pass's directory scan and
+    its unlink. Imported lazily to keep ``image_loader`` free of a
+    module-level dependency on the cache layer.
+    """
+    from working_copy_cache import (
+        touch_working_copy_access,
+        working_copy_publication_guard,
+    )
+
+    with working_copy_publication_guard():
+        touch_working_copy_access(wc_path)
+
+
+def _restore_working_copy_access_time(wc_path, preserved_times_ns):
+    """Put a working copy's atime back after an opt-out read decoded it.
+
+    ``_evict_once`` uses ``max(mtime, atime)`` as the recency key.
+    ``load_working_image(record_access=False)`` documents that its
+    callers (background library traversals like sharpness, classify,
+    culling) want to leave that key alone — but PIL's ``open`` on a
+    strictatime or default relatime filesystem advances the atime as a
+    side effect of the read. Restoring it neutralizes that side effect
+    so a batch job that walks every working copy doesn't refresh every
+    file's recency and drown out the interactive touches from
+    ``touch_working_copy_access``.
+
+    A concurrent publisher's write shows up as an mtime change; skip
+    the restore in that case so their write isn't erased and the fresh
+    recency their publish carries is preserved. Best effort: this runs
+    on a request/job serving pixels, so a failed stat/utime costs only
+    eviction-ordering accuracy and must never fail the caller.
+    """
+    try:
+        post_stat = os.stat(wc_path)
+    except OSError:
+        return
+    if post_stat.st_mtime_ns != preserved_times_ns[1]:
+        return
+    with contextlib.suppress(OSError):
+        os.utime(wc_path, ns=preserved_times_ns)
+
+
 def load_working_image(
     photo, vireo_dir, max_size=1024, folders=None, *, return_source=False,
+    record_access=False,
 ):
     """Load a photo's working image — the fast path for all pixel operations.
 
@@ -571,6 +618,12 @@ def load_working_image(
         vireo_dir: path to ~/.vireo/
         max_size: maximum dimension (longest side). None for full resolution.
         folders: optional {folder_id: path} mapping (required when working_copy_path is NULL)
+        record_access: stamp the working copy as recently used when it is
+            the source. Opt-in rather than automatic: quota eviction orders
+            by recency, and a background job that walks the whole library
+            (classification, sharpness, culling) would stamp every copy and
+            flatten the signal into noise. Request paths serving a user
+            looking at a photo pass True; job callers leave it False.
 
     Returns:
         PIL.Image.Image or None. When ``return_source=True``, returns an
@@ -587,9 +640,75 @@ def load_working_image(
     if photo.get("working_copy_path"):
         wc_path = os.path.join(vireo_dir, photo["working_copy_path"])
         if os.path.exists(wc_path):
+            # Snapshot atime before the decode so a job caller that
+            # opted out of recording access does not accidentally
+            # advance the eviction key. ``_evict_once`` sorts by
+            # ``max(mtime, atime)``; on strictatime mounts (and on
+            # relatime once the daily bump condition trips) PIL's
+            # ``open`` inside ``_load_standard`` advances ``atime``
+            # even when we pass ``record_access=False``. Without a
+            # restore, a background library traversal — sharpness,
+            # classify, culling — would refresh every copy it walks
+            # and flatten the LRU signal the interactive callers
+            # rely on. Snapshot before the read so we can put atime
+            # back to whatever it was; a concurrent publisher shows
+            # up as an mtime change, and we skip the restore in that
+            # case so their write isn't erased.
+            #
+            # Known residual: if an interactive read stamps this same
+            # copy between our snapshot and our restore, the restore
+            # puts the older value back and that stamp is lost, so a
+            # photo the user just viewed can look staler than it is and
+            # be evicted early (it regenerates on demand — no data loss).
+            # Not worth a third layer of compensation on top of an
+            # overload we intend to remove: the fix is to stop deriving
+            # recency from stat metadata at all and keep it in a
+            # ``working_copy_access(photo_id, accessed_at)`` table, the
+            # shape the preview cache already uses. Tracked as a
+            # follow-up rather than grown here.
+            preserved_times_ns = None
+            if not record_access:
+                try:
+                    pre_stat = os.stat(wc_path)
+                    preserved_times_ns = (
+                        pre_stat.st_atime_ns, pre_stat.st_mtime_ns,
+                    )
+                except OSError:
+                    preserved_times_ns = None
             working_image = _load_standard(wc_path, max_size)
             if working_image is not None:
+                if record_access:
+                    # Only the touch takes
+                    # ``working_copy_publication_guard``, so it cannot
+                    # land between the quota pass's directory scan and
+                    # its unlink (an identity-skipped file leaves the
+                    # cache above a lowered quota).
+                    #
+                    # The decode deliberately stays outside that guard.
+                    # It is a process-wide lock that eviction holds
+                    # across a scandir of the entire cache, so guarding
+                    # every interactive decode with it would serialize
+                    # all of the app's image reads against each other
+                    # and against eviction — the exact stall this work
+                    # is meant to remove. The residual races are benign:
+                    # an unlink in the exists/open window falls through
+                    # to the original source below, and a publisher
+                    # replacing the path between decode and touch costs
+                    # one misattributed recency stamp on a file that is
+                    # being actively used either way.
+                    _record_working_copy_access(wc_path)
+                elif preserved_times_ns is not None:
+                    _restore_working_copy_access_time(
+                        wc_path, preserved_times_ns,
+                    )
                 return _result(working_image, "working_copy")
+            if preserved_times_ns is not None:
+                # Even a failed decode may have bumped atime; put it
+                # back so eviction doesn't see a cold file as fresh
+                # just because we tried to read it.
+                _restore_working_copy_access_time(
+                    wc_path, preserved_times_ns,
+                )
 
     # No usable working copy — load original (may be JPEG or RAW). This also
     # closes the exists/open race with quota eviction: a failed working-copy
@@ -609,6 +728,7 @@ def extract_working_copy(
     quality=92,
     raw_decode=RAW_DECODE_PRESERVE_HIGHLIGHTS,
     publication_guard=None,
+    on_publish=None,
 ):
     """Extract a JPEG working copy from an image file.
 
@@ -622,6 +742,15 @@ def extract_working_copy(
             RAW_DECODE_CAMERA_RENDERED without changing that edit source.
         publication_guard: optional context-manager factory that serializes
             publication to a shared canonical cache path with eviction.
+        on_publish: optional callback ``on_publish(output_path)`` invoked
+            immediately after the atomic replace, WHILE the publication
+            guard is still held. Callers use this to capture the file's
+            fingerprint (mtime, inode, size) as part of the atomic publish
+            step — a post-return stat would be racy, because another
+            publisher can atomically replace the same canonical path in
+            the gap between guard release and the caller's next action.
+            Exceptions from the callback are swallowed with a warning so
+            they cannot fail an otherwise successful publish.
 
     Returns:
         True on success, False on failure
@@ -648,6 +777,14 @@ def extract_working_copy(
         guard = publication_guard() if publication_guard else contextlib.nullcontext()
         with guard:
             os.replace(tmp_path, output_path)
+            if on_publish is not None:
+                try:
+                    on_publish(output_path)
+                except Exception:
+                    log.warning(
+                        "extract_working_copy on_publish callback raised for %s",
+                        output_path, exc_info=True,
+                    )
         tmp_path = None
         return True
     except Exception:

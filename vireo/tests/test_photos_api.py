@@ -13120,3 +13120,80 @@ def test_edit_render_touches_working_copy_source(
         f"mtime is still {now_mtime} (aged {aged_mtime}); an actively "
         "edited WC would stay at the head of the eviction queue"
     )
+
+
+def test_edit_render_touches_working_copy_source_under_guard(
+    client_with_photo, monkeypatch,
+):
+    """The edit-render touch must run under ``working_copy_publication_guard``.
+
+    Regression for a P2 codex review finding on PR #1607: an unguarded
+    touch can change a working copy's mtime between ``_evict_once``'s
+    directory scan and its unlink. The identity check then rejects the
+    file as replaced and skips it; because ``deferred=True`` only fires
+    on catalog invalidation (not on identity skips), the settings flow
+    schedules no retry and the cache can sit above a lowered quota until
+    another write or restart. ``touch_working_copy_access`` documents
+    that callers hold the guard for exactly this reason — the recipe
+    branch's touch has to obey the same contract.
+    """
+    import os
+    import time
+
+    import app as app_module
+    import working_copy_cache
+    from PIL import Image
+
+    app, db, photo_id = client_with_photo
+    vireo_dir = os.path.dirname(app.config["THUMB_CACHE_DIR"])
+    working_dir = os.path.join(vireo_dir, "working")
+    os.makedirs(working_dir, exist_ok=True)
+    wc_path = os.path.join(working_dir, f"{photo_id}.jpg")
+    Image.new("RGB", (800, 600), (200, 60, 40)).save(
+        wc_path, "JPEG", quality=90,
+    )
+    db.conn.execute(
+        "UPDATE photos SET working_copy_path=? WHERE id=?",
+        (f"working/{photo_id}.jpg", photo_id),
+    )
+    db.conn.commit()
+    db.set_photo_edit_recipe(photo_id, {"rotation": 90})
+
+    aged = time.time() - 24 * 3600
+    os.utime(wc_path, (aged, aged))
+
+    lock_held_when_touched = []
+    real_touch = working_copy_cache.touch_working_copy_access
+
+    def spy_touch(path):
+        # ``_eviction_lock`` is an ``RLock``; ``_is_owned`` reports
+        # whether the current thread already holds it. That is exactly
+        # the property this fix ensures — a caller inside
+        # ``working_copy_publication_guard`` sees True; an unguarded
+        # touch (the regression) sees False.
+        held = working_copy_cache._eviction_lock._is_owned()
+        lock_held_when_touched.append((os.fspath(path), held))
+        return real_touch(path)
+
+    monkeypatch.setattr(app_module, "touch_working_copy_access", spy_touch)
+
+    resp = app.test_client().get(f"/photos/{photo_id}/original")
+    assert resp.status_code == 200, resp.data
+
+    edit_source_touches = [
+        (path, held)
+        for path, held in lock_held_when_touched
+        if os.path.samefile(path, wc_path)
+    ]
+    assert edit_source_touches, (
+        "expected the recipe render to touch the working copy it read; "
+        f"observed touches: {lock_held_when_touched!r}"
+    )
+    for path, held in edit_source_touches:
+        assert held, (
+            "recipe-render touch of the working-copy source ran "
+            "OUTSIDE ``working_copy_publication_guard`` — an eviction "
+            "pass racing this touch would identity-skip the file "
+            "instead of reclaiming it, silently overshooting a lowered "
+            f"quota: {path}"
+        )

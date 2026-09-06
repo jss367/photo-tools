@@ -29481,12 +29481,38 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             # generation mtime and stay first in the eviction queue no
             # matter how often it was displayed at 1:1. Recording access
             # here keeps the LRU ordering aligned with actual use.
-            if (
-                trusted_wc_path
+            #
+            # ``touch_working_copy_access`` documents that callers hold
+            # ``working_copy_publication_guard`` — the same lock the
+            # quota pass takes — so the mtime move cannot land between
+            # ``_evict_once``'s directory scan and its unlink. Without
+            # the guard, an unlucky touch during a quota reduction
+            # changes the file's fingerprint after eviction snapshotted
+            # it; ``_file_identity(os.stat(path)) != sampled_identity``
+            # then treats the file as replaced and skips it, so the
+            # pass returns fewer freed bytes than needed. Because
+            # ``deferred=True`` only fires on ``PRAGMA data_version``
+            # invalidation (not on identity skips), the settings flow
+            # never schedules its background retry and the cache can
+            # sit above the requested quota until another write or
+            # restart. Hold the guard through the decode read so the
+            # source bytes we load cannot be unlinked out from under
+            # us either — mirroring ``_serve_trusted_working_copy``'s
+            # caller contract.
+            edit_source_is_working_copy = (
+                trusted_wc_path is not None
                 and image_path == trusted_wc_path
-            ):
-                touch_working_copy_access(trusted_wc_path)
-            img = load_image(image_path, max_size=None, **load_kwargs)
+            )
+            if edit_source_is_working_copy:
+                with working_copy_publication_guard():
+                    touch_working_copy_access(trusted_wc_path)
+                    img = load_image(
+                        image_path, max_size=None, **load_kwargs,
+                    )
+            else:
+                img = load_image(
+                    image_path, max_size=None, **load_kwargs,
+                )
             if (
                 img is not None
                 and resolved_ext in RAW_EXTENSIONS

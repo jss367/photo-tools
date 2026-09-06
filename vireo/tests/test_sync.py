@@ -50,7 +50,8 @@ def test_rating_return_to_previous_value_syncs_latest(tmp_path, db, batch, histo
 
     expected_rating = 2 if history == "undo" else 1
     assert db.get_photo(pid)["rating"] == expected_rating
-    assert sync_to_xmp(db) == {"synced": 1, "failed": 0, "failures": []}
+    assert sync_to_xmp(db) == {"synced": 1, "failed": 0, "failures": [],
+                               "ok": True, "errors": []}
     assert read_sync_preview_metadata(xmp_path)["rating"] == str(expected_rating)
     assert not db.get_pending_changes()
 
@@ -1068,3 +1069,209 @@ def test_sync_from_xmp_preserves_cross_slot_homonyms(tmp_path):
     surviving_ids = {kw['id'] for kw in keywords}
     assert kid_by_type['taxonomy'] in surviving_ids
     assert kid_by_type['individual'] in surviving_ids
+
+
+def test_sync_result_reports_partial_failure_to_the_job_layer(tmp_path, monkeypatch):
+    """A run that fails on most photos must not land in history as a success."""
+    import xmp as xmp_module
+    from db import Database
+    from sync import sync_to_xmp
+
+    db = Database(str(tmp_path / "test.db"))
+    db.set_active_workspace(db.ensure_default_workspace())
+    pid, _ = _setup_photo_with_xmp(tmp_path, db)
+    db.queue_change(pid, 'keyword_add', 'Test')
+
+    def refuse(*args, **kwargs):
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(xmp_module, "write_sidecar", refuse)
+    monkeypatch.setattr("sync.write_sidecar", refuse)
+
+    result = sync_to_xmp(db)
+    assert result["synced"] == 0
+    assert result["failed"] == 1
+    assert result["ok"] is False
+    assert result["errors"] and "Permission denied" in result["errors"][0]
+    # The count belongs in the summary so one NAS-wide cause reads as one line.
+    assert "(1 photo)" in result["errors"][0]
+    assert len(db.get_pending_changes()) == 1
+
+
+def test_sync_failure_reasons_are_deduplicated(tmp_path, monkeypatch):
+    """Thousands of identical failures collapse into one named cause."""
+    from db import Database
+    from sync import sync_to_xmp
+
+    db = Database(str(tmp_path / "test.db"))
+    db.set_active_workspace(db.ensure_default_workspace())
+    # An uncreated child of tmp_path is guaranteed absent; a fixed
+    # /nonexistent path is not, and on hosts where it exists the test would
+    # silently exercise a different code path.
+    missing_dir = tmp_path / 'gone'
+    fid = db.add_folder(str(missing_dir), name='gone')
+    for i in range(3):
+        pid = db.add_photo(folder_id=fid, filename=f'missing{i}.jpg',
+                           extension='.jpg', file_size=100, file_mtime=1.0)
+        db.queue_change(pid, 'keyword_add', 'Test')
+
+    result = sync_to_xmp(db)
+    assert result["failed"] == 3
+    assert result["ok"] is False
+    assert len(result["errors"]) == 1
+    assert "(3 photos)" in result["errors"][0]
+
+
+def test_sync_failure_reason_ignores_per_photo_filename(tmp_path, monkeypatch):
+    """One NAS-wide EACCES on many sidecars must collapse to one reason.
+
+    ``str(OSError)`` appends the offending filename
+    (``[Errno 13] Permission denied: '/path/to/DSC_0001.xmp'``), so counting
+    raw error strings would treat every per-photo failure as a distinct
+    reason and reduce the summary back to one-line-per-photo. The summary
+    must strip the filename so the count captures the whole batch under one
+    cause.
+    """
+    import xmp as xmp_module
+    from db import Database
+    from sync import sync_to_xmp
+
+    db = Database(str(tmp_path / "test.db"))
+    db.set_active_workspace(db.ensure_default_workspace())
+    pids = []
+    for i in range(4):
+        pid, _ = _setup_photo_with_xmp(tmp_path / f"lot{i}", db)
+        db.queue_change(pid, 'keyword_add', 'Test')
+        pids.append(pid)
+
+    def refuse_with_filename(xmp_path, *args, **kwargs):
+        raise PermissionError(13, "Permission denied", xmp_path)
+
+    monkeypatch.setattr(xmp_module, "write_sidecar", refuse_with_filename)
+    monkeypatch.setattr("sync.write_sidecar", refuse_with_filename)
+
+    result = sync_to_xmp(db)
+
+    assert result["synced"] == 0
+    assert result["failed"] == len(pids)
+    assert result["ok"] is False
+    # Sanity: the underlying per-photo error strings really do differ.
+    raw_errors = {f["error"] for f in result["failures"]}
+    assert len(raw_errors) == len(pids), raw_errors
+    # The summary collapses them to one cause and reports the full count.
+    assert len(result["errors"]) == 1, result["errors"]
+    reason = result["errors"][0]
+    assert "Permission denied" in reason
+    assert f"({len(pids)} photos)" in reason
+    # And it names the cause without leaking any per-photo path.
+    for f in result["failures"]:
+        # Each failure keeps its raw path-bearing error for the detail log,
+        # but the summary line must not include the specific filename.
+        assert f["error"] != reason
+        assert ".xmp" not in reason
+
+
+def test_sync_result_counts_distinct_photos_not_records():
+    """Two failure records for the same photo count the photo once.
+
+    A photo with two queued unsupported changes of the same type produces
+    two identical failure records; the summary reports 'photos', not
+    records, so the two must collapse to one.
+    """
+    from sync import _sync_result
+
+    failures = [
+        {"photo_id": 1, "error": "unsupported change type: flag"},
+        {"photo_id": 1, "error": "unsupported change type: flag"},
+        {"photo_id": 2, "error": "unsupported change type: flag"},
+    ]
+    result = _sync_result(synced=0, failures=failures)
+    # The raw failures are preserved for the detail log.
+    assert result["failed"] == 3
+    # But the summary counts distinct photos per reason: photo 1 once, plus
+    # photo 2, so the reason applies to two photos, not three.
+    assert result["errors"] == ["unsupported change type: flag (2 photos)"]
+
+
+def test_sync_panel_does_not_report_zero_for_a_resultless_failure():
+    """A crashed sync must not render as "Wrote 0, failed on 0".
+
+    When ``sync_to_xmp`` raises before returning -- a failing
+    ``get_pending_changes`` or ``clear_pending`` -- the JobRunner completes the
+    job with a null result. Defaulting the counters to zero would state a
+    count the run never established, and if ``clear_pending`` is what failed,
+    sidecars had already been written. The guard is on the counters rather
+    than on ``event.status`` so a resultless completed or cancelled event
+    cannot reach the counter branches either.
+    """
+    from pathlib import Path
+
+    panel = (Path(__file__).parents[1] / "templates/_sync_panel.html").read_text()
+    handler = panel[panel.index("onComplete: function(event)"):]
+    handler = handler[:handler.index("onError:")]
+    assert "typeof result.synced === 'number'" in handler
+    assert "typeof result.failed === 'number'" in handler
+    assert "Sync failed" in handler
+    # The JobRunner's failure contract, not just the error list.
+    assert "event.failure && event.failure.message" in handler
+    # One tooltip assignment, so a stale failure detail cannot survive a
+    # later clean run and the two sites cannot drift apart.
+    assert handler.count("status.title") == 1
+
+
+def test_sync_panel_clears_stale_success_when_pending_remains():
+    """A "Synced N photos!" success stays green until checkPendingSync clears it.
+
+    ``runVisibleSync`` syncs only the checked change types, so the unchecked
+    ones intentionally stay queued. The panel must not leave the green
+    success message next to a nonzero pending count -- the two together read
+    as a UI bug. Match the state we set on the element (``dataset.syncState``)
+    rather than the specific words, so future copy tweaks to the success
+    branch cannot desync the check.
+    """
+    from pathlib import Path
+
+    panel = (Path(__file__).parents[1] / "templates/_sync_panel.html").read_text()
+
+    # The success branches (``Synced!`` / ``Synced N photos!`` /
+    # ``Nothing to sync.``) mark the element as success.
+    complete_handler = panel[panel.index("onComplete: function(event)"):]
+    complete_handler = complete_handler[:complete_handler.index("onError:")]
+    assert "status.dataset.syncState = 'success'" in complete_handler
+
+    # ``checkPendingSync`` clears any stale success when pending remains,
+    # so the marker approach must be used there too. The old literal-text
+    # match (``status.textContent === 'Synced!'``) is gone: it silently
+    # missed the ``Synced N photos!`` case runVisibleSync produces.
+    check_fn = panel[panel.index("async function checkPendingSync"):]
+    check_fn = check_fn[:check_fn.index("async function runSync")]
+    assert "status.dataset.syncState === 'success'" in check_fn
+    assert "status.textContent === 'Synced!'" not in check_fn
+
+
+def test_sync_panel_cancelled_summary_includes_failures():
+    """A cancelled run that already saw failures must surface them.
+
+    ``api_job_sync`` does not poll cancellation inside ``sync_to_xmp``'s
+    per-photo loop, so a cancel requested mid-run still returns a structured
+    result containing both writes and failures while the JobRunner emits
+    ``status: "cancelled"``. Reporting only the written count would present
+    a NAS-wide permission failure as an ordinary cancellation.
+    """
+    from pathlib import Path
+
+    panel = (Path(__file__).parents[1] / "templates/_sync_panel.html").read_text()
+    handler = panel[panel.index("onComplete: function(event)"):]
+    handler = handler[:handler.index("onError:")]
+
+    cancelled = handler[handler.index("event.status === 'cancelled'"):]
+    # Take just the cancelled branch, up to the next ``else if`` / ``else``.
+    cancelled = cancelled[:cancelled.index("} else if (failed === 0")]
+
+    # Both the failed count and the first reason must be reported when
+    # failures occurred before cancellation took hold.
+    assert "failed.toLocaleString()" in cancelled
+    assert "reasons[0]" in cancelled
+    # And the colour must switch to danger so the summary is not read as an
+    # ordinary user-requested cancellation.
+    assert "var(--danger)" in cancelled

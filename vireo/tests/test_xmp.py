@@ -580,3 +580,232 @@ def test_failed_access_metadata_copy_preserves_sidecar(sample_xmp, monkeypatch):
         write_rating(sample_xmp, 5)
     assert path.read_bytes() == original
     assert set(path.parent.iterdir()) == {path}
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="macOS ACL API")
+def test_atomic_sidecar_preserves_xattrs_under_writeextattr_deny(sample_xmp):
+    """The ordering rule, exercised against a real deny-writeextattr ACL.
+
+    The stub test below pins the call order everywhere; this one proves the
+    OS behaviour the order exists for. With the ACL applied first, setxattr
+    against the temp file returns EACCES, ``_copy_xattrs`` skips the
+    attribute as non-critical, and the published sidecar silently loses the
+    source's metadata.
+    """
+    import subprocess
+
+    subprocess.run(["xattr", "-w", "com.vireo.test", "shared metadata",
+                    sample_xmp], check=True)
+    user = subprocess.check_output(["id", "-un"], text=True).strip()
+    subprocess.run(["chmod", "+a", f"{user} deny writeextattr", sample_xmp],
+                   check=True)
+    try:
+        subprocess.run(["xattr", "-w", "com.vireo.probe", "x", sample_xmp],
+                       check=True, capture_output=True)
+    except subprocess.CalledProcessError:
+        pass
+    else:
+        # The deny entry did not bind. Skip rather than assert a guarantee
+        # this machine is not actually providing.
+        subprocess.run(["xattr", "-d", "com.vireo.probe", sample_xmp],
+                       check=False)
+        pytest.skip("deny writeextattr does not bind this user")
+
+    write_rating(sample_xmp, 5)
+
+    value = subprocess.check_output(
+        ["xattr", "-p", "com.vireo.test", sample_xmp], text=True).strip()
+    assert value == "shared metadata"
+    acl = subprocess.check_output(["ls", "-le", sample_xmp], text=True)
+    assert "deny writeextattr" in acl
+    assert read_sync_preview_metadata(sample_xmp)["rating"] == "5"
+
+
+def test_preserve_sidecar_access_copies_xattrs_before_acl_on_darwin(
+    monkeypatch, tmp_path,
+):
+    """Non-ACL xattrs must be copied before the source ACL is applied.
+
+    A macOS ACL can allow file-data writes but deny writeextattr. Applying
+    the ACL first would then make ``setxattr`` on the destination return
+    EACCES; ``_copy_xattrs`` would skip the (non-critical) source metadata,
+    and ``os.replace`` would publish a sidecar without it. Portable because
+    every darwin-specific dependency is patched out.
+    """
+    import xmp
+
+    source = tmp_path / "source"
+    source.write_bytes(b"src")
+    destination = tmp_path / "destination"
+    destination.write_bytes(b"dst")
+
+    events = []
+
+    def fake_copy_xattrs(src, dst, *rest):
+        events.append("xattrs")
+
+    class _FakeCopyfile:
+        argtypes = None
+        restype = None
+
+        def __call__(self, *args, **kwargs):
+            events.append("acl")
+            return 0
+
+    class _FakeCDLL:
+        copyfile = _FakeCopyfile()
+
+    class _FakeCtypes:
+        c_char_p = object()
+        c_void_p = object()
+        c_uint32 = object()
+        c_int = object()
+
+        @staticmethod
+        def CDLL(name, use_errno=False):
+            return _FakeCDLL()
+
+        @staticmethod
+        def get_errno():
+            return 0
+
+    monkeypatch.setattr(xmp, "_copy_xattrs", fake_copy_xattrs)
+    monkeypatch.setattr(xmp, "_darwin_xattr", lambda: (_FakeCtypes, None))
+    # Force the darwin branch even off macOS so this is testable everywhere.
+    monkeypatch.setattr(xmp.sys, "platform", "darwin")
+
+    xmp._preserve_sidecar_access(source, destination, source.stat())
+    assert events == ["xattrs", "acl"], events
+
+
+# ── Extended-attribute preservation ─────────────────────────────────────
+
+def _fake_xattr_store(source_attrs, refuse=None, refuse_errno=None):
+    """Build list/get/set/remove callables over in-memory xattr dicts."""
+    import errno as errno_module
+
+    store = {"source": dict(source_attrs), "dest": {}}
+
+    def which(path):
+        return store[path]
+
+    def list_xattrs(path):
+        return list(which(path))
+
+    def get_xattr(path, name):
+        return which(path)[name]
+
+    def set_xattr(path, name, value):
+        if name == refuse:
+            code = refuse_errno or errno_module.EACCES
+            raise OSError(code, os.strerror(code), str(path))
+        which(path)[name] = value
+
+    def remove_xattr(path, name):
+        which(path).pop(name, None)
+
+    return store, list_xattrs, get_xattr, set_xattr, remove_xattr
+
+
+def test_copy_xattrs_skips_attributes_no_process_may_set():
+    """A kernel-owned xattr must not sink the whole sidecar write.
+
+    macOS stamps ``com.apple.provenance`` on written files and refuses every
+    attempt to set it. Copying attributes as a block made each already-written
+    sidecar on an SMB share permanently unwritable.
+    """
+    import xmp
+
+    store, *api = _fake_xattr_store(
+        {"com.apple.provenance": b"", "com.vireo.keep": b"value"},
+        refuse="com.apple.provenance",
+    )
+    xmp._copy_xattrs("source", "dest", *api)
+    assert store["dest"] == {"com.vireo.keep": b"value"}
+
+
+def test_copy_xattrs_raises_on_errors_that_are_not_structural():
+    """A full disk is a real failure — do not publish a half-copied sidecar."""
+    import errno
+
+    import xmp
+
+    _, *api = _fake_xattr_store(
+        {"com.vireo.keep": b"value"}, refuse="com.vireo.keep",
+        refuse_errno=errno.ENOSPC,
+    )
+    with pytest.raises(OSError):
+        xmp._copy_xattrs("source", "dest", *api)
+
+
+def test_copy_xattrs_never_skips_access_control_attributes():
+    """Linux stores ACLs as xattrs; dropping one would widen access."""
+    import xmp
+
+    _, *api = _fake_xattr_store(
+        {"system.posix_acl_access": b"acl"}, refuse="system.posix_acl_access",
+    )
+    with pytest.raises(PermissionError):
+        xmp._copy_xattrs("source", "dest", *api)
+
+
+@pytest.mark.parametrize(
+    "attribute",
+    ["system.nfs4_acl", "system.richacl", "security.selinux"],
+)
+def test_copy_xattrs_never_skips_non_posix_acl_namespaces(attribute):
+    """NFSv4/RichACL/security xattrs are access control too.
+
+    The Linux ``system.`` namespace is reserved for kernel-managed access
+    control -- ``system.nfs4_acl`` on NFSv4 mounts, ``system.richacl`` on
+    RichACL mounts. If ``setxattr`` returns EACCES/EPERM/ENOTSUP, skipping
+    the attribute would publish a sidecar with weaker access than the
+    original; the previous all-or-nothing copy aborted in that case.
+    """
+    import xmp
+
+    _, *api = _fake_xattr_store({attribute: b"acl"}, refuse=attribute)
+    with pytest.raises(PermissionError):
+        xmp._copy_xattrs("source", "dest", *api)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX extended attributes")
+def test_sidecar_update_survives_unsettable_source_xattr(sample_xmp, monkeypatch):
+    """End to end: an uncopyable source attribute still rewrites the sidecar."""
+    import errno
+
+    import xmp
+
+    name = "com.apple.provenance"
+    if sys.platform == "darwin":
+        target, list_fn, get_fn, set_fn = (
+            xmp, "_darwin_list_xattrs", "_darwin_get_xattr", "_darwin_set_xattr",
+        )
+    else:
+        target, list_fn, get_fn, set_fn = (
+            os, "listxattr", "getxattr", "setxattr",
+        )
+    real_list = getattr(target, list_fn)
+    real_get = getattr(target, get_fn)
+    real_set = getattr(target, set_fn)
+
+    def listing(path, *args, **kwargs):
+        names = list(real_list(path, *args, **kwargs))
+        return names + [name] if str(path) == str(sample_xmp) else names
+
+    def reading(path, attr, *args, **kwargs):
+        if attr == name:
+            return b""
+        return real_get(path, attr, *args, **kwargs)
+
+    def writing(path, attr, value, *args, **kwargs):
+        if attr == name:
+            raise OSError(errno.EACCES, "Permission denied", str(path))
+        return real_set(path, attr, value, *args, **kwargs)
+
+    monkeypatch.setattr(target, list_fn, listing)
+    monkeypatch.setattr(target, get_fn, reading)
+    monkeypatch.setattr(target, set_fn, writing)
+
+    write_rating(sample_xmp, 5)
+    assert read_sync_preview_metadata(sample_xmp)["rating"] == "5"

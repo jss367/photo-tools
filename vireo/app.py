@@ -25348,12 +25348,14 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 )
                 while not lock_acquired:
                     if ctx.runner.is_cancelled(job["id"]):
-                        return {"synced": 0, "failed": 0, "failures": []}
+                        return {"synced": 0, "failed": 0, "failures": [],
+                                "ok": True, "errors": []}
                     lock_acquired = app._sync_job_lock.acquire(timeout=0.1)
 
             try:
                 if ctx.runner.is_cancelled(job["id"]):
-                    return {"synced": 0, "failed": 0, "failures": []}
+                    return {"synced": 0, "failed": 0, "failures": [],
+                            "ok": True, "errors": []}
                 ctx.runner.push_event(
                     job["id"],
                     "progress",

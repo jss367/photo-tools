@@ -582,6 +582,63 @@ def test_failed_access_metadata_copy_preserves_sidecar(sample_xmp, monkeypatch):
     assert set(path.parent.iterdir()) == {path}
 
 
+def test_preserve_sidecar_access_copies_xattrs_before_acl_on_darwin(
+    monkeypatch, tmp_path,
+):
+    """Non-ACL xattrs must be copied before the source ACL is applied.
+
+    A macOS ACL can allow file-data writes but deny writeextattr. Applying
+    the ACL first would then make ``setxattr`` on the destination return
+    EACCES; ``_copy_xattrs`` would skip the (non-critical) source metadata,
+    and ``os.replace`` would publish a sidecar without it. Portable because
+    every darwin-specific dependency is patched out.
+    """
+    import xmp
+
+    source = tmp_path / "source"
+    source.write_bytes(b"src")
+    destination = tmp_path / "destination"
+    destination.write_bytes(b"dst")
+
+    events = []
+
+    def fake_copy_xattrs(src, dst, *rest):
+        events.append("xattrs")
+
+    class _FakeCopyfile:
+        argtypes = None
+        restype = None
+
+        def __call__(self, *args, **kwargs):
+            events.append("acl")
+            return 0
+
+    class _FakeCDLL:
+        copyfile = _FakeCopyfile()
+
+    class _FakeCtypes:
+        c_char_p = object()
+        c_void_p = object()
+        c_uint32 = object()
+        c_int = object()
+
+        @staticmethod
+        def CDLL(name, use_errno=False):
+            return _FakeCDLL()
+
+        @staticmethod
+        def get_errno():
+            return 0
+
+    monkeypatch.setattr(xmp, "_copy_xattrs", fake_copy_xattrs)
+    monkeypatch.setattr(xmp, "_darwin_xattr", lambda: (_FakeCtypes, None))
+    # Force the darwin branch even off macOS so this is testable everywhere.
+    monkeypatch.setattr(xmp.sys, "platform", "darwin")
+
+    xmp._preserve_sidecar_access(source, destination, source.stat())
+    assert events == ["xattrs", "acl"], events
+
+
 # ── Extended-attribute preservation ─────────────────────────────────────
 
 def _fake_xattr_store(source_attrs, refuse=None, refuse_errno=None):

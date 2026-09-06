@@ -264,7 +264,18 @@ def _sync_result(synced, failures):
     "failed", not "completed", so the UI cannot report success over a NAS
     that rejected every write.
     """
-    counts = Counter(f.get("reason") or f["error"] for f in failures)
+    # Count each (reason, photo_id) pair once: a photo with two queued
+    # unsupported changes of the same type produces two failure records with
+    # identical reasons, but the summary reports "photos", not records.
+    seen = set()
+    counts = Counter()
+    for f in failures:
+        reason = f.get("reason") or f["error"]
+        key = (reason, f.get("photo_id"))
+        if key in seen:
+            continue
+        seen.add(key)
+        counts[reason] += 1
     reasons = [
         f"{reason} ({count} photo{'s' if count != 1 else ''})"
         for reason, count in counts.most_common(_MAX_REPORTED_FAILURE_REASONS)

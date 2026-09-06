@@ -1105,7 +1105,11 @@ def test_sync_failure_reasons_are_deduplicated(tmp_path, monkeypatch):
 
     db = Database(str(tmp_path / "test.db"))
     db.set_active_workspace(db.ensure_default_workspace())
-    fid = db.add_folder('/nonexistent', name='gone')
+    # An uncreated child of tmp_path is guaranteed absent; a fixed
+    # /nonexistent path is not, and on hosts where it exists the test would
+    # silently exercise a different code path.
+    missing_dir = tmp_path / 'gone'
+    fid = db.add_folder(str(missing_dir), name='gone')
     for i in range(3):
         pid = db.add_photo(folder_id=fid, filename=f'missing{i}.jpg',
                            extension='.jpg', file_size=100, file_mtime=1.0)
@@ -1165,3 +1169,25 @@ def test_sync_failure_reason_ignores_per_photo_filename(tmp_path, monkeypatch):
         # but the summary line must not include the specific filename.
         assert f["error"] != reason
         assert ".xmp" not in reason
+
+
+def test_sync_result_counts_distinct_photos_not_records():
+    """Two failure records for the same photo count the photo once.
+
+    A photo with two queued unsupported changes of the same type produces
+    two identical failure records; the summary reports 'photos', not
+    records, so the two must collapse to one.
+    """
+    from sync import _sync_result
+
+    failures = [
+        {"photo_id": 1, "error": "unsupported change type: flag"},
+        {"photo_id": 1, "error": "unsupported change type: flag"},
+        {"photo_id": 2, "error": "unsupported change type: flag"},
+    ]
+    result = _sync_result(synced=0, failures=failures)
+    # The raw failures are preserved for the detail log.
+    assert result["failed"] == 3
+    # But the summary counts distinct photos per reason: photo 1 once, plus
+    # photo 2, so the reason applies to two photos, not three.
+    assert result["errors"] == ["unsupported change type: flag (2 photos)"]

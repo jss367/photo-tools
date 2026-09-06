@@ -213,11 +213,24 @@ async function runSync(changeIds) {
         // Report what reached the sidecars, not merely that the job ran. A
         // NAS that rejects every write finishes the job normally; saying
         // "Synced!" over it is why a stuck banner looks like a UI bug.
+        var hasResult = !!(event && event.result);
         var result = (event && event.result) || {};
         var synced = result.synced || 0;
         var failed = result.failed || 0;
         var reasons = (event && event.errors) || result.errors || [];
-        if (event.status === 'cancelled') {
+        // Clear any tooltip left over from a prior failure so a subsequent
+        // completed or cancelled run does not keep pointing at old causes.
+        status.title = '';
+        if (event.status === 'failed' && !hasResult) {
+          // Fatal exception outside the per-photo handler (e.g. clear_pending
+          // failed after some writes). Show a generic failure rather than
+          // "Wrote 0, failed on 0", which contradicts the failure.
+          status.textContent = 'Sync failed'
+            + (reasons.length ? ' — ' + reasons[0] : '')
+            + '. Changes stay pending.';
+          status.style.color = 'var(--danger)';
+          status.title = reasons.join('\n');
+        } else if (event.status === 'cancelled') {
           status.textContent = 'Sync cancelled — ' + synced.toLocaleString() + ' written.';
           status.style.color = 'var(--text-dim)';
         } else if (failed === 0 && event.status === 'completed') {

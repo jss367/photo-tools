@@ -214,6 +214,14 @@ def _preserve_sidecar_access(source, destination, source_stat):
         # aborts before replacement.
         ctypes, _ = _darwin_xattr()
 
+        # Copy extended attributes BEFORE applying the source ACL: a macOS
+        # ACL can allow file-data writes but deny writeextattr, and once
+        # the source ACL is in place, setxattr on the destination would
+        # return EACCES and _copy_xattrs would then skip the (non-critical)
+        # source metadata, publishing a sidecar without it.
+        _copy_xattrs(source, destination, _darwin_list_xattrs,
+                     _darwin_get_xattr, _darwin_set_xattr, _darwin_remove_xattr)
+
         copyfile = ctypes.CDLL(None, use_errno=True).copyfile
         copyfile.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_void_p,
                              ctypes.c_uint32]
@@ -223,8 +231,6 @@ def _preserve_sidecar_access(source, destination, source_stat):
                     copyfile_acl) != 0:
             error = ctypes.get_errno()
             raise OSError(error, os.strerror(error), str(source))
-        _copy_xattrs(source, destination, _darwin_list_xattrs,
-                     _darwin_get_xattr, _darwin_set_xattr, _darwin_remove_xattr)
     elif hasattr(os, "listxattr"):
         # Linux exposes POSIX ACLs as system.posix_acl_access. Unlike
         # shutil.copystat, do not silently ignore permission-copy failures --

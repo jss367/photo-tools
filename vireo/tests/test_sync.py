@@ -1502,7 +1502,6 @@ def test_sync_serializes_case_aliases_on_case_insensitive_filesystems(tmp_path, 
     own worker and one photo's changes were overwritten.
     """
     import sync as sync_module
-
     from db import Database
     from sync import sync_to_xmp
     from xmp import read_keywords
@@ -1544,7 +1543,6 @@ def test_sync_keeps_case_variant_sidecars_separate_on_case_sensitive_fs(tmp_path
     losing photo's changes into the wrong sidecar.
     """
     import sync as sync_module
-
     from db import Database
     from sync import sync_to_xmp
     from xmp import read_keywords

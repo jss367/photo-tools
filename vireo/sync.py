@@ -1,5 +1,6 @@
 """Sync engine: reconcile database and XMP sidecars."""
 
+import contextlib
 import logging
 import os
 import tempfile
@@ -121,10 +122,8 @@ def _is_case_insensitive_dir(folder):
         except OSError:
             return False
     finally:
-        try:
+        with contextlib.suppress(OSError):
             os.remove(probe)
-        except OSError:
-            pass
 
 
 def _select_changes(changes, change_ids):

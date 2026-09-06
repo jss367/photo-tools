@@ -220,3 +220,69 @@ def test_browse_resize_keeps_a_right_clicked_photo_visible(live_server, page):
     assert visibility["fullyVisible"] is True, (
         f"the right-clicked photo left the grid viewport after the resize: {visibility}"
     )
+
+
+def test_browse_resize_keeps_a_collapsed_stack_cover_visible(live_server, page):
+    # Collapsing a stack while two of its members are selected deliberately
+    # leaves the focus on a hidden member — it is still an active batch target —
+    # and moves only the caret to the visible cover. The correction has to
+    # resolve that hidden focus to the cover, the way grid navigation does,
+    # instead of finding no card and giving up on the cover the user can see.
+    db = live_server["db"]
+    burst_ids = live_server["data"]["photos"][:3]
+    with db.conn:
+        db.conn.execute(
+            "UPDATE photos SET burst_id = 'resize-burst' WHERE id IN (?, ?, ?)",
+            burst_ids,
+        )
+    _seed_extra_photos(live_server, 40)
+
+    page.set_viewport_size({"width": 1400, "height": 900})
+    page.goto(live_server["url"] + "/browse")
+    page.locator(".grid-card").first.wait_for(state="visible")
+    page.locator("#browseStacksToggle").check()
+    cover = page.locator(".grid-card.has-browse-stack").first
+    cover.wait_for(state="visible")
+    cover_id = int(cover.get_attribute("data-id"))
+
+    cover.locator(".browse-stack-badge").click()
+    members = page.locator(
+        f'.browse-stack-tray[data-stack-cover-id="{cover_id}"] .browse-stack-member'
+    )
+    members.first.wait_for(state="visible")
+    hidden = [
+        int(members.nth(i).get_attribute("data-id"))
+        for i in range(members.count())
+        if int(members.nth(i).get_attribute("data-id")) != cover_id
+    ]
+    page.locator(f'.browse-stack-member[data-id="{hidden[0]}"]').click()
+    page.locator(f'.browse-stack-member[data-id="{hidden[1]}"]').click(
+        modifiers=["ControlOrMeta"]
+    )
+    page.locator(f'.grid-card[data-id="{cover_id}"] .browse-stack-badge').click()
+
+    # Both the focus and the last click are now on unrendered members.
+    assert page.evaluate("selectedPhotoId") in hidden
+    assert page.evaluate("lastClickedPhotoId") in hidden
+    assert page.evaluate("() => !!renderedCardForFocus(focusedBrowsePhotoId())") is True
+
+    page.evaluate("() => noteFocusedCardVisibility()")
+    wide = page.evaluate("() => gridContainer.clientWidth")
+    page.set_viewport_size({"width": 780, "height": 900})
+    page.wait_for_function("width => gridContainer.clientWidth < width", arg=wide)
+    page.evaluate(SETTLE)
+
+    visibility = page.evaluate(
+        """id => {
+          const card = document.querySelector(`.grid-card[data-id="${id}"]`);
+          const view = document.getElementById('gridContainer').getBoundingClientRect();
+          const rect = card.getBoundingClientRect();
+          return {fullyVisible: rect.top >= view.top - 1 && rect.bottom <= view.bottom + 1,
+                  card: {top: rect.top, bottom: rect.bottom},
+                  view: {top: view.top, bottom: view.bottom}};
+        }""",
+        cover_id,
+    )
+    assert visibility["fullyVisible"] is True, (
+        f"the collapsed stack cover left the grid viewport after the resize: {visibility}"
+    )

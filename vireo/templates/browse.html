@@ -7522,25 +7522,36 @@ window.addEventListener('resize', function() {
 function focusedBrowsePhotoId() {
   // The most recent click wins. A cmd/shift-click extends the selection while
   // leaving selectedPhotoId on the older detail focus, and the card the user
-  // just clicked is the one they are looking at. It only wins while its card
-  // is actually rendered, though: collapsing a stack after a stack-wide Select
-  // all leaves the last-clicked member selected but unrendered, with
-  // selectedPhotoId deliberately pinned to the visible cover. Preferring the
-  // hidden member there would find no element and silently disable the
-  // correction for the cover the user can see.
+  // just clicked is the one they are looking at. It only wins while it has a
+  // card on screen, though: collapsing a stack after a stack-wide Select all
+  // leaves the last-clicked member selected but unrendered, with
+  // selectedPhotoId deliberately pinned to the visible cover.
   if (lastClickedPhotoId != null &&
       (lastClickedPhotoId === selectedPhotoId || selectedPhotos.has(lastClickedPhotoId)) &&
-      getBrowsePhotoElement(lastClickedPhotoId)) {
+      renderedCardForFocus(lastClickedPhotoId)) {
     return lastClickedPhotoId;
   }
   return selectedPhotoId;
 }
 
-// The focused card's box, measured from the top of the grid viewport.
-function focusedCardBox() {
-  var photoId = focusedBrowsePhotoId();
+// The card standing in for a focused photo. A focused photo that is not itself
+// rendered can still have a visible home: a collapsed stack draws its cover in
+// place of every member, and collapsing while two members are selected leaves
+// the focus on a hidden one by design (the member stays an active batch
+// target). Grid and lightbox navigation already resolve that focus to the
+// cover — getBrowseShortcutPhoto — so the resize correction does too, instead
+// of giving up and letting the visibly-selected cover reflow off screen.
+function renderedCardForFocus(photoId) {
   if (photoId == null) return null;
   var card = getBrowsePhotoElement(photoId);
+  if (card) return card;
+  var coverId = browseStackCoverIdForPhoto(photoId);
+  return coverId == null ? null : getBrowsePhotoElement(coverId);
+}
+
+// The focused card's box, measured from the top of the grid viewport.
+function focusedCardBox() {
+  var card = renderedCardForFocus(focusedBrowsePhotoId());
   if (!card) return null;
   var containerRect = gridContainer.getBoundingClientRect();
   var cardRect = card.getBoundingClientRect();

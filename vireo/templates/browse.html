@@ -2425,6 +2425,10 @@ var earliestPage = 1;
 var browseDatasetReady = false;
 var selectedPhotoId = null;
 var selectedIndex = -1;
+// The card the user clicked most recently. Usually selectedPhotoId, but a
+// cmd-click can fold the focused photo into selectedPhotos and null the focus
+// id, and that card is still the one the user is looking at.
+var lastClickedPhotoId = null;
 var anchorRestoreEpoch = 0;
 var anchorScanDepth = 0;
 var selectedPhotos = new Set(); // multi-select
@@ -7508,6 +7512,48 @@ window.addEventListener('resize', function() {
   requestAnimationFrame(updateGridTail);
 });
 
+/* ---------- Keep the clicked photo visible across layout changes ---------- */
+// The grid is `auto-fill`, so any width change reflows every card into a
+// different column: after a window resize (or a sidebar/detail-panel drag) the
+// photo the user clicked can end up far outside the viewport. A shorter
+// viewport pushes it past the bottom edge the same way. Put it back in view.
+function focusedBrowsePhotoId() {
+  if (selectedPhotoId != null) return selectedPhotoId;
+  if (lastClickedPhotoId != null && selectedPhotos.has(lastClickedPhotoId)) return lastClickedPhotoId;
+  return null;
+}
+
+function keepFocusedCardVisible() {
+  var photoId = focusedBrowsePhotoId();
+  if (photoId == null) return;
+  var card = getBrowsePhotoElement(photoId);
+  if (!card) return;
+  var containerRect = gridContainer.getBoundingClientRect();
+  var cardRect = card.getBoundingClientRect();
+  var top = cardRect.top - containerRect.top;
+  var viewHeight = gridContainer.clientHeight;
+  if (top >= 0 && cardRect.bottom - containerRect.top <= viewHeight) return;
+  // Off-screen after the reflow: land it in the middle of the viewport rather
+  // than flush against whichever edge it drifted past, so the rows around it
+  // stay readable. A card taller than the viewport pins its top edge instead.
+  var wantedTop = cardRect.height >= viewHeight ? 0 : (viewHeight - cardRect.height) / 2;
+  gridContainer.scrollTop += top - wantedTop;
+}
+
+if (window.ResizeObserver) {
+  // ResizeObserver runs after layout but before paint, so the correction lands
+  // in the same frame as the reflow — the card never visibly jumps away.
+  var lastGridViewportSize = gridContainer.clientWidth + 'x' + gridContainer.clientHeight;
+  new ResizeObserver(function() {
+    var size = gridContainer.clientWidth + 'x' + gridContainer.clientHeight;
+    // A scrollbar appearing counts (it reflows the columns); anything that
+    // leaves the viewport box alone cannot have moved the card out of view.
+    if (size === lastGridViewportSize) return;
+    lastGridViewportSize = size;
+    keepFocusedCardVisible();
+  }).observe(gridContainer);
+}
+
 /* ---------- Scroll Position Tracking ---------- */
 var scrollTimer = null;
 var lastGridScrollTop = gridContainer.scrollTop;
@@ -7529,6 +7575,7 @@ gridContainer.addEventListener('wheel', function(e) {
 /* ---------- Photo Selection & Detail ---------- */
 function selectPhoto(e, id, idx) {
   anchorRestoreEpoch++;
+  lastClickedPhotoId = id;
   if (e.shiftKey && selectedIndex >= 0) {
     // Shift-click: range select
     var start = Math.min(selectedIndex, idx);

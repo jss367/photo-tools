@@ -164,6 +164,7 @@ from working_copy_cache import (
     evict_if_over_quota as evict_working_copy_cache_if_over_quota,
 )
 from working_copy_cache import (
+    touch_working_copy_access,
     working_copy_publication_guard,
     working_copy_quota_bytes,
     working_copy_stats,
@@ -4331,9 +4332,28 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 continue
         if not mtimes:
             return
-        peg = max(mtimes)
+        # Satisfy the gate without backdating the file. ``max(mtimes)`` alone
+        # stamps a render of a 2019 RAW with a 2019 mtime, and working-copy
+        # quota eviction reads mtime as recency — so a copy generated on
+        # demand for an old source would be born at the head of the eviction
+        # queue and reclaimed before the user opened the next photo. The gate
+        # only needs ``>=``, so clamping up to the wall clock keeps it honest
+        # and leaves a usable recency stamp.
+        peg = max(max(mtimes), time.time())
         with contextlib.suppress(OSError, TypeError, ValueError):
             os.utime(cache_path, (peg, peg))
+
+    def _serve_trusted_working_copy(path):
+        """Serve a working-copy cache hit and stamp it as recently used.
+
+        Callers hold ``working_copy_publication_guard`` — the same lock the
+        quota pass takes — so the stamp cannot land between eviction's
+        directory scan and its unlink.
+        """
+        from flask import send_file
+
+        touch_working_copy_access(path)
+        return send_file(path, mimetype="image/jpeg")
 
     def _prepared_full_resolution_render(
         vireo_dir, photo, recipe, file_state=None,
@@ -29566,7 +29586,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             # eviction from unlinking the open handle.
             with working_copy_publication_guard():
                 if os.path.isfile(trusted_wc_path):
-                    return send_file(trusted_wc_path, mimetype="image/jpeg")
+                    return _serve_trusted_working_copy(trusted_wc_path)
 
         # Resolve original file path
         from offline_cache import resolve_original_path
@@ -29626,7 +29646,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             # branch above.
             with working_copy_publication_guard():
                 if os.path.isfile(trusted_wc_path):
-                    return send_file(trusted_wc_path, mimetype="image/jpeg")
+                    return _serve_trusted_working_copy(trusted_wc_path)
 
         has_current_raw_failure = (
             (not using_offline_cache or resolved_ext in RAW_EXTENSIONS)
@@ -29661,9 +29681,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     # revalidate under the publication guard before opening.
                     with working_copy_publication_guard():
                         if os.path.isfile(trusted_wc_path):
-                            return send_file(
-                                trusted_wc_path, mimetype="image/jpeg",
-                            )
+                            return _serve_trusted_working_copy(trusted_wc_path)
                 log.info(
                     "Skipping original-image extraction for photo %s; RAW working-copy "
                     "extraction already failed for current source mtime",
@@ -30075,9 +30093,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                             _record_working_copy_failure(
                                 db, photo, source_for_extraction,
                             )
-                            return send_file(
-                                trusted_wc_path, mimetype="image/jpeg",
-                            )
+                            return _serve_trusted_working_copy(trusted_wc_path)
             return _serve_generated_original(tmp_path, uw, uh)
 
         # extract_working_copy failed on a RAW source: try the full-res
@@ -30173,9 +30189,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 # 500 rather than raising inside ``send_file``.
                 with working_copy_publication_guard():
                     if os.path.isfile(trusted_wc_path):
-                        return send_file(
-                            trusted_wc_path, mimetype="image/jpeg",
-                        )
+                        return _serve_trusted_working_copy(trusted_wc_path)
             return "Could not load image", 500
         if primary_is_raw:
             cache_path = display_cache_path

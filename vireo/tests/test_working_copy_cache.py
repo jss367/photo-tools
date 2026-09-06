@@ -772,3 +772,88 @@ def test_zero_quota_skips_working_copy_generation(
         assert not path.exists()
     finally:
         db.close()
+
+
+def test_eviction_result_reports_which_files_were_removed(tmp_path):
+    """The payload names the reclaimed files, not just a count.
+
+    The scanner's backfill has to distinguish "the quota pass reclaimed
+    bytes I just generated" from "it reclaimed coverage that already
+    existed" — the second means the cache is rotating rather than growing
+    and the batch must stand down. A bare count cannot answer that.
+    """
+    from working_copy_cache import evict_if_over_quota
+
+    db, working_dir, photo_ids = _seed_working_copies(
+        tmp_path, [600_000, 600_000, 600_000],
+    )
+    try:
+        result = evict_if_over_quota(db, str(tmp_path), quota_mb=1)
+
+        assert set(result["evicted_paths"]) == {
+            str(working_dir / f"{photo_ids[0]}.jpg"),
+            str(working_dir / f"{photo_ids[1]}.jpg"),
+        }
+    finally:
+        db.close()
+
+
+def test_touch_marks_an_old_working_copy_as_recently_used(tmp_path):
+    """A cache hit advances mtime so eviction reads it as recently used."""
+    import time
+
+    from working_copy_cache import touch_working_copy_access
+
+    path = tmp_path / "1.jpg"
+    path.write_bytes(b"x" * 100)
+    stale = time.time() - 30 * 24 * 3600
+    os.utime(path, (stale, stale))
+
+    assert touch_working_copy_access(str(path)) is True
+    assert path.stat().st_mtime > stale
+    assert path.stat().st_mtime >= time.time() - 60
+
+
+def test_touch_skips_a_freshly_stamped_working_copy(tmp_path):
+    """Throttled: a burst of 1:1 zoom requests must not utime per request."""
+    import time
+
+    from working_copy_cache import touch_working_copy_access
+
+    path = tmp_path / "1.jpg"
+    path.write_bytes(b"x" * 100)
+    recent = time.time() - 60
+    os.utime(path, (recent, recent))
+
+    assert touch_working_copy_access(str(path)) is False
+    assert path.stat().st_mtime == recent
+
+
+def test_touch_never_drags_a_future_stamped_copy_backwards(tmp_path):
+    """Forward-only.
+
+    ``/photos/<id>/original`` serves a cached rendition when its mtime is
+    ``>=`` its sources'. A copy pegged into the future (clock skew, an
+    archive with forward-dated timestamps) is pegged there deliberately;
+    stamping it with "now" would fail that gate and re-decode the RAW on
+    every request.
+    """
+    import time
+
+    from working_copy_cache import touch_working_copy_access
+
+    path = tmp_path / "1.jpg"
+    path.write_bytes(b"x" * 100)
+    future = time.time() + 7 * 24 * 3600
+    os.utime(path, (future, future))
+
+    assert touch_working_copy_access(str(path)) is False
+    assert path.stat().st_mtime == future
+
+
+def test_touch_is_best_effort_on_a_missing_file(tmp_path):
+    """Serving bytes must never fail because eviction won the race."""
+    from working_copy_cache import touch_working_copy_access
+
+    assert touch_working_copy_access(str(tmp_path / "gone.jpg")) is False
+    assert touch_working_copy_access(None) is False

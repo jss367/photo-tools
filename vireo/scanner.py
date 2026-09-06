@@ -1440,6 +1440,14 @@ def _extract_working_copies(db, vireo_dir, progress_callback=None,
           JOIN folders f ON f.id = p.folder_id
          WHERE {candidate_where}
            {scope_clause}
+         -- Newest import first. A library whose working copies do not all
+         -- fit under the quota gets partial coverage no matter what, so the
+         -- order decides *which* photos are covered — and unordered means
+         -- rowid order, which walks the oldest imports first and leaves the
+         -- shoot the user just brought in for last. Import recency (id) is
+         -- the right proxy here rather than capture time: an archive of
+         -- decade-old files imported today is what is being culled today.
+         ORDER BY p.id DESC
         """,
         params,
     ).fetchall()
@@ -1947,8 +1955,9 @@ def _extract_working_copies(db, vireo_dir, progress_callback=None,
 
             if new_bytes_since_enforce >= incremental_threshold:
                 retained_before_enforce = set(retained_new_files)
+                enforcement = None
                 try:
-                    evict_if_over_quota(db, vireo_dir)
+                    enforcement = evict_if_over_quota(db, vireo_dir)
                 except Exception:
                     log.exception(
                         "Working-copy quota enforcement failed mid-batch"
@@ -1976,6 +1985,38 @@ def _extract_working_copies(db, vireo_dir, progress_callback=None,
                     retained_before_enforce - set(retained_new_files)
                 )
                 if any(path != wc_abs for path in removed_batch_files):
+                    stop_after_current = True
+
+                # The same rotation, one step earlier: enforcement can stay
+                # under the ceiling by reclaiming working copies this batch
+                # did not write — the ones a previous run or an on-demand
+                # render already published. Those deletions never shrink
+                # ``retained_new_files``, so the check above cannot see them,
+                # and the batch would happily trade existing coverage for new
+                # coverage file by file. That is not progress: total coverage
+                # is flat, and because eviction sheds the oldest stamps first
+                # it is spending the user's most recently used copies to
+                # backfill photos they have not asked for. Defer the rest.
+                #
+                # Only the library-wide pass. A scoped run is a scan or an
+                # import of specific folders — the shoot the user just put
+                # on disk and is about to cull — and displacing the least
+                # recently used old copy to cover it is exactly what a cache
+                # is for. It is the unscoped sweep, which has no such claim
+                # on being more important than what is already cached, that
+                # must not churn.
+                displaced_existing = scope is None and {
+                    path
+                    for path in (enforcement or {}).get("evicted_paths", ())
+                    if path not in retained_before_enforce
+                }
+                if displaced_existing:
+                    log.info(
+                        "Working-copy batch reclaimed %d pre-existing "
+                        "copies to stay under quota; deferring the rest "
+                        "rather than rotating the cache",
+                        len(displaced_existing),
+                    )
                     stop_after_current = True
 
             # Once this batch alone has produced a full quota's worth of new

@@ -2037,6 +2037,46 @@ def test_original_serves_full_res_working_copy(app_and_db):
     assert resp.status_code == 200
 
 
+def test_original_stamps_the_working_copy_it_serves(app_and_db):
+    """Serving a working copy marks it as recently used.
+
+    Quota eviction orders candidates by mtime, which on a generated file
+    means "written longest ago" unless something records use. Without this
+    stamp a full cache reclaims the copies for the photos being worked on
+    right now — they are the ones that have been on disk the longest —
+    while an archive nobody opens survives.
+    """
+    from PIL import Image
+
+    app, db = app_and_db
+    client = app.test_client()
+
+    pid = db.get_photos()[0]["id"]
+    db.conn.execute(
+        "UPDATE photos SET width=800, height=600 WHERE id=?", (pid,),
+    )
+    vireo_dir = os.path.dirname(app.config["THUMB_CACHE_DIR"])
+    working_dir = os.path.join(vireo_dir, "working")
+    os.makedirs(working_dir, exist_ok=True)
+    wc_path = os.path.join(working_dir, f"{pid}.jpg")
+    Image.new("RGB", (800, 600)).save(wc_path, "JPEG")
+    db.conn.execute(
+        "UPDATE photos SET working_copy_path=? WHERE id=?",
+        (f"working/{pid}.jpg", pid),
+    )
+    db.conn.commit()
+
+    stale = time.time() - 30 * 24 * 3600
+    os.utime(wc_path, (stale, stale))
+
+    resp = client.get(f"/photos/{pid}/original")
+    assert resp.status_code == 200
+    assert os.path.getmtime(wc_path) > stale, (
+        "the served working copy kept its month-old mtime, so quota "
+        "eviction still reads it as the least valuable file in the cache"
+    )
+
+
 def test_original_opens_full_res_working_copy_under_eviction_guard(
     app_and_db, monkeypatch,
 ):
@@ -2512,6 +2552,74 @@ def test_unedited_raw_display_cache_survives_when_companion_is_newer_than_raw_ro
     )
     with Image.open(io.BytesIO(second.data)) as rendered:
         assert rendered.getpixel((0, 0))[0] > 200
+
+
+def test_generated_rendition_is_not_born_at_the_head_of_the_eviction_queue(
+    app_and_db, monkeypatch,
+):
+    """A render of an old source gets a current mtime, not the source's.
+
+    The cache-hit gate only needs the rendition's mtime to be ``>=`` its
+    sources', but pegging it exactly *to* an old source stamps a brand new
+    file with a years-old timestamp — and working-copy quota eviction reads
+    mtime as recency, so the render would be first in line for reclamation
+    the moment the cache filled. Clamp the peg up to the wall clock.
+    """
+    import image_loader
+    from PIL import Image
+
+    app, db = app_and_db
+    client = app.test_client()
+    photo = db.get_photos()[0]
+    photo_id = photo["id"]
+
+    vireo_dir = os.path.dirname(app.config["THUMB_CACHE_DIR"])
+    source_dir = os.path.join(vireo_dir, "raw-source")
+    os.makedirs(source_dir, exist_ok=True)
+    raw_path = os.path.join(source_dir, "DSC_0001.NEF")
+    with open(raw_path, "wb") as handle:
+        handle.write(b"fake raw")
+    # A decade-old capture, which is the common shape for the archives this
+    # library keeps: eviction must not read "old photo" as "stale cache".
+    ancient = time.time() - 10 * 365 * 24 * 3600
+    os.utime(raw_path, (ancient, ancient))
+
+    db.conn.execute(
+        "UPDATE folders SET path=? WHERE id=?",
+        (source_dir, photo["folder_id"]),
+    )
+    db.conn.execute(
+        """UPDATE photos
+           SET filename='DSC_0001.NEF', extension='.nef',
+               width=800, height=600, companion_path=NULL,
+               working_copy_path=NULL, file_mtime=?
+           WHERE id=?""",
+        (ancient, photo_id),
+    )
+    db.conn.commit()
+
+    def fake_extract(source, output, **kwargs):
+        Image.new("RGB", (800, 600), (200, 200, 200)).save(output, "JPEG")
+        return True
+
+    monkeypatch.setattr(image_loader, "extract_working_copy", fake_extract)
+
+    resp = client.get(f"/photos/{photo_id}/original")
+    assert resp.status_code == 200
+
+    display_path = os.path.join(
+        vireo_dir, "originals", f"{photo_id}.display.jpg",
+    )
+    assert os.path.exists(display_path)
+    stamped = os.path.getmtime(display_path)
+    assert stamped >= ancient, (
+        "the rendition must still satisfy its own source-mtime hit check"
+    )
+    assert stamped >= time.time() - 300, (
+        f"rendition was stamped {(time.time() - stamped) / 86400:.0f} days "
+        "old at birth — quota eviction would reclaim it before anything "
+        "the user actually stopped looking at"
+    )
 
 
 def test_original_trusts_raw_working_copy_even_when_smaller_than_stored_dims(

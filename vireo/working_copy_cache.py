@@ -67,6 +67,53 @@ def working_copy_publication_guard():
         yield
 
 
+# Working copies carry no access record of their own, so quota eviction
+# orders candidates by mtime — which on a generated file means "written
+# longest ago", not "least recently used". Left alone that inverts the
+# intent: the copies for the photos imported and reviewed most recently
+# are exactly the ones a full cache reclaims first, while a decade-old
+# archive that nobody opens survives because its copies happen to be
+# newer on disk. Stamping the serve time on a cache hit turns mtime into
+# a real recency signal without adding a second LRU table.
+#
+# Throttled: a photographer pixel-peeping one frame at 1:1 issues a burst
+# of requests for the same file, and one utime per request buys nothing
+# over one per session.
+_ACCESS_TOUCH_INTERVAL_SECONDS = 6 * 60 * 60
+
+
+def touch_working_copy_access(path):
+    """Record a working-copy cache hit for eviction ordering.
+
+    Only ever moves mtime *forward*, and only when the file is already
+    older than ``_ACCESS_TOUCH_INTERVAL_SECONDS``. Both properties matter
+    for the display-cache freshness gates in ``/photos/<id>/original``,
+    which serve a cached rendition when its mtime is ``>=`` its sources':
+    advancing an old stamp to now keeps that true, and skipping files
+    stamped in the future (clock skew, archives with forward-dated
+    timestamps — the case ``_peg_display_cache_mtime`` exists for) avoids
+    dragging a deliberately pegged mtime backwards into a re-decode loop.
+
+    Best-effort: callers are serving bytes, so a failed stat/utime costs
+    only eviction-ordering accuracy and must never fail the request.
+    Returns True when the stamp moved.
+    """
+    if not path:
+        return False
+    now = time.time()
+    try:
+        stat_result = os.stat(path)
+    except OSError:
+        return False
+    if now - stat_result.st_mtime < _ACCESS_TOUCH_INTERVAL_SECONDS:
+        return False
+    try:
+        os.utime(path, (now, now))
+    except OSError:
+        return False
+    return True
+
+
 def _file_identity(st):
     """Return the fields that distinguish an atomically replaced file."""
     if os.name == "nt":
@@ -234,7 +281,7 @@ def evict_if_over_quota(db, vireo_dir, quota_mb=None, *, startup=False):
     if not os.path.isdir(working_dir):
         return {
             "evicted": 0, "freed_bytes": 0, "remaining_bytes": 0,
-            "quota_bytes": max_bytes,
+            "quota_bytes": max_bytes, "evicted_paths": [],
         }
 
     with _eviction_lock:
@@ -256,6 +303,7 @@ def evict_if_over_quota(db, vireo_dir, quota_mb=None, *, startup=False):
             "freed_bytes": 0,
             "remaining_bytes": None,
             "quota_bytes": max_bytes,
+            "evicted_paths": [],
             "deferred": True,
         }
 
@@ -407,7 +455,7 @@ def _evict_once(db, working_dir, max_bytes, *, startup):
     if total <= max_bytes:
         return {
             "evicted": 0, "freed_bytes": 0, "remaining_bytes": total,
-            "quota_bytes": max_bytes,
+            "quota_bytes": max_bytes, "evicted_paths": [],
         }
 
     if not _begin_stable_eviction_transaction(
@@ -475,6 +523,11 @@ def _evict_once(db, working_dir, max_bytes, *, startup):
         "freed_bytes": freed_bytes,
         "remaining_bytes": total,
         "quota_bytes": max_bytes,
+        # Which files went, not just how many: a batch caller (the scanner's
+        # backfill) has to tell "reclaimed bytes I just wrote" from "reclaimed
+        # coverage that already existed" to decide whether it is still growing
+        # the cache or merely rotating it.
+        "evicted_paths": [path for _, _, path in evicted],
     }
 
 

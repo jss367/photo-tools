@@ -1352,8 +1352,10 @@ def test_startup_backfill_pause_parks_between_rows_and_resumes(
             f"worker kept extracting while paused: {calls}"
         )
 
-    # Row 1's result survives the pause rather than being rolled back.
-    assert (vireo_dir / "working" / f"{ids[0]}.jpg").exists()
+    # The first row's result survives the pause rather than being rolled
+    # back. Backfill walks candidates newest-import-first, so that is the
+    # highest photo id.
+    assert (vireo_dir / "working" / f"{max(ids)}.jpg").exists()
 
     assert app._job_runner.resume_job(job_id) is True
 
@@ -1930,11 +1932,14 @@ def test_oversized_copy_does_not_defer_later_fitting_candidate(
         fitting_source = folder / "fitting.jpg"
         _make_jpeg(str(oversized_source), 2000, 1500)
         _make_jpeg(str(fitting_source), 2000, 1500)
-        oversized_id = _photo_id_of_file(
-            db, folder_id, oversized_source.name, oversized_source,
-        )
+        # Backfill walks candidates newest-import-first, so the oversized
+        # one has to be the later import for it to be processed first —
+        # which is the ordering this regression is about.
         fitting_id = _photo_id_of_file(
             db, folder_id, fitting_source.name, fitting_source,
+        )
+        oversized_id = _photo_id_of_file(
+            db, folder_id, oversized_source.name, oversized_source,
         )
 
         generated_sources = []
@@ -2206,3 +2211,211 @@ def test_scanner_does_not_track_copy_evicted_before_catalog_commit(
         assert row["working_copy_evicted_mtime"] is not None
     finally:
         db.close()
+
+
+def test_backfill_extracts_newest_imports_first(tmp_path, monkeypatch):
+    """Candidates are processed newest-import-first.
+
+    A library whose working copies do not all fit under the quota gets
+    partial coverage no matter what, so the order decides *which* photos
+    are covered. Unordered, SQLite scans ``photos`` by rowid and the pass
+    spends its whole budget on the oldest imports in the catalog — the
+    shoot the user brought in yesterday is last in line behind every
+    archive they have ever imported.
+    """
+    import config as cfg
+    import scanner
+    from db import Database
+    from scanner import _extract_working_copies
+
+    monkeypatch.setattr(cfg, "CONFIG_PATH", str(tmp_path / "config.json"))
+    cfg.save({
+        **cfg.DEFAULTS,
+        "working_copy_max_size": 1000,
+        "working_copy_quality": 90,
+    })
+
+    folder = tmp_path / "photos"
+    folder.mkdir()
+    vireo_dir = tmp_path / "vireo"
+    vireo_dir.mkdir()
+    db = Database(str(vireo_dir / "test.db"))
+    folder_id = db.add_folder(str(folder))
+    photo_ids = []
+    for i in range(5):
+        src = folder / f"big-{i}.jpg"
+        _make_jpeg(str(src), 2000, 1500)
+        photo_ids.append(
+            _photo_id_of_file(db, folder_id, f"big-{i}.jpg", src)
+        )
+
+    extracted = []
+    real_extract = scanner.extract_working_copy
+
+    def recording_extract(source_path, output_path, **kwargs):
+        extracted.append(os.path.basename(output_path))
+        return real_extract(source_path, output_path, **kwargs)
+
+    monkeypatch.setattr(scanner, "extract_working_copy", recording_extract)
+
+    _extract_working_copies(db, str(vireo_dir))
+
+    assert extracted == [f"{pid}.jpg" for pid in reversed(photo_ids)], (
+        "backfill must walk candidates newest-import-first; got "
+        f"{extracted} for photo ids {photo_ids}"
+    )
+
+
+def test_backfill_stops_rather_than_evicting_existing_coverage(
+    tmp_path, monkeypatch,
+):
+    """A full cache defers the rest instead of cannibalising what it has.
+
+    Mid-batch quota enforcement can stay under the ceiling by reclaiming
+    working copies this batch did not write — ones an earlier run or an
+    on-demand render already published. Those deletions leave the batch's
+    own byte tracking untouched, so without an explicit check the pass
+    keeps going and trades existing coverage for new coverage one file at
+    a time: total coverage is flat, and since eviction sheds the oldest
+    stamps first it spends the user's most recently used copies to
+    backfill photos they never asked for.
+    """
+    import config as cfg
+    from db import Database
+    from scanner import _extract_working_copies
+
+    monkeypatch.setattr(cfg, "CONFIG_PATH", str(tmp_path / "config.json"))
+    # ~700 KB per copy against a 1 MB ceiling: one new copy plus the
+    # pre-existing one is already over quota.
+    cfg.save({
+        **cfg.DEFAULTS,
+        "working_copy_max_size": 1000,
+        "working_copy_quality": 90,
+        "working_copy_cache_max_mb": 1,
+    })
+
+    folder = tmp_path / "photos"
+    folder.mkdir()
+    vireo_dir = tmp_path / "vireo"
+    vireo_dir.mkdir()
+    working_dir = vireo_dir / "working"
+    working_dir.mkdir()
+    db = Database(str(vireo_dir / "test.db"))
+    folder_id = db.add_folder(str(folder))
+
+    # Already covered, and the oldest file in the cache — first in line
+    # for eviction under an mtime-ordered quota pass.
+    covered_src = folder / "covered.jpg"
+    _make_noisy_jpeg(covered_src, 2000, 1500)
+    covered_id = _photo_id_of_file(db, folder_id, "covered.jpg", covered_src)
+    covered_copy = working_dir / f"{covered_id}.jpg"
+    _make_noisy_jpeg(covered_copy, 1000, 750)
+    os.utime(str(covered_copy), (1_000_000, 1_000_000))
+    db.conn.execute(
+        "UPDATE photos SET working_copy_path=? WHERE id=?",
+        (f"working/{covered_id}.jpg", covered_id),
+    )
+    db.conn.commit()
+
+    candidate_ids = []
+    for i in range(4):
+        src = folder / f"big-{i}.jpg"
+        _make_noisy_jpeg(src, 2000, 1500)
+        candidate_ids.append(
+            _photo_id_of_file(db, folder_id, f"big-{i}.jpg", src)
+        )
+
+    _extract_working_copies(db, str(vireo_dir))
+
+    generated = [
+        pid for pid in candidate_ids
+        if (working_dir / f"{pid}.jpg").exists()
+    ]
+    assert len(generated) == 1, (
+        "the batch must stand down as soon as enforcement reclaims a copy "
+        f"it did not write; it generated {len(generated)} of "
+        f"{len(candidate_ids)} candidates instead"
+    )
+
+    deferred = db.conn.execute(
+        "SELECT COUNT(*) FROM photos WHERE working_copy_path IS NULL"
+        " AND working_copy_evicted_mtime IS NOT NULL AND id IN "
+        f"({','.join('?' for _ in candidate_ids)})",
+        candidate_ids,
+    ).fetchone()[0]
+    assert deferred == len(candidate_ids) - len(generated), (
+        "every candidate the batch declined to process must be marked "
+        "capacity-deferred so the next launch does not re-decode it"
+    )
+    db.close()
+
+
+def test_scoped_scan_still_displaces_older_copies_to_cover_new_photos(
+    tmp_path, monkeypatch,
+):
+    """A scan/import of specific folders may rotate the cache.
+
+    The library-wide sweep stands down rather than trading existing
+    coverage for new coverage, but a scoped run is the shoot the user just
+    put on disk and is about to cull. Displacing the least recently used
+    old copy to make room for it is what the cache is for — standing down
+    here would leave a fresh import with no working copies at all.
+    """
+    import config as cfg
+    from db import Database
+    from scanner import _extract_working_copies
+
+    monkeypatch.setattr(cfg, "CONFIG_PATH", str(tmp_path / "config.json"))
+    cfg.save({
+        **cfg.DEFAULTS,
+        "working_copy_max_size": 1000,
+        "working_copy_quality": 90,
+        "working_copy_cache_max_mb": 1,
+    })
+
+    old_folder = tmp_path / "archive"
+    old_folder.mkdir()
+    new_folder = tmp_path / "todays-card"
+    new_folder.mkdir()
+    vireo_dir = tmp_path / "vireo"
+    vireo_dir.mkdir()
+    working_dir = vireo_dir / "working"
+    working_dir.mkdir()
+    db = Database(str(vireo_dir / "test.db"))
+    old_folder_id = db.add_folder(str(old_folder))
+    new_folder_id = db.add_folder(str(new_folder))
+
+    covered_src = old_folder / "covered.jpg"
+    _make_noisy_jpeg(covered_src, 2000, 1500)
+    covered_id = _photo_id_of_file(
+        db, old_folder_id, "covered.jpg", covered_src,
+    )
+    covered_copy = working_dir / f"{covered_id}.jpg"
+    _make_noisy_jpeg(covered_copy, 1000, 750)
+    os.utime(str(covered_copy), (1_000_000, 1_000_000))
+    db.conn.execute(
+        "UPDATE photos SET working_copy_path=? WHERE id=?",
+        (f"working/{covered_id}.jpg", covered_id),
+    )
+    db.conn.commit()
+
+    imported_ids = []
+    for i in range(3):
+        src = new_folder / f"new-{i}.jpg"
+        _make_noisy_jpeg(src, 2000, 1500)
+        imported_ids.append(
+            _photo_id_of_file(db, new_folder_id, f"new-{i}.jpg", src)
+        )
+
+    _extract_working_copies(db, str(vireo_dir), scope=[str(new_folder)])
+
+    generated = [
+        pid for pid in imported_ids
+        if (working_dir / f"{pid}.jpg").exists()
+    ]
+    assert len(generated) >= 2, (
+        "a scoped run must keep going after enforcement reclaims an older "
+        f"copy; it produced {len(generated)} of {len(imported_ids)} "
+        "candidates before standing down"
+    )
+    db.close()

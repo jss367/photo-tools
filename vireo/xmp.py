@@ -536,9 +536,11 @@ class SidecarEditor:
         except FileNotFoundError:
             pass
         except ET.ParseError:
+            # Its contents are unusable either way: a write replaces the file
+            # with a fresh tree, and a pruning operation leaves it alone.
             self._existed = True
             self._parse_failed = True
-            log.warning("Corrupt XMP file %s — creating new sidecar", path)
+            log.warning("Corrupt XMP file: %s", path)
         else:
             self._existed = True
             self._root = tree.getroot()
@@ -621,7 +623,8 @@ class SidecarEditor:
                         keep_exact=False):
         """Remove keywords from dc:subject and lr:hierarchicalSubject.
 
-        See ``remove_keywords`` for the ``hierarchical`` semantics.
+        See the module-level ``remove_keywords`` for the ``hierarchical``
+        semantics.
 
         ``keep_exact`` leaves an entry whose text is exactly one of
         ``keywords_to_remove`` in place, so only spelling variants are

@@ -1985,6 +1985,193 @@ def test_capacity_deferral_does_not_mark_reused_photo_id(
         db.close()
 
 
+def _prepare_capacity_deferral_db(tmp_path, monkeypatch):
+    """Shared setup for the capacity-deferral identity-guard regressions."""
+    import config as cfg
+    import scanner
+    from db import Database
+
+    monkeypatch.setattr(cfg, "CONFIG_PATH", str(tmp_path / "config.json"))
+    cfg.save({
+        **cfg.DEFAULTS,
+        "working_copy_max_size": 1000,
+        "working_copy_quality": 90,
+        "working_copy_cache_max_mb": 1,
+    })
+
+    folder = tmp_path / "photos"
+    folder.mkdir()
+    vireo_dir = tmp_path / "vireo"
+    vireo_dir.mkdir()
+    db = Database(str(vireo_dir / "test.db"))
+    folder_id = db.add_folder(str(folder))
+    photo_ids = []
+    for index in range(3):
+        source = folder / f"candidate-{index}.jpg"
+        _make_jpeg(str(source), 2000, 1500)
+        photo_ids.append(_photo_id_of_file(db, folder_id, source.name, source))
+
+    def sized_extract(_source, output, **_kwargs):
+        os.makedirs(os.path.dirname(output), exist_ok=True)
+        with open(output, "wb") as handle:
+            handle.truncate(600_000)
+        return True
+
+    monkeypatch.setattr(scanner, "extract_working_copy", sized_extract)
+    return db, vireo_dir, folder_id, photo_ids
+
+
+def test_capacity_deferral_rejects_companion_swap_on_pending_row(
+    tmp_path, monkeypatch,
+):
+    """A companion re-pair on a pending row must not stamp its evicted marker.
+
+    Regression for a P2 codex review finding on PR #1607: the capacity-
+    deferral UPDATE guarded only ``id/folder_id/filename/file_size/file_mtime``,
+    matching the same four primary columns ``_snapshot_row_still_current``
+    treats as insufficient. When a scan re-pairs a deferred row with a
+    different companion between the batch's snapshot and its capacity stop,
+    the id-only guard still matches and stamps ``working_copy_evicted_mtime``
+    on the row's new extraction inputs — suppressing their backfill until
+    the quota or the primary mtime changes.
+    """
+    import scanner
+    import working_copy_cache
+
+    db, vireo_dir, _folder_id, photo_ids = _prepare_capacity_deferral_db(
+        tmp_path, monkeypatch,
+    )
+    try:
+        pending_id = photo_ids[0]
+        real_evict = working_copy_cache.evict_if_over_quota
+        eviction_calls = 0
+
+        def swap_companion_before_deferral(*args, **kwargs):
+            nonlocal eviction_calls
+            result = real_evict(*args, **kwargs)
+            eviction_calls += 1
+            if eviction_calls == 1:
+                db.conn.execute(
+                    "UPDATE photos SET companion_path='sibling.jpg'"
+                    " WHERE id=?",
+                    (pending_id,),
+                )
+                db.conn.commit()
+            return result
+
+        monkeypatch.setattr(
+            working_copy_cache,
+            "evict_if_over_quota",
+            swap_companion_before_deferral,
+        )
+
+        scanner._extract_working_copies(db, str(vireo_dir))
+
+        row = db.conn.execute(
+            "SELECT working_copy_evicted_mtime FROM photos WHERE id=?",
+            (pending_id,),
+        ).fetchone()
+        assert row["working_copy_evicted_mtime"] is None, (
+            "capacity-deferral UPDATE stamped an evicted marker on a row "
+            "whose companion_path changed during the batch; the marker now "
+            "suppresses the row's new-input backfill"
+        )
+    finally:
+        db.close()
+
+
+def test_capacity_deferral_rejects_folder_relocation_on_pending_row(
+    tmp_path, monkeypatch,
+):
+    """A folder relocation on a pending row must not stamp its evicted marker.
+
+    Regression for the same P2 finding: ``folders.path`` is half the
+    extraction source, and a relocated folder keeps its ``folder_id``.
+    Without a ``folders.path`` guard the deferred UPDATE still matches the
+    moved row and stamps ``working_copy_evicted_mtime`` on the new source
+    location's inputs.
+
+    Each photo lives in its own folder so relocating the pending row's
+    folder does not trip the pre-extraction revalidation on the other
+    candidates (which would skip them upstream and prevent the batch from
+    ever reaching the capacity-stop branch that fires the deferred UPDATE).
+    """
+    import config as cfg
+    import scanner
+    import working_copy_cache
+    from db import Database
+
+    monkeypatch.setattr(cfg, "CONFIG_PATH", str(tmp_path / "config.json"))
+    cfg.save({
+        **cfg.DEFAULTS,
+        "working_copy_max_size": 1000,
+        "working_copy_quality": 90,
+        "working_copy_cache_max_mb": 1,
+    })
+
+    vireo_dir = tmp_path / "vireo"
+    vireo_dir.mkdir()
+    db = Database(str(vireo_dir / "test.db"))
+    try:
+        photo_ids = []
+        folder_ids = []
+        for index in range(3):
+            per_photo_folder = tmp_path / f"photos-{index}"
+            per_photo_folder.mkdir()
+            source = per_photo_folder / f"candidate-{index}.jpg"
+            _make_jpeg(str(source), 2000, 1500)
+            folder_id = db.add_folder(str(per_photo_folder))
+            folder_ids.append(folder_id)
+            photo_ids.append(
+                _photo_id_of_file(db, folder_id, source.name, source)
+            )
+
+        def sized_extract(_source, output, **_kwargs):
+            os.makedirs(os.path.dirname(output), exist_ok=True)
+            with open(output, "wb") as handle:
+                handle.truncate(600_000)
+            return True
+
+        monkeypatch.setattr(scanner, "extract_working_copy", sized_extract)
+
+        pending_id = photo_ids[0]
+        pending_folder_id = folder_ids[0]
+        real_evict = working_copy_cache.evict_if_over_quota
+        eviction_calls = 0
+
+        def relocate_pending_folder_before_deferral(*args, **kwargs):
+            nonlocal eviction_calls
+            result = real_evict(*args, **kwargs)
+            eviction_calls += 1
+            if eviction_calls == 1:
+                db.conn.execute(
+                    "UPDATE folders SET path=? WHERE id=?",
+                    (str(tmp_path / "relocated"), pending_folder_id),
+                )
+                db.conn.commit()
+            return result
+
+        monkeypatch.setattr(
+            working_copy_cache,
+            "evict_if_over_quota",
+            relocate_pending_folder_before_deferral,
+        )
+
+        scanner._extract_working_copies(db, str(vireo_dir))
+
+        row = db.conn.execute(
+            "SELECT working_copy_evicted_mtime FROM photos WHERE id=?",
+            (pending_id,),
+        ).fetchone()
+        assert row["working_copy_evicted_mtime"] is None, (
+            "capacity-deferral UPDATE stamped an evicted marker on a row "
+            "whose folder path changed during the batch; the marker now "
+            "suppresses the row's new-input backfill"
+        )
+    finally:
+        db.close()
+
+
 def test_oversized_copy_does_not_defer_later_fitting_candidate(
     tmp_path, monkeypatch,
 ):

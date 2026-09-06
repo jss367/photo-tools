@@ -2406,6 +2406,13 @@ def _extract_working_copies(db, vireo_dir, progress_callback=None,
                     and sum(retained_new_files.values())
                     < refreshed_quota_bytes
                 ):
+                    # Same complete identity guard as the deferred write
+                    # above: a companion re-pair or folder relocation between
+                    # the deferred write and this undo must not cause the
+                    # undo to match — the marker on the row's *previous*
+                    # source identity is what we wrote, and the row now has
+                    # different extraction inputs whose backfill the marker
+                    # never suppressed.
                     deferred_marker_rows = [
                         (
                             row["id"], row["folder_id"], row["filename"],

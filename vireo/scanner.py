@@ -1546,6 +1546,15 @@ def _extract_working_copies(db, vireo_dir, progress_callback=None,
     # replaced our file between record time and guard acquisition survives
     # — the same identity check ``_evict_once`` and the orphan cleanup use.
     retained_new_identities = {}
+    # Parallel to ``retained_new_files``: {abs_path: source-identity dict}
+    # from the row snapshot at publish time. The post-loop trim's
+    # deferred-marker UPDATE uses this identity in its WHERE so a
+    # mid-batch companion re-pair or folder relocation cannot stamp
+    # ``working_copy_evicted_mtime`` on a row whose extraction inputs
+    # have since changed — the marker on the row's *previous* source
+    # identity is what we want, since the deleted rendition was
+    # generated from the previous state.
+    retained_new_snapshots = {}
     stop_after_current = False
 
     # Commit per row so the writer lock is released between iterations.
@@ -2114,6 +2123,11 @@ def _extract_working_copies(db, vireo_dir, progress_callback=None,
                 for path, identity in retained_new_identities.items()
                 if path in retained_new_files
             }
+            retained_new_snapshots = {
+                path: snapshot
+                for path, snapshot in retained_new_snapshots.items()
+                if path in retained_new_files
+            }
             removed_batch_files = (
                 retained_before_quota_lowering - set(retained_new_files)
             )
@@ -2150,6 +2164,23 @@ def _extract_working_copies(db, vireo_dir, progress_callback=None,
                         )
                     except OSError:
                         retained_new_identities[wc_abs] = None
+                # Snapshot the row's source identity too. The trim's
+                # deferred-marker UPDATE below uses this identity in
+                # its WHERE so a mid-batch companion re-pair or folder
+                # relocation doesn't stamp
+                # ``working_copy_evicted_mtime`` from the row's NEW
+                # source state (the deleted rendition was generated
+                # from the OLD state, so the marker would suppress
+                # regeneration until the primary mtime or the quota
+                # changes — a companion swap alone may never do so).
+                retained_new_snapshots[wc_abs] = {
+                    "folder_id": row["folder_id"],
+                    "filename": row["filename"],
+                    "companion_path": row["companion_path"],
+                    "file_size": row["file_size"],
+                    "file_mtime": row["file_mtime"],
+                    "folder_path": row["folder_path"],
+                }
 
             if new_bytes_since_enforce >= incremental_threshold:
                 retained_before_enforce = set(retained_new_files)
@@ -2196,6 +2227,11 @@ def _extract_working_copies(db, vireo_dir, progress_callback=None,
                 retained_new_identities = {
                     path: identity
                     for path, identity in retained_new_identities.items()
+                    if path in retained_new_files
+                }
+                retained_new_snapshots = {
+                    path: snapshot
+                    for path, snapshot in retained_new_snapshots.items()
                     if path in retained_new_files
                 }
                 # Once enforcement removes an earlier fitting rendition from
@@ -2462,7 +2498,7 @@ def _extract_working_copies(db, vireo_dir, progress_callback=None,
         except (ValueError, TypeError):
             return -1
 
-    trimmed_ids = []
+    trimmed = []
     if retained_new_files and quota_bytes > 0:
         batch_bytes = sum(retained_new_files.values())
         # Take the usage snapshot AND the quota re-read AND the trim
@@ -2587,12 +2623,19 @@ def _extract_working_copies(db, vireo_dir, progress_callback=None,
                             path, exc_info=True,
                         )
                         continue
+                    # Take the row snapshot BEFORE popping — used
+                    # below for the full source-identity guard on the
+                    # deferred-marker UPDATE.
+                    trimmed_snapshot = retained_new_snapshots.get(path)
                     retained_new_files.pop(path, None)
                     retained_new_identities.pop(path, None)
+                    retained_new_snapshots.pop(path, None)
                     batch_over -= size
-                    trimmed_ids.append(_wc_id_from_batch_path(path))
+                    trimmed.append(
+                        (_wc_id_from_batch_path(path), trimmed_snapshot),
+                    )
 
-                if trimmed_ids:
+                if trimmed:
                     # Mark the trimmed rows capacity-deferred, exactly
                     # like the candidates the batch never reached.
                     # Without this the rows come back as
@@ -2605,22 +2648,61 @@ def _extract_working_copies(db, vireo_dir, progress_callback=None,
                     # re-decode the same lowest-priority rows, and
                     # trim them again: the exact "decode a quota-sized
                     # batch only to evict it, and repeat indefinitely"
-                    # loop the deferred marker exists to prevent. The
-                    # ``id + path`` guard prevents stamping the marker
-                    # on a replacement row that reused the id and never
-                    # published this rendition, and is also what serves
-                    # the concurrent-publisher case above once we hold
-                    # the publication guard.
-                    db.conn.executemany(
-                        "UPDATE photos SET working_copy_path=NULL,"
-                        " working_copy_evicted_mtime=COALESCE(file_mtime, -1)"
-                        " WHERE id=? AND working_copy_path=?",
-                        [
-                            (photo_id, f"working/{photo_id}.jpg")
-                            for photo_id in trimmed_ids
-                            if photo_id >= 0
-                        ],
-                    )
+                    # loop the deferred marker exists to prevent.
+                    #
+                    # The full snapshot-identity guard (folder_id,
+                    # filename, companion_path, file_size, file_mtime,
+                    # folders.path) matches the success/deferred UPDATEs
+                    # elsewhere in this function: if a concurrent scan
+                    # changed the row's companion, folder path, size,
+                    # or source mtime between publish and this UPDATE,
+                    # the row's extraction inputs no longer match what
+                    # the deleted rendition was generated from, so the
+                    # marker (which is tied to the previous state)
+                    # must not land — otherwise the candidate predicate
+                    # suppresses regeneration for the row's NEW inputs
+                    # until quota or primary mtime changes (a companion
+                    # swap alone may never do so). ``working_copy_path
+                    # IS ?`` also matches the concurrent-publisher case
+                    # already covered by the identity-skip above.
+                    #
+                    # ``working_copy_evicted_mtime`` records the
+                    # snapshot's ``file_mtime`` — the mtime the
+                    # deleted rendition was generated from — so a
+                    # future source rewrite (a real content change)
+                    # clears the gate. Using the row's *current*
+                    # ``file_mtime`` would tie the marker to the new
+                    # state and a future ``file_mtime`` bump to the
+                    # snapshot value would fail to clear it.
+                    deferred_rows = [
+                        (
+                            snapshot["file_mtime"]
+                            if snapshot["file_mtime"] is not None
+                            else -1,
+                            photo_id,
+                            f"working/{photo_id}.jpg",
+                            snapshot["folder_id"],
+                            snapshot["filename"],
+                            snapshot["companion_path"],
+                            snapshot["file_size"],
+                            snapshot["file_mtime"],
+                            snapshot["folder_path"],
+                        )
+                        for photo_id, snapshot in trimmed
+                        if photo_id >= 0 and snapshot is not None
+                    ]
+                    if deferred_rows:
+                        db.conn.executemany(
+                            "UPDATE photos SET working_copy_path=NULL,"
+                            " working_copy_evicted_mtime=?"
+                            " WHERE id=? AND working_copy_path IS ?"
+                            " AND folder_id=? AND filename=?"
+                            " AND companion_path IS ?"
+                            " AND file_size IS ? AND file_mtime IS ?"
+                            " AND (SELECT path FROM folders"
+                            "        WHERE id = photos.folder_id) IS ?",
+                            deferred_rows,
+                        )
                     commit_with_retry(db.conn)
 
     # A scan/import may add a large batch at once. Enforce once after

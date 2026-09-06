@@ -4273,3 +4273,110 @@ def test_post_loop_trim_usage_snapshot_under_publication_guard(
         "cannibalize pre-existing coverage to reclaim the unaccounted "
         f"bytes: {stats_lock_states!r}"
     )
+
+
+def test_trim_deferred_marker_carries_snapshot_source_identity(
+    tmp_path, monkeypatch,
+):
+    """Trim's deferred-marker UPDATE must guard by snapshot identity.
+
+    Regression for a P2 codex finding on PR #1607 against ``6a5b39fd``.
+    When a concurrent scan changes a trimmed photo's ``companion_path``,
+    ``folders.path``, ``file_size``, or ``file_mtime`` between the
+    batch's publish and this UPDATE, the id + working_copy_path
+    predicate still matches. The trim then stamps
+    ``working_copy_evicted_mtime`` from the row's NEW source state,
+    even though the deleted rendition was generated from the OLD
+    state. ``_working_copy_candidate_predicate`` then suppresses
+    regeneration for the row's new inputs until the primary mtime or
+    quota changes — a companion re-pair or folder relocation alone
+    may never do so.
+
+    Setup: 10 candidates at 110 KB each, batch trims the lowest-id
+    one. Swap that row's ``companion_path`` between the publish and
+    the trim (via a hook on ``os.remove``, which runs inside the trim
+    for the target file). With the fix, the UPDATE's companion-guard
+    doesn't match the mutated row, no marker lands, and the row is
+    still a backfill candidate.
+    """
+    import config as cfg
+    from db import Database
+    from scanner import _extract_working_copies
+
+    monkeypatch.setattr(cfg, "CONFIG_PATH", str(tmp_path / "config.json"))
+    cfg.save({
+        **cfg.DEFAULTS,
+        "working_copy_max_size": 1000,
+        "working_copy_quality": 90,
+        "working_copy_cache_max_mb": 1,
+    })
+
+    folder = tmp_path / "photos"
+    folder.mkdir()
+    vireo_dir = tmp_path / "vireo"
+    vireo_dir.mkdir()
+    working_dir = vireo_dir / "working"
+    working_dir.mkdir()
+    db = Database(str(vireo_dir / "test.db"))
+    folder_id = db.add_folder(str(folder))
+
+    imported_ids = []
+    for i in range(10):
+        src = folder / f"photo-{i:02d}.jpg"
+        _make_jpeg(str(src), 2000, 1500)
+        imported_ids.append(
+            _photo_id_of_file(db, folder_id, f"photo-{i:02d}.jpg", src)
+        )
+    lowest_id = min(imported_ids)
+    db.conn.close()
+
+    import scanner as _scanner_mod
+
+    def fixed_extract(_source, output, **_kwargs):
+        with open(output, "wb") as handle:
+            handle.truncate(110 * 1024)
+        return True
+
+    monkeypatch.setattr(_scanner_mod, "extract_working_copy", fixed_extract)
+
+    # Swap the lowest-id row's ``companion_path`` right when the trim
+    # is about to unlink its file — that's a mid-trim mutation, so
+    # the deferred-marker UPDATE that follows sees a different row.
+    target_path_str = str(working_dir / f"{lowest_id}.jpg")
+    real_remove = os.remove
+    mutated = {"done": False}
+
+    def remove_then_swap(path):
+        result = real_remove(path)
+        if not mutated["done"] and os.fspath(path) == target_path_str:
+            mutated["done"] = True
+            db_mid = Database(str(vireo_dir / "test.db"))
+            db_mid.conn.execute(
+                "UPDATE photos SET companion_path='sibling.jpg' "
+                "WHERE id=?", (lowest_id,),
+            )
+            db_mid.conn.commit()
+            db_mid.conn.close()
+        return result
+
+    monkeypatch.setattr(_scanner_mod.os, "remove", remove_then_swap)
+
+    verify_db = Database(str(vireo_dir / "test.db"))
+    _extract_working_copies(verify_db, str(vireo_dir))
+
+    row = verify_db.conn.execute(
+        "SELECT working_copy_evicted_mtime, companion_path"
+        " FROM photos WHERE id=?", (lowest_id,),
+    ).fetchone()
+    verify_db.conn.close()
+
+    assert row["companion_path"] == "sibling.jpg", (
+        "test setup: companion swap did not stick"
+    )
+    assert row["working_copy_evicted_mtime"] is None, (
+        "trim stamped a capacity-deferred marker on a row whose "
+        "companion changed between publish and trim; the marker on "
+        "the new source state would suppress regeneration for the "
+        "row's new extraction inputs until the primary mtime or "
+        "quota changes"
+    )

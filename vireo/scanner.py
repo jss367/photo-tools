@@ -1849,8 +1849,42 @@ def _extract_working_copies(db, vireo_dir, progress_callback=None,
             # catalog commit so eviction can never leave a non-NULL path
             # pointing at bytes it removed before this job committed.
             with working_copy_publication_guard():
+                # Existence check first, then a fingerprint check
+                # against the identity captured INSIDE extract's guard
+                # (via ``on_publish``). ``extract_working_copy``
+                # releases its guard before returning, so a stale
+                # extractor for a deleted-and-recycled id can atomically
+                # overwrite ``wc_abs`` between that release and this
+                # reacquire: the file exists, but its bytes are theirs,
+                # not ours. Committing ``working_copy_path=wc_rel`` in
+                # the UPDATE below would attach the stale extractor's
+                # pixels to this (current) row — the same class of harm
+                # the orphan cleanup already guards for the rowcount==0
+                # path, applied here to the success path too.
+                fingerprint_mismatched = False
                 if not os.path.isfile(wc_abs):
                     publication_lost = True
+                else:
+                    published_identity = (
+                        captured_wc_identity[-1]
+                        if captured_wc_identity
+                        else None
+                    )
+                    if published_identity is not None:
+                        try:
+                            current_identity = _wc_file_identity(
+                                os.stat(wc_abs)
+                            )
+                        except OSError:
+                            current_identity = None
+                        if (
+                            current_identity is None
+                            or current_identity != published_identity
+                        ):
+                            fingerprint_mismatched = True
+                            publication_lost = True
+                if publication_lost:
+                    pass
                 else:
                     # A settings request can lower the quota and finish its
                     # one-time eviction while this slow extraction is still
@@ -1993,34 +2027,58 @@ def _extract_working_copies(db, vireo_dir, progress_callback=None,
                         " LIMIT 1",
                         (wc_rel,),
                     ).fetchone() is not None
-                    if file_still_ours and not row_owned_by_replacement:
+                    if file_still_ours:
+                        # Our captured fingerprint matches the current
+                        # bytes on disk. Two cases collapse into the
+                        # same action:
+                        #
+                        # * No row claims ``wc_rel`` — the bytes are an
+                        #   orphan from a deleted photo; unlink cleanly.
+                        # * A replacement row DID commit ``wc_rel``
+                        #   (``row_owned_by_replacement``) — that
+                        #   means WE atomically overwrote THEIR valid
+                        #   file with our stale bytes (we lost the id
+                        #   race but our extract kept running and
+                        #   published anyway). Preserving the file
+                        #   here would leave the replacement row
+                        #   serving OUR stale pixels indefinitely.
+                        #   Unlink so ``_evict_once``'s
+                        #   ``stale_tracked_ids`` reconciles the
+                        #   replacement's row on its next pass and its
+                        #   own next request re-backfills.
                         try:
                             os.remove(wc_abs)
                         except FileNotFoundError:
                             pass
                         except OSError:
-                            # Quota eviction will reclaim the bytes on a later
-                            # pass; log so a persistently unremovable file (a
-                            # locked or read-only cache dir) is visible rather
-                            # than silently accumulating.
+                            # Quota eviction will reclaim the bytes on
+                            # a later pass; log so a persistently
+                            # unremovable file (a locked or read-only
+                            # cache dir) is visible rather than
+                            # silently accumulating.
                             log.warning(
-                                "Could not remove the orphaned working copy at "
-                                "%s", wc_abs, exc_info=True,
+                                "Could not remove the orphaned working "
+                                "copy at %s",
+                                wc_abs, exc_info=True,
                             )
                         log.info(
-                            "Discarding orphaned working-copy output for "
-                            "photo %s: row identity changed during extraction "
-                            "(deleted or reused for a new import); removed %s",
-                            row["id"], wc_abs,
+                            "Discarding orphaned working-copy output "
+                            "for photo %s: row identity changed during "
+                            "extraction; removed %s "
+                            "(row_owned_by_replacement=%s — replacement "
+                            "row will re-backfill after next quota "
+                            "reconciliation)",
+                            row["id"], wc_abs, row_owned_by_replacement,
                         )
                     else:
                         log.info(
-                            "Discarding orphaned working-copy UPDATE for "
-                            "photo %s: row identity changed during "
-                            "extraction, but the canonical file at %s was "
-                            "replaced by another publisher (file_still_ours=%s,"
-                            " row_owned_by_replacement=%s); leaving their "
-                            "bytes intact",
+                            "Discarding orphaned working-copy UPDATE "
+                            "for photo %s: row identity changed during "
+                            "extraction, and the canonical file at %s "
+                            "was atomically replaced by another "
+                            "publisher (file_still_ours=%s, "
+                            "row_owned_by_replacement=%s); leaving "
+                            "their bytes intact",
                             row["id"], wc_abs, file_still_ours,
                             row_owned_by_replacement,
                         )
@@ -2095,11 +2153,22 @@ def _extract_working_copies(db, vireo_dir, progress_callback=None,
             commit_with_retry(db.conn)
 
         if publication_lost:
-            log.info(
-                "Working copy for photo %s was evicted before its catalog "
-                "commit; leaving the eviction marker intact",
-                row["id"],
-            )
+            if fingerprint_mismatched:
+                log.info(
+                    "Working copy for photo %s was atomically replaced by "
+                    "a stale extractor (or a competing publisher) between "
+                    "our publish and this catalog commit; the bytes at "
+                    "%s do not match the fingerprint captured under "
+                    "extract's guard. Leaving their bytes intact and "
+                    "skipping this row's UPDATE",
+                    row["id"], wc_abs,
+                )
+            else:
+                log.info(
+                    "Working copy for photo %s was evicted before its "
+                    "catalog commit; leaving the eviction marker intact",
+                    row["id"],
+                )
             _emit_working_copy_progress(i)
             continue
 

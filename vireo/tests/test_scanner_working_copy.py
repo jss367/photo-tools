@@ -4687,3 +4687,206 @@ def test_trim_revalidation_rejects_candidates_without_publisher_fingerprint(
         "candidate passes until the primary mtime or the quota "
         f"changes: marker={dict(marker) if marker else None!r}"
     )
+
+
+def test_success_update_rejects_stale_overwrite_before_commit(
+    tmp_path, monkeypatch,
+):
+    """The success UPDATE must reject a fingerprint mismatch.
+
+    Regression for a P1 codex finding on PR #1607 against ``36a179f7``.
+    ``extract_working_copy`` releases its guard before returning; a
+    stale extractor for a deleted-and-recycled id can atomically
+    overwrite ``wc_abs`` between that release and the scanner's guard
+    reacquire (~scanner.py:1851). The prior code checked only
+    ``os.path.isfile(wc_abs)`` before running the success UPDATE — so
+    the file existed and the row's identity guard matched (row is
+    current, ``working_copy_path IS NULL``), and the UPDATE committed
+    ``working_copy_path=wc_rel`` while the bytes on disk belonged to
+    the stale extractor. The current row would then serve pixels
+    generated for the previous owner of the reused id.
+
+    Fix adds a fingerprint check between the isfile and the UPDATE:
+    if ``captured_wc_identity[-1]`` does not match the current bytes'
+    identity, treat as ``publication_lost`` and skip the UPDATE.
+
+    Setup: gate ``extract_working_copy`` to hold after publishing, then
+    atomically replace ``wc_abs`` with a competing publisher's payload
+    before releasing the gate; assert the row's ``working_copy_path``
+    is still NULL after the run.
+    """
+    import threading
+
+    import scanner
+
+    app, vireo_dir, ids = _prepare_backfill_app(
+        tmp_path, monkeypatch, ["target.jpg"],
+    )
+    target_id = ids[0]
+
+    real_extract = scanner.extract_working_copy
+    extract_returned = threading.Event()
+    release_after_race = threading.Event()
+
+    def gated_extract(*args, **kwargs):
+        result = real_extract(*args, **kwargs)
+        extract_returned.set()
+        assert release_after_race.wait(timeout=30), (
+            "test never released post-extract"
+        )
+        return result
+
+    monkeypatch.setattr(scanner, "extract_working_copy", gated_extract)
+
+    app._kickoff_working_copy_backfill()
+    assert extract_returned.wait(timeout=30), "extraction never returned"
+
+    # Atomically replace ``wc_abs`` with a stale extractor's bytes.
+    # The row identity is UNCHANGED — this is not the id-reuse case
+    # covered by the orphan cleanup; it's the plain "someone else
+    # atomically overwrote our published bytes" race the isfile check
+    # alone doesn't catch.
+    wc_abs = vireo_dir / "working" / f"{target_id}.jpg"
+    stale_bytes = b"STALE-EXTRACTOR-BYTES-DIFFERENT-FROM-OURS" * 40
+    tmp_replace = wc_abs.parent / f".{target_id}.stale.jpg.tmp"
+    tmp_replace.write_bytes(stale_bytes)
+    os.replace(str(tmp_replace), str(wc_abs))
+
+    release_after_race.set()
+    job = _wait_for_backfill_terminal(app._job_runner)
+    assert job["status"] == "completed", f"job: {job}"
+
+    from db import Database
+    db_path = app.config["DB_PATH"]
+    verify_db = Database(db_path)
+    row = verify_db.conn.execute(
+        "SELECT working_copy_path FROM photos WHERE id=?",
+        (target_id,),
+    ).fetchone()
+    verify_db.conn.close()
+
+    assert row is not None, "target row disappeared during the run"
+    assert row["working_copy_path"] is None, (
+        "the success UPDATE committed ``working_copy_path=wc_rel`` "
+        "even though the bytes on disk were atomically replaced by a "
+        "stale extractor between our publish and the reacquire — the "
+        "row would now serve the stale extractor's pixels: "
+        f"working_copy_path={row['working_copy_path']!r}"
+    )
+
+
+def test_orphan_cleanup_unlinks_stale_bytes_over_replacement_row(
+    tmp_path, monkeypatch,
+):
+    """Orphan cleanup must unlink stale bytes even when a replacement row claims the path.
+
+    Regression for a P1 codex finding on PR #1607 against ``36a179f7``.
+    Reverse ordering of the id-reuse race the earlier fix covered:
+
+    * Row_A extractor starts.
+    * Row_A is deleted and its id reused for Row_B; Row_B publishes
+      its own bytes and commits ``working_copy_path=wc_rel`` FIRST.
+    * Row_A extractor finishes and atomically overwrites ``wc_abs``
+      with Row_A's now-stale bytes.
+    * Row_A extractor reacquires guard. Row_A's identity guard
+      doesn't match Row_B, so the success UPDATE rowcount is 0 →
+      orphan cleanup runs.
+    * ``file_still_ours`` = True (captured Row_A identity matches
+      the current Row_A bytes on disk — we really did publish
+      them). ``row_owned_by_replacement`` = True (Row_B claims
+      ``wc_rel``).
+
+    Prior code guarded ``os.remove`` on
+    ``file_still_ours and not row_owned_by_replacement`` — so it
+    preserved the file. Row_B's row then permanently served Row_A's
+    stale pixels: eviction's identity check wouldn't flag it (the
+    file is a valid file, just not the intended content), and only a
+    manual delete or a source-mtime bump on Row_B would trigger
+    regeneration.
+
+    Fix drops the ``not row_owned_by_replacement`` clause: whenever
+    the current bytes are our (Row_A's stale) bytes, unlink them.
+    ``_evict_once``'s ``stale_tracked_ids`` reconciles Row_B on its
+    next pass and Row_B's next request re-backfills.
+    """
+    import threading
+
+    import scanner
+
+    app, vireo_dir, ids = _prepare_backfill_app(
+        tmp_path, monkeypatch, ["target.jpg"],
+    )
+    target_id = ids[0]
+
+    real_extract = scanner.extract_working_copy
+    extract_returned = threading.Event()
+    release_after_race = threading.Event()
+
+    def gated_extract(*args, **kwargs):
+        result = real_extract(*args, **kwargs)
+        extract_returned.set()
+        assert release_after_race.wait(timeout=30), (
+            "test never released post-extract"
+        )
+        return result
+
+    monkeypatch.setattr(scanner, "extract_working_copy", gated_extract)
+
+    app._kickoff_working_copy_backfill()
+    assert extract_returned.wait(timeout=30), "extraction never returned"
+
+    # Simulate: id reuse (Row_B replaces Row_A) AND Row_B has
+    # already committed its ``working_copy_path=wc_rel``. The bytes
+    # on disk right now are Row_A's real publication (from
+    # ``gated_extract``'s inner ``real_extract`` call) — playing the
+    # role of "Row_A extractor's stale bytes that overwrote Row_B's
+    # file". That mirrors the reverse-ordering scenario exactly.
+    from db import Database
+    db_path = app.config["DB_PATH"]
+    admin_db = Database(db_path)
+    target_row = admin_db.conn.execute(
+        "SELECT p.folder_id, f.path AS folder_path"
+        " FROM photos p JOIN folders f ON f.id=p.folder_id"
+        " WHERE p.id=?",
+        (target_id,),
+    ).fetchone()
+    folder_id = target_row["folder_id"]
+    photos_dir = target_row["folder_path"]
+    admin_db.conn.execute("DELETE FROM photos WHERE id=?", (target_id,))
+    admin_db.conn.commit()
+
+    replacement_src = os.path.join(photos_dir, "replacement.jpg")
+    _make_jpeg(replacement_src, 1600, 1200)
+    new_id = admin_db.add_photo(
+        folder_id, "replacement.jpg", ".jpg",
+        file_size=os.path.getsize(replacement_src),
+        file_mtime=os.path.getmtime(replacement_src),
+        width=1600, height=1200,
+    )
+    assert new_id == target_id, (
+        f"id reuse setup failed: {new_id} != {target_id}"
+    )
+    admin_db.conn.execute(
+        "UPDATE photos SET working_copy_path=? WHERE id=?",
+        (f"working/{new_id}.jpg", new_id),
+    )
+    admin_db.conn.commit()
+    admin_db.conn.close()
+
+    wc_abs = vireo_dir / "working" / f"{target_id}.jpg"
+
+    release_after_race.set()
+    job = _wait_for_backfill_terminal(app._job_runner)
+    assert job["status"] == "completed", f"job: {job}"
+
+    assert not wc_abs.exists(), (
+        "orphan cleanup preserved the stale (Row_A) extractor's "
+        "bytes even though a replacement row (Row_B) had committed "
+        "``working_copy_path=wc_rel``. Row_B would now permanently "
+        "serve Row_A's pixels — its captured identity matches a "
+        "valid file, so eviction's identity check would not catch "
+        "the content mismatch. Only unlinking these stale bytes lets "
+        "``_evict_once``'s ``stale_tracked_ids`` reconcile Row_B on "
+        "its next pass and Row_B's next request re-backfill: "
+        f"wc_abs still contains {wc_abs.stat().st_size} bytes"
+    )

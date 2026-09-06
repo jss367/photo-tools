@@ -4275,6 +4275,139 @@ def test_post_loop_trim_usage_snapshot_under_publication_guard(
     )
 
 
+def test_post_loop_trim_revalidates_batch_bytes_under_publication_guard(
+    tmp_path, monkeypatch,
+):
+    """Trim must recompute ``batch_bytes`` under the guard.
+
+    Regression for a P2 codex review finding on PR #1607 against
+    ``e2329a6``: ``batch_bytes`` was summed from ``retained_new_files``
+    BEFORE ``working_copy_publication_guard`` was acquired. If a
+    competing publisher (on-demand render, id reuse, ``_evict_once``)
+    removed one of the batch's files between publish and this trim,
+    the stale ``batch_bytes`` still counted its size. Meanwhile the
+    guarded ``existing_bytes`` snapshot correctly saw the reduced disk
+    footprint. ``batch_over`` then reported a phantom overshoot and
+    the trim deleted a second, still-present batch file — and stamped
+    its row capacity-deferred for no reason.
+
+    Setup: 10 candidates at 110 KB each, quota 1 MB. Just before the
+    trim acquires its publication guard, remove the lowest-id batch
+    file (the trim's first sort target) to simulate a competing
+    publisher's reclaim. With the fix, the guarded revalidation
+    detects the missing file, drops it from ``retained_new_files``,
+    recomputes ``batch_bytes`` at 990 KB, and the trim declines to act
+    — the second-lowest-id file survives and its row keeps
+    ``working_copy_evicted_mtime IS NULL``. Without the fix, the trim
+    unlinks the second file and stamps it capacity-deferred.
+    """
+    from contextlib import contextmanager
+
+    import config as cfg
+    from db import Database
+    from scanner import _extract_working_copies
+
+    monkeypatch.setattr(cfg, "CONFIG_PATH", str(tmp_path / "config.json"))
+    cfg.save({
+        **cfg.DEFAULTS,
+        "working_copy_max_size": 1000,
+        "working_copy_quality": 90,
+        "working_copy_cache_max_mb": 1,
+    })
+
+    folder = tmp_path / "photos"
+    folder.mkdir()
+    vireo_dir = tmp_path / "vireo"
+    vireo_dir.mkdir()
+    working_dir = vireo_dir / "working"
+    working_dir.mkdir()
+    db = Database(str(vireo_dir / "test.db"))
+    folder_id = db.add_folder(str(folder))
+
+    imported_ids = []
+    for i in range(10):
+        src = folder / f"photo-{i:02d}.jpg"
+        _make_jpeg(str(src), 2000, 1500)
+        imported_ids.append(
+            _photo_id_of_file(db, folder_id, f"photo-{i:02d}.jpg", src)
+        )
+    sorted_ids = sorted(imported_ids)
+    lowest_id = sorted_ids[0]
+    second_lowest_id = sorted_ids[1]
+
+    import scanner as _scanner_mod
+
+    batch_writes = {"count": 0, "expected": len(imported_ids)}
+
+    def counting_extract(_source, output, **_kwargs):
+        with open(output, "wb") as handle:
+            handle.truncate(110 * 1024)
+        batch_writes["count"] += 1
+        return True
+
+    monkeypatch.setattr(
+        _scanner_mod, "extract_working_copy", counting_extract,
+    )
+
+    # Simulate a competing publisher reclaiming the lowest-id batch
+    # file between publish and the post-loop trim's guard acquisition.
+    # ``working_copy_publication_guard`` is entered many times inside
+    # ``_extract_working_copies`` (each extract's publish, mid-batch
+    # enforcement); gate on ``batch_writes["count"] >= expected`` so
+    # only the FIRST post-batch guard entry — the trim — triggers the
+    # reclaim. Patch the guard on ``working_copy_cache`` because the
+    # scanner imports it at function-call time from that module.
+    import working_copy_cache as _wc_cache
+    real_guard = _wc_cache.working_copy_publication_guard
+    reclaim = {"done": False}
+    target_path = str(working_dir / f"{lowest_id}.jpg")
+
+    @contextmanager
+    def guard_with_reclaim():
+        if (
+            not reclaim["done"]
+            and batch_writes["count"] >= batch_writes["expected"]
+        ):
+            try:
+                os.remove(target_path)
+            except OSError:
+                pass
+            reclaim["done"] = True
+        with real_guard():
+            yield
+
+    monkeypatch.setattr(
+        _wc_cache, "working_copy_publication_guard", guard_with_reclaim,
+    )
+
+    _extract_working_copies(db, str(vireo_dir))
+
+    assert reclaim["done"], (
+        "test scaffold never fired the reclaim — the trim never "
+        "acquired ``working_copy_publication_guard`` after the batch "
+        "loop completed, so the regression is not exercised"
+    )
+
+    survivor = working_dir / f"{second_lowest_id}.jpg"
+    assert survivor.exists(), (
+        "trim deleted a second surviving batch file even though the "
+        "cache was already under quota — a stale ``batch_bytes`` "
+        "computed outside the publication guard inflated "
+        "``batch_over`` by the reclaimed file's bytes"
+    )
+
+    row = db.conn.execute(
+        "SELECT working_copy_evicted_mtime FROM photos WHERE id=?",
+        (second_lowest_id,),
+    ).fetchone()
+    assert row is not None and row[0] is None, (
+        "second-lowest-id row was capacity-deferred by the trim's "
+        "phantom overshoot — the deferred marker suppresses backfill "
+        "until quota or primary mtime changes"
+    )
+    db.close()
+
+
 def test_trim_deferred_marker_carries_snapshot_source_identity(
     tmp_path, monkeypatch,
 ):

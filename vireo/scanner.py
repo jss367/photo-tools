@@ -2500,14 +2500,14 @@ def _extract_working_copies(db, vireo_dir, progress_callback=None,
 
     trimmed = []
     if retained_new_files and quota_bytes > 0:
-        batch_bytes = sum(retained_new_files.values())
-        # Take the usage snapshot AND the quota re-read AND the trim
-        # decision all under ``working_copy_publication_guard``. Every
-        # concurrent path that touches the cache — on-demand
-        # publishers, quota eviction, ``_settings_post_save_side_
-        # effects`` — takes that same lock, so holding it here makes
-        # the (existing_bytes, quota_bytes, batch_over) triple atomic
-        # with those concurrent mutations.
+        # Take the retained-files revalidation, the usage snapshot,
+        # the quota re-read, and the trim decision all under
+        # ``working_copy_publication_guard``. Every concurrent path
+        # that touches the cache — on-demand publishers, quota
+        # eviction, ``_settings_post_save_side_effects`` — takes that
+        # same lock, so holding it here makes the (retained,
+        # existing_bytes, quota_bytes, batch_over) tuple atomic with
+        # those concurrent mutations.
         #
         # Without this: an on-demand render publishing after an
         # unguarded ``working_copy_stats`` but before the guard
@@ -2521,6 +2521,37 @@ def _extract_working_copies(db, vireo_dir, progress_callback=None,
             _file_identity as _trim_file_identity,
         )
         with working_copy_publication_guard():
+            # Revalidate ``retained_new_files`` under the guard before
+            # deriving ``batch_bytes``. Between publish and this trim,
+            # a competing publisher (on-demand render, id reuse,
+            # ``_evict_once``) can remove or atomically replace a
+            # canonical path we recorded. Counting those stale bytes
+            # inflates ``batch_over`` — e.g. ten 110 KB files against
+            # a 1 MB quota, one already reclaimed elsewhere: the
+            # stale sum still reads 1.1 MB, ``existing_bytes``
+            # (measured under the same guard) has shed the 110 KB,
+            # so ``batch_over`` reports a phantom 100 KB and the
+            # trim deletes a second surviving output and marks its
+            # row capacity-deferred for no reason. Dropping stale
+            # entries first keeps ``batch_bytes`` in sync with the
+            # same atomic filesystem snapshot ``working_copy_stats``
+            # is about to take.
+            for stale_path in list(retained_new_files):
+                expected_identity = retained_new_identities.get(stale_path)
+                try:
+                    current_identity = _trim_file_identity(
+                        os.stat(stale_path)
+                    )
+                except OSError:
+                    current_identity = None
+                if current_identity is None or (
+                    expected_identity is not None
+                    and current_identity != expected_identity
+                ):
+                    retained_new_files.pop(stale_path, None)
+                    retained_new_identities.pop(stale_path, None)
+                    retained_new_snapshots.pop(stale_path, None)
+            batch_bytes = sum(retained_new_files.values())
             existing_bytes = 0
             if scope is None:
                 # Measure what was already cached before this batch.

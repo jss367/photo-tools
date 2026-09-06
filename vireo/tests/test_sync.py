@@ -1082,11 +1082,13 @@ def test_sync_result_reports_partial_failure_to_the_job_layer(tmp_path, monkeypa
     pid, _ = _setup_photo_with_xmp(tmp_path, db)
     db.queue_change(pid, 'keyword_add', 'Test')
 
-    def refuse(*args, **kwargs):
+    def refuse(tree, xmp_path):
         raise PermissionError(13, "Permission denied")
 
-    monkeypatch.setattr(xmp_module, "write_sidecar", refuse)
-    monkeypatch.setattr("sync.write_sidecar", refuse)
+    # Fail where the NAS actually failed: publishing the tree. Patching a
+    # single writer would miss a sync that batches its mutations into one
+    # publish.
+    monkeypatch.setattr(xmp_module, "_write_tree_atomic", refuse)
 
     result = sync_to_xmp(db)
     assert result["synced"] == 0
@@ -1144,11 +1146,10 @@ def test_sync_failure_reason_ignores_per_photo_filename(tmp_path, monkeypatch):
         db.queue_change(pid, 'keyword_add', 'Test')
         pids.append(pid)
 
-    def refuse_with_filename(xmp_path, *args, **kwargs):
+    def refuse_with_filename(tree, xmp_path):
         raise PermissionError(13, "Permission denied", xmp_path)
 
-    monkeypatch.setattr(xmp_module, "write_sidecar", refuse_with_filename)
-    monkeypatch.setattr("sync.write_sidecar", refuse_with_filename)
+    monkeypatch.setattr(xmp_module, "_write_tree_atomic", refuse_with_filename)
 
     result = sync_to_xmp(db)
 
@@ -1275,3 +1276,416 @@ def test_sync_panel_cancelled_summary_includes_failures():
     # And the colour must switch to danger so the summary is not read as an
     # ordinary user-requested cancellation.
     assert "var(--danger)" in cancelled
+
+
+# ── One publish per sidecar, in parallel ────────────────────────────────
+
+def _count_publishes(monkeypatch):
+    """Record every sidecar publish, delegating to the real writer."""
+    import xmp as xmp_module
+
+    published = []
+    original = xmp_module._write_tree_atomic
+
+    def counting(tree, xmp_path):
+        published.append(str(xmp_path))
+        return original(tree, xmp_path)
+
+    monkeypatch.setattr(xmp_module, "_write_tree_atomic", counting)
+    return published
+
+
+def test_sync_publishes_each_sidecar_once(tmp_path, monkeypatch):
+    """Every change type a photo queued lands in a single publish.
+
+    Each writer used to parse and republish the sidecar on its own, so a
+    photo with keywords, a flag and a rating paid the full temp-file /
+    fsync / ACL-copy / rename cost three times. On an SMB-mounted NAS that
+    is most of the runtime.
+    """
+    import config as cfg
+    from db import Database
+    from sync import sync_to_xmp
+    from xmp import read_keywords, read_sync_preview_metadata
+
+    monkeypatch.setattr(cfg, "CONFIG_PATH", str(tmp_path / "config.json"))
+    cfg.save({"sync_flags_to_xmp": True})
+
+    db = Database(str(tmp_path / "test.db"))
+    db.set_active_workspace(db.ensure_default_workspace())
+    pid, xmp_path = _setup_photo_with_xmp(tmp_path, db, keywords={"Wildlife"})
+    db.queue_change(pid, "keyword_add", "Osprey")
+    db.queue_change(pid, "keyword_remove", "Wildlife")
+    db.queue_change(pid, "rating", "4")
+    db.queue_change(pid, "flag", "flagged")
+
+    published = _count_publishes(monkeypatch)
+    result = sync_to_xmp(db)
+
+    assert result["synced"] == 1
+    assert published == [str(xmp_path)]
+    # And the single published tree carries every queued change.
+    assert read_keywords(xmp_path) == {"Osprey"}
+    metadata = read_sync_preview_metadata(xmp_path)
+    assert metadata["rating"] == "4"
+    assert metadata["flag"] == "flagged"
+    assert db.get_pending_changes() == []
+
+
+def test_sync_skips_publishing_an_already_correct_sidecar(tmp_path, monkeypatch):
+    """Re-queuing metadata the sidecar already carries costs a read, not a write."""
+    from db import Database
+    from sync import sync_to_xmp
+
+    db = Database(str(tmp_path / "test.db"))
+    db.set_active_workspace(db.ensure_default_workspace())
+    pid, xmp_path = _setup_photo_with_xmp(tmp_path, db, keywords={"Osprey"})
+    db.queue_change(pid, "keyword_add", "Osprey")
+    db.queue_change(pid, "rating", "3")
+    assert sync_to_xmp(db)["synced"] == 1
+
+    before = os.path.getmtime(xmp_path)
+    db.queue_change(pid, "keyword_add", "Osprey")
+    db.queue_change(pid, "rating", "3")
+
+    published = _count_publishes(monkeypatch)
+    result = sync_to_xmp(db)
+
+    # The change is still retired -- the sidecar already says what it asks for.
+    assert result["synced"] == 1
+    assert result["failed"] == 0
+    assert published == []
+    assert os.path.getmtime(xmp_path) == before
+    assert db.get_pending_changes() == []
+
+
+def test_sync_writes_independent_sidecars_concurrently(tmp_path):
+    """Two photos in different folders are published at the same time.
+
+    Sidecar writes are network-latency bound, so the run must overlap them.
+    The barrier only clears when two writers are inside the publish at once;
+    a serial loop leaves each waiting alone until it times out.
+    """
+    import threading
+
+    import xmp as xmp_module
+    from db import Database
+    from sync import sync_to_xmp
+
+    db = Database(str(tmp_path / "test.db"))
+    db.set_active_workspace(db.ensure_default_workspace())
+    for i in range(2):
+        pid, _ = _setup_photo_with_xmp(tmp_path / f"lot{i}", db)
+        db.queue_change(pid, "keyword_add", "Osprey")
+
+    barrier = threading.Barrier(2, timeout=30)
+    original = xmp_module._write_tree_atomic
+
+    def publish_together(tree, xmp_path):
+        barrier.wait()
+        return original(tree, xmp_path)
+
+    xmp_module._write_tree_atomic = publish_together
+    try:
+        result = sync_to_xmp(db)
+    finally:
+        xmp_module._write_tree_atomic = original
+
+    assert result["failed"] == 0, result["errors"]
+    assert result["synced"] == 2
+
+
+def test_sync_keeps_photos_sharing_a_sidecar_on_one_writer(tmp_path):
+    """A RAW and a JPEG share one .xmp; their changes must not clobber.
+
+    Both photos resolve to ``bird.xmp``. Published in parallel, each would
+    load the pre-change tree and the loser's keyword would vanish.
+    """
+    from db import Database
+    from sync import sync_to_xmp
+    from xmp import read_keywords
+
+    db = Database(str(tmp_path / "test.db"))
+    db.set_active_workspace(db.ensure_default_workspace())
+    jpeg_id, xmp_path = _setup_photo_with_xmp(tmp_path, db)
+    folder_id = db.get_photo(jpeg_id)["folder_id"]
+    raw_id = db.add_photo(folder_id=folder_id, filename="bird.nef",
+                          extension=".nef", file_size=100, file_mtime=1.0)
+    db.queue_change(jpeg_id, "keyword_add", "Osprey")
+    db.queue_change(raw_id, "keyword_add", "Kestrel")
+
+    result = sync_to_xmp(db)
+
+    assert result["synced"] == 2
+    assert read_keywords(xmp_path) == {"Osprey", "Kestrel"}
+
+
+def test_sync_resolves_paths_once_per_run_and_folder(tmp_path, monkeypatch):
+    """Path resolution and the offline-folder probe scale with folders, not photos.
+
+    Resolving a sidecar per photo re-ran the recursive folder-tree CTE and a
+    full photo-detail SELECT every time, and probed the same folder once per
+    photo -- a network round trip each on a NAS.
+    """
+    from db import Database
+    from sync import sync_to_xmp
+
+    db = Database(str(tmp_path / "test.db"))
+    db.set_active_workspace(db.ensure_default_workspace())
+    pid, _ = _setup_photo_with_xmp(tmp_path, db)
+    folder_id = db.get_photo(pid)["folder_id"]
+    db.queue_change(pid, "keyword_add", "Osprey")
+    for i in range(4):
+        sibling = db.add_photo(folder_id=folder_id, filename=f"more{i}.jpg",
+                               extension=".jpg", file_size=100, file_mtime=1.0)
+        db.queue_change(sibling, "keyword_add", "Osprey")
+
+    tree_calls = []
+    original_tree = db.get_folder_tree
+    monkeypatch.setattr(
+        db, "get_folder_tree",
+        lambda: (tree_calls.append(1), original_tree())[1],
+    )
+    isdir_calls = []
+    original_isdir = os.path.isdir
+    monkeypatch.setattr(
+        os.path, "isdir",
+        lambda path: (isdir_calls.append(path), original_isdir(path))[1],
+    )
+
+    result = sync_to_xmp(db)
+
+    assert result["synced"] == 5
+    assert len(tree_calls) == 1
+    assert len([p for p in isdir_calls if str(tmp_path) in str(p)]) == 1
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="symlink creation needs elevation")
+def test_sync_serializes_photos_reached_through_folder_alias(tmp_path):
+    """A folder symlink and its target resolve to one sidecar, on one worker.
+
+    Two photos in two folder rows that ``realpath``-collapse to the same
+    directory used to hash to different ``by_sidecar`` keys, so parallel
+    workers parsed one .xmp, mutated it, and each atomically rewrote it --
+    the last writer's tree won and the other photo's keyword vanished even
+    though both changes were reported synced.
+    """
+    from db import Database
+    from sync import sync_to_xmp
+    from xmp import read_keywords
+
+    db = Database(str(tmp_path / "test.db"))
+    db.set_active_workspace(db.ensure_default_workspace())
+    jpeg_id, xmp_path = _setup_photo_with_xmp(tmp_path, db)
+    real_folder = os.path.dirname(xmp_path)
+    alias_folder = str(tmp_path / "alias")
+    os.symlink(real_folder, alias_folder)
+    alias_fid = db.add_folder(alias_folder, name="alias")
+    raw_id = db.add_photo(
+        folder_id=alias_fid, filename="bird.nef", extension=".nef",
+        file_size=100, file_mtime=1.0,
+    )
+    db.queue_change(jpeg_id, "keyword_add", "Osprey")
+    db.queue_change(raw_id, "keyword_add", "Kestrel")
+
+    result = sync_to_xmp(db)
+
+    assert result["synced"] == 2, result["errors"]
+    assert read_keywords(xmp_path) == {"Osprey", "Kestrel"}
+
+
+def test_sync_serializes_case_variant_sidecars_without_merging_them(tmp_path):
+    """Case-variant sidecar paths share a worker but keep their own files.
+
+    ``Bird.CR3`` and ``BIRD.JPG`` in one folder derive sidecar paths ending in
+    ``Bird.xmp`` and ``BIRD.xmp`` -- distinct strings, but the same file on
+    APFS, SMB and NTFS. They must never be published in parallel, or one
+    photo's tree overwrites the other's while both report synced.
+
+    Both properties are asserted without depending on the host filesystem's
+    case behaviour, because that is exactly what the code no longer probes:
+    the two writes must land on one worker thread, and each photo's keyword
+    must reach the path that photo names. On a case-insensitive host those
+    two paths are one file holding both keywords; on a case-sensitive host
+    they are two files holding one each. Either way nothing is lost and
+    nothing is written into the wrong sidecar.
+    """
+    import threading
+
+    import xmp as xmp_module
+    from db import Database
+    from sync import sync_to_xmp
+    from xmp import read_keywords, write_sidecar
+
+    db = Database(str(tmp_path / "test.db"))
+    db.set_active_workspace(db.ensure_default_workspace())
+    a_id, xmp_path = _setup_photo_with_xmp(tmp_path, db)
+    folder = os.path.dirname(xmp_path)
+    folder_id = db.get_photo(a_id)["folder_id"]
+    # Rename the sidecar and the photo so it looks like the mixed-case source.
+    mixed_path = os.path.join(folder, "Bird.xmp")
+    os.rename(xmp_path, mixed_path)
+    db.conn.execute(
+        "UPDATE photos SET filename = ?, extension = ? WHERE id = ?",
+        ("Bird.CR3", ".CR3", a_id),
+    )
+    b_id = db.add_photo(
+        folder_id=folder_id, filename="BIRD.JPG", extension=".JPG",
+        file_size=100, file_mtime=1.0,
+    )
+    upper_path = os.path.join(folder, "BIRD.xmp")
+    write_sidecar(upper_path, flat_keywords=set(), hierarchical_keywords=set())
+    db.queue_change(a_id, "keyword_add", "Osprey")
+    db.queue_change(b_id, "keyword_add", "Kestrel")
+
+    threads = []
+    original = xmp_module._write_tree_atomic
+
+    def record_thread(tree, path):
+        threads.append(threading.current_thread().name)
+        return original(tree, path)
+
+    xmp_module._write_tree_atomic = record_thread
+    try:
+        result = sync_to_xmp(db)
+    finally:
+        xmp_module._write_tree_atomic = original
+
+    assert result["synced"] == 2, result["errors"]
+    # One group means one worker: the publishes cannot have overlapped.
+    assert len(set(threads)) == 1, threads
+    # And each photo's change reached the path that photo names.
+    assert "Osprey" in read_keywords(mixed_path)
+    assert "Kestrel" in read_keywords(upper_path)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="symlink creation needs elevation")
+def test_sync_serializes_photos_whose_sidecars_are_symlinked_together(tmp_path):
+    """A sidecar that is a symlink to another photo's sidecar is one file.
+
+    These two paths differ in basename, so grouping puts them in different
+    buckets and the pool runs them concurrently -- but ``_write_tree_atomic``
+    resolves the link before replacing, so both publish over the same file.
+    Without the per-target lock each editor parses the pre-change tree and
+    the last writer discards the other photo's keyword while both report
+    synced.
+    """
+    import time
+
+    import xmp as xmp_module
+    from db import Database
+    from sync import sync_to_xmp
+    from xmp import read_keywords
+
+    db = Database(str(tmp_path / "test.db"))
+    db.set_active_workspace(db.ensure_default_workspace())
+    target_id, target_xmp = _setup_photo_with_xmp(tmp_path, db)
+    folder = os.path.dirname(target_xmp)
+    folder_id = db.get_photo(target_id)["folder_id"]
+    link_id = db.add_photo(folder_id=folder_id, filename="hawk.jpg",
+                           extension=".jpg", file_size=100, file_mtime=1.0)
+    os.symlink(target_xmp, os.path.join(folder, "hawk.xmp"))
+
+    db.queue_change(target_id, "keyword_add", "Osprey")
+    db.queue_change(link_id, "keyword_add", "Kestrel")
+
+    # Widen the window between parse and publish so an unserialized run
+    # would reliably lose one of the two keywords.
+    original = xmp_module._write_tree_atomic
+
+    def slow_publish(tree, path):
+        time.sleep(0.05)
+        return original(tree, path)
+
+    xmp_module._write_tree_atomic = slow_publish
+    try:
+        result = sync_to_xmp(db)
+    finally:
+        xmp_module._write_tree_atomic = original
+
+    assert result["synced"] == 2, result["errors"]
+    assert read_keywords(target_xmp) == {"Osprey", "Kestrel"}
+
+
+def test_sync_reports_a_malformed_queue_row_without_aborting_the_run(tmp_path):
+    """One unplannable photo fails alone; the rest of the run still writes.
+
+    ``_plan_photo_sync`` calls ``int(value)`` for a rating, and the schema
+    permits a NULL or non-numeric value. Planning moved out of the per-photo
+    try when the writes were hoisted onto a pool, which let one legacy row
+    abort every other photo's sidecar.
+    """
+    from db import Database
+    from sync import sync_to_xmp
+    from xmp import read_keywords
+
+    db = Database(str(tmp_path / "test.db"))
+    db.set_active_workspace(db.ensure_default_workspace())
+    bad_id, _ = _setup_photo_with_xmp(tmp_path / "bad", db)
+    good_id, good_xmp = _setup_photo_with_xmp(tmp_path / "good", db)
+    db.queue_change(bad_id, "rating", "not-a-number")
+    db.queue_change(good_id, "keyword_add", "Osprey")
+
+    result = sync_to_xmp(db)
+
+    assert result["synced"] == 1
+    assert result["failed"] == 1
+    assert result["ok"] is False
+    assert result["failures"][0]["photo_id"] == bad_id
+    assert read_keywords(good_xmp) == {"Osprey"}
+    # The good photo's row is retired; the malformed one stays queued.
+    assert [c["photo_id"] for c in db.get_pending_changes()] == [bad_id]
+
+
+def test_sync_serializes_folder_rows_that_differ_only_in_case(tmp_path):
+    """Two folder rows spelled differently in case are one directory.
+
+    A share mounted case-insensitively can be catalogued twice --
+    ``/mnt/Photos`` and ``/mnt/PHOTOS`` -- and ``realpath`` preserves each
+    spelling while ``normcase`` does nothing off Windows, so folding only the
+    basename left the two spellings in separate groups holding separate
+    locks. Their photos could then publish over the same sidecar at once.
+    """
+    import threading
+
+    import xmp as xmp_module
+    from db import Database
+    from sync import sync_to_xmp
+    from xmp import read_keywords, write_sidecar
+
+    db = Database(str(tmp_path / "test.db"))
+    db.set_active_workspace(db.ensure_default_workspace())
+    a_id, xmp_a = _setup_photo_with_xmp(tmp_path, db)
+    lower_folder = os.path.dirname(xmp_a)
+    upper_folder = os.path.join(os.path.dirname(lower_folder), "PHOTOS")
+    # The same directory on a case-insensitive host, a sibling on a
+    # case-sensitive one; either way the two rows must share a worker.
+    os.makedirs(upper_folder, exist_ok=True)
+    upper_fid = db.add_folder(upper_folder, name="PHOTOS")
+    # Same basename as the photo in the lower-case row, so the two sidecar
+    # paths differ only in the folder's spelling.
+    b_id = db.add_photo(folder_id=upper_fid, filename="bird.nef",
+                        extension=".nef", file_size=100, file_mtime=1.0)
+    xmp_b = os.path.join(upper_folder, "bird.xmp")
+    write_sidecar(xmp_b, flat_keywords=set(), hierarchical_keywords=set())
+
+    db.queue_change(a_id, "keyword_add", "Osprey")
+    db.queue_change(b_id, "keyword_add", "Kestrel")
+
+    threads = []
+    original = xmp_module._write_tree_atomic
+
+    def record_thread(tree, path):
+        threads.append(threading.current_thread().name)
+        return original(tree, path)
+
+    xmp_module._write_tree_atomic = record_thread
+    try:
+        result = sync_to_xmp(db)
+    finally:
+        xmp_module._write_tree_atomic = original
+
+    assert result["synced"] == 2, result["errors"]
+    assert len(set(threads)) == 1, threads
+    assert "Osprey" in read_keywords(xmp_a)
+    assert "Kestrel" in read_keywords(xmp_b)

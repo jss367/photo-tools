@@ -2,34 +2,42 @@
 
 import logging
 import os
+import threading
 from collections import Counter, defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 
 from db import KEYWORD_SOURCE_UNKNOWN
 from keyword_normalization import keyword_match_key
-from xmp import (
-    read_keywords,
-    remove_keywords,
-    remove_vireo_gps_location,
-    write_edit_recipe,
-    write_gps_location,
-    write_pick_flag,
-    write_rating,
-    write_sidecar,
-)
+from xmp import SidecarEditor, read_keywords
 
 log = logging.getLogger(__name__)
 
+# Publishing a sidecar is network-latency bound -- temp-file create, fsync,
+# ACL and xattr copy, rename -- not CPU bound, so writes to different files
+# overlap almost perfectly. Eight keeps a NAS busy without flooding an SMB
+# connection's request queue, and the GIL is released for every one of those
+# syscalls.
+_SYNC_MAX_WORKERS = 8
 
-def _get_xmp_path_for_photo(db, photo_id):
-    """Determine the XMP sidecar path for a photo."""
-    photo = db.get_photo(photo_id)
-    if not photo:
-        return None
+
+def _resolve_xmp_paths(db, photo_ids):
+    """Map photo ids to sidecar paths with two queries instead of 2N.
+
+    Resolving one photo at a time ran the recursive folder-tree CTE and a
+    full photo-detail SELECT per photo; ``sync_from_xmp`` already hoists the
+    folder map. Photos whose row no longer exists are absent from the result,
+    which is how the caller detects them. A photo whose folder is not in the
+    active workspace keeps the historical behaviour of resolving against an
+    empty folder path, so it fails the accessibility check rather than
+    silently writing somewhere else.
+    """
     folders = {f["id"]: f["path"] for f in db.get_folder_tree()}
-    folder_path = folders.get(photo["folder_id"], "")
-    base = os.path.splitext(photo["filename"])[0]
-    return os.path.join(folder_path, base + ".xmp")
+    paths = {}
+    for photo_id, (folder_id, filename) in db.get_photo_filenames(photo_ids).items():
+        base = os.path.splitext(filename)[0]
+        paths[photo_id] = os.path.join(folders.get(folder_id, ""), base + ".xmp")
+    return paths
 
 
 def _sync_flags_to_xmp_enabled(db):
@@ -143,7 +151,7 @@ def _plan_photo_sync(photo_changes, sync_flags, sync_locations):
     return plan
 
 
-def _remove_planned_keywords(xmp_path, plan):
+def _remove_planned_keywords(editor, plan):
     """Strip sidecar keywords the plan removes or is about to re-add.
 
     Removals run BEFORE additions. remove_keywords() compares by normalized
@@ -153,7 +161,7 @@ def _remove_planned_keywords(xmp_path, plan):
     for the same photo would then have its newly-written clean entry stripped
     along with the old quoted one, clearing pending changes and leaving the
     sidecar without the keyword. Applying the remove first strips only the
-    pre-existing quoted variant; the subsequent write_sidecar then adds the
+    pre-existing quoted variant; the subsequent add_keywords then writes the
     clean spelling.
 
     Removals are split by whether they're paired with an add for the same
@@ -174,64 +182,83 @@ def _remove_planned_keywords(xmp_path, plan):
         }
         solo_removes = plan.keywords_to_remove - paired_removes
         if solo_removes:
-            remove_keywords(xmp_path, solo_removes)
+            editor.remove_keywords(solo_removes)
         # Merge repair-queued flat-only removes with the rename-paired flat
         # removes: both take exactly the ``hierarchical=False`` code path.
         flat_removes = paired_removes | plan.keywords_to_remove_flat
         if flat_removes:
-            remove_keywords(xmp_path, flat_removes, hierarchical=False)
+            editor.remove_keywords(flat_removes, hierarchical=False)
 
     # Strip any sidecar dc:subject entry that normalizes to a keyword we're
-    # about to add. write_sidecar() dedupes with an exact-string set
+    # about to add. add_keywords() dedupes with an exact-string set
     # difference, so a pure keyword_add for `apapane` against a legacy
     # sidecar `‘apapane` would append a second <rdf:li>. Canonicalizing
-    # first collapses variants into the clean spelling that write_sidecar
-    # writes next. Use the flat-only mode: a hierarchical remove (which
-    # drops any entry whose segment matches) would delete unrelated
-    # hierarchies such as `Animals|Birds|Hawk` when we add flat `Birds`.
+    # first collapses variants into the clean spelling written next. Use the
+    # flat-only mode: a hierarchical remove (which drops any entry whose
+    # segment matches) would delete unrelated hierarchies such as
+    # `Animals|Birds|Hawk` when we add flat `Birds`. ``keep_exact`` leaves an
+    # entry that is already the clean spelling alone, so re-syncing a sidecar
+    # that already carries the keyword stays a no-op instead of deleting and
+    # re-appending the same text.
     if plan.keywords_to_add:
-        remove_keywords(xmp_path, plan.keywords_to_add, hierarchical=False)
-
-
-def _write_photo_sync(db, photo_id, xmp_path, plan):
-    """Apply a ``_PhotoSyncPlan`` to the photo's sidecar, in dependency order."""
-    _remove_planned_keywords(xmp_path, plan)
-
-    # Write keyword additions after removals so a same-photo remove+add
-    # pair does not race (see _remove_planned_keywords).
-    if plan.keywords_to_add:
-        write_sidecar(
-            xmp_path, flat_keywords=plan.keywords_to_add, hierarchical_keywords=set()
+        editor.remove_keywords(
+            plan.keywords_to_add, hierarchical=False, keep_exact=True,
         )
 
-    # Write flag before rating: write_pick_flag creates a sidecar if needed,
-    # while write_rating intentionally only updates existing sidecars.
+
+def _write_photo_sync(xmp_path, plan, assigned_location=None):
+    """Apply a ``_PhotoSyncPlan`` to the photo's sidecar, in dependency order.
+
+    Every mutation lands in one ``SidecarEditor``, so the sidecar is parsed
+    once and republished once no matter how many change types the photo
+    queued. The ordering below still matters: it decides what the single
+    published tree contains.
+
+    ``assigned_location`` is passed in rather than looked up here because the
+    writers run on a pool thread and the SQLite connection belongs to the
+    caller's thread.
+    """
+    editor = SidecarEditor(xmp_path)
+    _remove_planned_keywords(editor, plan)
+
+    # Apply keyword additions after removals so a same-photo remove+add
+    # pair does not cancel out (see _remove_planned_keywords).
+    if plan.keywords_to_add:
+        editor.add_keywords(
+            flat_keywords=plan.keywords_to_add, hierarchical_keywords=set()
+        )
+
+    # Apply the flag before the rating: a flag creates a sidecar if needed,
+    # while a rating intentionally only updates existing ones.
     if plan.flag is not None:
-        write_pick_flag(xmp_path, plan.flag)
+        editor.set_pick_flag(plan.flag)
 
     if plan.sync_location:
-        loc = db.get_assigned_photo_location(photo_id)
+        loc = assigned_location
         if loc and loc.get("latitude") is not None and loc.get("longitude") is not None:
-            write_gps_location(
-                xmp_path,
+            editor.set_gps_location(
                 loc["latitude"],
                 loc["longitude"],
                 source=loc.get("source") or "assigned",
             )
         else:
-            remove_vireo_gps_location(xmp_path)
+            editor.remove_vireo_gps_location()
     elif plan.cleanup_location:
-        remove_vireo_gps_location(xmp_path)
+        editor.remove_vireo_gps_location()
 
     if plan.edit_recipe_json is not None:
-        write_edit_recipe(xmp_path, plan.edit_recipe_json)
+        editor.set_edit_recipe(plan.edit_recipe_json)
 
-    # Write rating after every operation that can create a sidecar. Rating
-    # alone intentionally remains a no-op for missing XMP, but a selected
-    # keyword, flag, location, or edit write should make the same-photo
-    # rating persist rather than silently clear it.
+    # Apply the rating after every operation that can create a sidecar.
+    # Rating alone intentionally remains a no-op for missing XMP, but a
+    # selected keyword, flag, location, or edit write should make the
+    # same-photo rating persist rather than silently clear it.
     if plan.rating is not None:
-        write_rating(xmp_path, plan.rating)
+        editor.set_rating(plan.rating)
+
+    # One publish for the whole photo. Nothing is written when no mutation
+    # changed anything -- re-syncing an already-correct sidecar costs a read.
+    editor.commit()
 
 
 # How many distinct failure reasons a sync reports up to the job layer. A NAS
@@ -316,52 +343,201 @@ def sync_to_xmp(db, progress_callback=None, change_ids=None):
 
     sync_flags = _sync_flags_to_xmp_enabled(db)
     sync_locations = _write_assigned_location_to_xmp_enabled(db)
-    synced = 0
-    failures = []
-    synced_ids = []
 
-    total = len(by_photo)
-    for i, (photo_id, photo_changes) in enumerate(by_photo.items()):
-        xmp_path = _get_xmp_path_for_photo(db, photo_id)
+    # Everything that needs the database happens here, on the caller's
+    # thread: the sidecar writers below run on a pool and must not touch the
+    # connection.
+    xmp_paths = _resolve_xmp_paths(db, list(by_photo))
+    prepare_failures = {}
+    plans = {}
+    folder_accessible = {}
+    canonical_folders = {}
+    for photo_id, photo_changes in by_photo.items():
+        xmp_path = xmp_paths.get(photo_id)
         if not xmp_path:
-            failures.append({"photo_id": photo_id, "error": "photo not found in DB"})
+            prepare_failures[photo_id] = {
+                "photo_id": photo_id, "error": "photo not found in DB",
+            }
             continue
 
-        # Check if the folder exists (NAS might be offline)
+        # Check if the folder exists (NAS might be offline). Cache the answer
+        # per folder: on a slow or offline mount this is a network round trip,
+        # and a folder holds thousands of photos. Resolve symlinks here too so
+        # the sidecar grouping below sees one canonical folder per folder
+        # rather than one syscall per photo.
         folder = os.path.dirname(xmp_path)
-        if not os.path.isdir(folder):
-            failures.append({
+        if folder not in folder_accessible:
+            folder_accessible[folder] = os.path.isdir(folder)
+            if folder_accessible[folder]:
+                try:
+                    canonical_folders[folder] = os.path.realpath(folder)
+                except OSError:
+                    canonical_folders[folder] = folder
+        if not folder_accessible[folder]:
+            prepare_failures[photo_id] = {
                 "photo_id": photo_id,
                 "error": f"folder not accessible: {folder}",
                 # Strip the per-folder path so many photos on an offline NAS
                 # summarise as one cause instead of one per subfolder.
                 "reason": "folder not accessible",
-            })
+            }
             continue
 
         try:
-            plan = _plan_photo_sync(photo_changes, sync_flags, sync_locations)
-            _write_photo_sync(db, photo_id, xmp_path, plan)
+            plans[photo_id] = _plan_photo_sync(
+                photo_changes, sync_flags, sync_locations,
+            )
         except Exception as e:
-            failures.append({
+            # A malformed queue row -- a rating whose value is NULL or not an
+            # integer, which the schema permits -- must fail its own photo, as
+            # it did when planning ran inside the per-photo try, rather than
+            # abort every other photo's write.
+            prepare_failures[photo_id] = {
                 "photo_id": photo_id,
                 "error": str(e),
                 "reason": _failure_reason(e),
-            })
-            log.warning("Failed to sync photo %d: %s", photo_id, e)
-        else:
-            if plan.supported_ids:
-                synced += 1
-                synced_ids.extend(plan.supported_ids)
-            for c in plan.unsupported_changes:
-                failures.append({
-                    "photo_id": photo_id,
-                    "change_id": c["id"],
-                    "error": f"unsupported change type: {c['change_type']}",
-                })
+            }
 
-        if progress_callback:
-            progress_callback(i + 1, total)
+    locations = {}
+    if sync_locations:
+        for photo_id, plan in list(plans.items()):
+            if not plan.sync_location:
+                continue
+            try:
+                locations[photo_id] = db.get_assigned_photo_location(photo_id)
+            except Exception as e:
+                # Historically this lookup ran inside the per-photo try, so a
+                # photo the workspace can no longer see failed alone rather
+                # than aborting the run.
+                del plans[photo_id]
+                prepare_failures[photo_id] = {
+                    "photo_id": photo_id,
+                    "error": str(e),
+                    "reason": _failure_reason(e),
+                }
+
+    # Group photos that may share a sidecar, so no two threads publish the
+    # same file: a RAW and a JPEG with one basename share one .xmp, and
+    # aliases spell the same file differently -- a folder reached through a
+    # symlink, or components differing only in case on APFS/SMB/NTFS. The key
+    # is the realpath'd folder joined to the basename, then case-folded whole:
+    # ``realpath`` preserves the spelling of every component and ``normcase``
+    # only lowercases on Windows, so folding the basename alone would leave
+    # two folder rows spelled ``/mnt/Photos`` and ``/mnt/PHOTOS`` in separate
+    # groups even though the share treats them as one directory.
+    #
+    # Grouping decides ordering only; each photo is still written through its
+    # own path. That makes an over-grouping harmless: two names a
+    # case-sensitive filesystem keeps distinct (`Masse.xmp` / `Maße.xmp`,
+    # which case-fold alike) are written to their own files, one after the
+    # other, instead of in parallel. Deciding instead to keep one path per
+    # group would silently write one photo's metadata into the other's
+    # sidecar, and knowing which case applies would mean probing the
+    # filesystem's case sensitivity -- a heuristic that is wrong for any
+    # mount whose in-mount path components carry no letters, and an extra
+    # round trip per folder on the NAS this loop exists to keep fast.
+    by_sidecar = defaultdict(list)
+    for photo_id in plans:
+        xmp_path = xmp_paths[photo_id]
+        canonical_folder = canonical_folders.get(
+            os.path.dirname(xmp_path), os.path.dirname(xmp_path),
+        )
+        canonical_key = os.path.normcase(
+            os.path.join(canonical_folder, os.path.basename(xmp_path))
+        ).casefold()
+        by_sidecar[canonical_key].append((photo_id, xmp_path))
+
+    sidecar_locks = {}
+    sidecar_locks_guard = threading.Lock()
+
+    def lock_for(xmp_path):
+        """Return the lock guarding whatever file ``xmp_path`` resolves to.
+
+        Grouping keys on the folder and basename, which catches the aliases
+        that arise from the catalog itself -- a RAW and a JPEG, case variants,
+        a symlinked folder. It cannot catch a sidecar path that is itself a
+        symlink to a different photo's sidecar: those basenames differ, so the
+        two land in different groups and run on different workers, while
+        ``_write_tree_atomic`` resolves the link and replaces the same file.
+        Resolving here costs nothing the publish was not already paying (it
+        resolves too) and it happens on the pool thread, not in the serial
+        prepare loop. The key is case-folded for the same reason the group key
+        is: ``realpath`` keeps each component's spelling, so two case
+        spellings of one directory would otherwise take different locks.
+        """
+        key = os.path.normcase(os.path.realpath(xmp_path)).casefold()
+        with sidecar_locks_guard:
+            lock = sidecar_locks.get(key)
+            if lock is None:
+                lock = sidecar_locks[key] = threading.Lock()
+        return lock
+
+    def write_sidecar_group(canonical_key):
+        """Write every photo queued against one sidecar; never raises."""
+        outcomes = {}
+        for photo_id, xmp_path in by_sidecar[canonical_key]:
+            try:
+                # One lock at a time and never nested, so no worker can
+                # deadlock against another.
+                with lock_for(xmp_path):
+                    _write_photo_sync(
+                        xmp_path, plans[photo_id], locations.get(photo_id),
+                    )
+            except Exception as e:  # recorded per photo, as before
+                outcomes[photo_id] = e
+            else:
+                outcomes[photo_id] = None
+        return outcomes
+
+    results = {}
+    total = len(by_photo)
+    # Photos that failed preparation are finished work: an offline NAS
+    # otherwise leaves the panel reading "0 of 2,240" while the run walks
+    # through every one of them.
+    completed = len(prepare_failures)
+    if progress_callback and completed:
+        progress_callback(completed, total)
+    if by_sidecar:
+        workers = min(_SYNC_MAX_WORKERS, len(by_sidecar))
+        with ThreadPoolExecutor(
+            max_workers=workers, thread_name_prefix="xmp-sync",
+        ) as pool:
+            futures = [pool.submit(write_sidecar_group, p) for p in by_sidecar]
+            for future in as_completed(futures):
+                outcomes = future.result()
+                results.update(outcomes)
+                completed += len(outcomes)
+                if progress_callback:
+                    progress_callback(completed, total)
+
+    # Report in queue order regardless of the order the pool finished in.
+    synced = 0
+    failures = []
+    synced_ids = []
+    for photo_id in by_photo:
+        if photo_id in prepare_failures:
+            failures.append(prepare_failures[photo_id])
+        plan = plans.get(photo_id)
+        if plan is None:
+            continue
+        error = results.get(photo_id)
+        if error is not None:
+            failures.append({
+                "photo_id": photo_id,
+                "error": str(error),
+                "reason": _failure_reason(error),
+            })
+            log.warning("Failed to sync photo %d: %s", photo_id, error)
+            continue
+        if plan.supported_ids:
+            synced += 1
+            synced_ids.extend(plan.supported_ids)
+        for c in plan.unsupported_changes:
+            failures.append({
+                "photo_id": photo_id,
+                "change_id": c["id"],
+                "error": f"unsupported change type: {c['change_type']}",
+            })
 
     # Clear successfully synced changes
     if synced_ids:

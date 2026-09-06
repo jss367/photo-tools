@@ -980,11 +980,11 @@ def _sync_preview_change_creates_sidecar(
 ):
     """Mirror sync operations that create a missing XMP sidecar before rating.
 
-    Matches the write order in ``sync.py``: ``write_sidecar`` (keyword_add),
-    ``write_pick_flag`` when flag sync is enabled, ``write_gps_location``
+    Matches the write order in ``sync.py``: ``add_keywords`` (keyword_add),
+    ``set_pick_flag`` when flag sync is enabled, ``set_gps_location``
     when location sync is enabled and the linked location has valid
-    coordinates, and ``write_edit_recipe`` with a non-empty payload all
-    create a missing sidecar via ``_load_or_create_xmp``. ``write_rating``
+    coordinates, and ``set_edit_recipe`` with a non-empty payload all
+    create a missing sidecar through ``SidecarEditor``. ``set_rating``
     and the ``remove_*`` paths do not, so they are excluded.
     """
     change_type = change["change_type"]

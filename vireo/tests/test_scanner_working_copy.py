@@ -1489,6 +1489,93 @@ def test_startup_backfill_skips_row_when_id_reused_during_pause(
     )
 
 
+def test_snapshot_revalidation_covers_relocation_repair_and_publish(
+    tmp_path, monkeypatch,
+):
+    """The precheck rejects every snapshot value the extraction loop trusts.
+
+    The four identity columns are not enough. The loop also dereferences the
+    folder's path (source = ``folder_path + filename``, and a relocated
+    folder keeps its ``folder_id``, so the identity-guarded failure UPDATE
+    would happily stamp a spurious failure marker) and ``companion_path``
+    (the second extraction source). And it only has work to do while
+    ``working_copy_path`` is NULL, which is what the candidate predicate
+    selected on.
+    """
+    import config as cfg
+    from db import Database
+    from scanner import _snapshot_row_still_current
+
+    monkeypatch.setattr(cfg, "CONFIG_PATH", str(tmp_path / "config.json"))
+    folder = tmp_path / "photos"
+    folder.mkdir()
+    vireo_dir = tmp_path / "vireo"
+    vireo_dir.mkdir()
+    db = Database(str(vireo_dir / "test.db"))
+    folder_id = db.add_folder(str(folder))
+    src = folder / "a.jpg"
+    _make_jpeg(str(src), 2000, 1500)
+    photo_id = _photo_id_of_file(db, folder_id, "a.jpg", src)
+
+    def snapshot():
+        return db.conn.execute(
+            """
+            SELECT p.id, p.folder_id, p.filename, p.companion_path,
+                   p.file_size, p.file_mtime, f.path AS folder_path
+              FROM photos p JOIN folders f ON f.id = p.folder_id
+             WHERE p.id = ?
+            """,
+            (photo_id,),
+        ).fetchone()
+
+    row = snapshot()
+    assert _snapshot_row_still_current(db, row) is True
+
+    for label, sql, params in (
+        ("folder relocated (same folder_id, new path)",
+         "UPDATE folders SET path=? WHERE id=?",
+         (str(tmp_path / "moved"), folder_id)),
+        ("re-paired with a different companion JPEG",
+         "UPDATE photos SET companion_path=? WHERE id=?",
+         ("a.jpg", photo_id)),
+        ("already published by another writer",
+         "UPDATE photos SET working_copy_path=? WHERE id=?",
+         (f"working/{photo_id}.jpg", photo_id)),
+        ("filename changed",
+         "UPDATE photos SET filename=? WHERE id=?", ("b.jpg", photo_id)),
+        ("file_size changed",
+         "UPDATE photos SET file_size=? WHERE id=?", (12345, photo_id)),
+        ("file_mtime changed",
+         "UPDATE photos SET file_mtime=? WHERE id=?", (1.0, photo_id)),
+    ):
+        before = snapshot()
+        db.conn.execute(sql, params)
+        db.conn.commit()
+        assert _snapshot_row_still_current(db, row) is False, (
+            f"revalidation accepted a stale snapshot after: {label}"
+        )
+        # Restore so each case is exercised in isolation.
+        db.conn.execute(
+            "UPDATE folders SET path=? WHERE id=?",
+            (before["folder_path"], folder_id),
+        )
+        db.conn.execute(
+            "UPDATE photos SET companion_path=?, working_copy_path=NULL,"
+            " filename=?, file_size=?, file_mtime=? WHERE id=?",
+            (before["companion_path"], before["filename"],
+             before["file_size"], before["file_mtime"], photo_id),
+        )
+        db.conn.commit()
+        assert _snapshot_row_still_current(db, row) is True, (
+            f"restore failed for: {label}"
+        )
+
+    db.conn.execute("DELETE FROM photos WHERE id=?", (photo_id,))
+    db.conn.commit()
+    assert _snapshot_row_still_current(db, row) is False
+    db.conn.close()
+
+
 def test_startup_backfill_discards_orphan_when_id_reused_during_extraction(
     tmp_path, monkeypatch,
 ):

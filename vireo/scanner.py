@@ -8,6 +8,7 @@ import json
 import logging
 import multiprocessing
 import os
+import sqlite3
 import sys
 import time
 from collections import defaultdict, deque
@@ -1266,19 +1267,44 @@ def _snapshot_row_still_current(db, row):
     Callers use this to skip the row instead of extracting the deleted
     photo's source and attaching that JPEG to the replacement.
 
-    ``file_size`` and ``file_mtime`` may be NULL, so use ``IS`` (not ``=``)
-    for those comparisons.
+    The identity columns are not the whole snapshot the loop dereferences,
+    so this re-reads two more values:
+
+    * ``folders.path`` — the source is ``folder_path + filename``, and a
+      relocated folder keeps its ``folder_id``. A stale path makes extraction
+      fail against a file that has merely moved, and the identity-guarded
+      failure UPDATE would then land (its four identity columns all still
+      match) and stamp a spurious failure marker that suppresses this photo's
+      backfill until its mtime changes or the retry grace expires.
+    * ``companion_path`` — the RAW+JPEG companion is the second extraction
+      source, so a row re-paired during the pause would be handed the
+      previous companion's pixels.
+
+    ``working_copy_path`` must also still be NULL. That is part of the
+    candidate predicate, so a non-NULL value means another writer already
+    published one and the multi-second decode would be pure waste.
+
+    ``file_size``, ``file_mtime`` and ``companion_path`` may be NULL, so the
+    SQL guard built from the identity columns uses ``IS`` (not ``=``).
     """
     current = db.conn.execute(
-        "SELECT folder_id, filename, file_size, file_mtime"
-        " FROM photos WHERE id=?",
+        """
+        SELECT p.folder_id, p.filename, p.companion_path, p.file_size,
+               p.file_mtime, p.working_copy_path, f.path AS folder_path
+          FROM photos p
+          JOIN folders f ON f.id = p.folder_id
+         WHERE p.id = ?
+        """,
         (row["id"],),
     ).fetchone()
     if current is None:
         return False
     return (
-        current["folder_id"] == row["folder_id"]
+        current["working_copy_path"] is None
+        and current["folder_id"] == row["folder_id"]
+        and current["folder_path"] == row["folder_path"]
         and current["filename"] == row["filename"]
+        and current["companion_path"] == row["companion_path"]
         and current["file_size"] == row["file_size"]
         and current["file_mtime"] == row["file_mtime"]
     )
@@ -1861,12 +1887,27 @@ def _extract_working_copies(db, vireo_dir, progress_callback=None,
                     publication_orphaned = True
                     try:
                         os.remove(wc_abs)
-                    except OSError:
+                    except FileNotFoundError:
                         pass
+                    except OSError:
+                        # Quota eviction will reclaim the bytes on a later
+                        # pass; log so a persistently unremovable file (a
+                        # locked or read-only cache dir) is visible rather
+                        # than silently accumulating.
+                        log.warning(
+                            "Could not remove the orphaned working copy at "
+                            "%s", wc_abs, exc_info=True,
+                        )
                     try:
                         db.conn.rollback()
-                    except Exception:
-                        pass
+                    except sqlite3.Error:
+                        # Nothing was written (rowcount 0), so a failed
+                        # rollback costs correctness nothing — the next
+                        # commit_with_retry closes the transaction.
+                        log.warning(
+                            "Rollback after an orphaned working-copy publish "
+                            "failed", exc_info=True,
+                        )
                     log.info(
                         "Discarding orphaned working-copy output for "
                         "photo %s: row identity changed during extraction "

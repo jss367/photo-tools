@@ -12618,8 +12618,16 @@ function formatDuration(seconds) {
     // from this surface.
     var allRunning = activeJobs.filter(isLiveJob);
     var attentionJobs = allRunning.filter(countsForBadge);
-    var thisWs = allRunning.filter(function(j) { return j.workspace_id === _activeWsId; });
-    var otherWs = allRunning.filter(function(j) { return j.workspace_id !== _activeWsId; });
+    // Workspace-agnostic jobs (null workspace_id — the startup backfills
+    // run over globally-shared photos) list with the current workspace's
+    // jobs: they are running for this workspace too, so filing them under
+    // "Other Workspaces" would tell the user the opposite of the truth.
+    var thisWs = allRunning.filter(function(j) {
+      return j.workspace_id == null || j.workspace_id === _activeWsId;
+    });
+    var otherWs = allRunning.filter(function(j) {
+      return j.workspace_id != null && j.workspace_id !== _activeWsId;
+    });
 
     // Badges count attention-worthy work across workspaces. Ambient system
     // jobs stay visible in the panel without asking for attention.

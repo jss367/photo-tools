@@ -1371,13 +1371,23 @@
       return;
     }
 
-    var thisWs = running.filter(function(j) { return j.workspace_id === activeWsId; });
-    var otherWs = running.filter(function(j) { return j.workspace_id !== activeWsId; });
+    // A null workspace_id means the job is workspace-agnostic (the startup
+    // working-copy / thumb_path backfills operate on photos, which are
+    // global). Those belong with the current workspace's jobs — they are
+    // running for this workspace as much as any other — not under "Other
+    // Workspaces", and their badge has to say so rather than naming a
+    // workspace they don't have.
+    var thisWs = running.filter(function(j) {
+      return j.workspace_id == null || j.workspace_id === activeWsId;
+    });
+    var otherWs = running.filter(function(j) {
+      return j.workspace_id != null && j.workspace_id !== activeWsId;
+    });
 
     var html = '<div style="padding:16px 24px 0;">';
 
     thisWs.forEach(function(j) {
-      html += renderJobCard(j);
+      html += renderJobCard(j, j.workspace_id == null ? { workspaceName: 'All workspaces' } : {});
     });
 
     if (otherWs.length > 0) {

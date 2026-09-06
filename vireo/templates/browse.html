@@ -7522,9 +7522,15 @@ window.addEventListener('resize', function() {
 function focusedBrowsePhotoId() {
   // The most recent click wins. A cmd/shift-click extends the selection while
   // leaving selectedPhotoId on the older detail focus, and the card the user
-  // just clicked is the one they are looking at.
+  // just clicked is the one they are looking at. It only wins while its card
+  // is actually rendered, though: collapsing a stack after a stack-wide Select
+  // all leaves the last-clicked member selected but unrendered, with
+  // selectedPhotoId deliberately pinned to the visible cover. Preferring the
+  // hidden member there would find no element and silently disable the
+  // correction for the cover the user can see.
   if (lastClickedPhotoId != null &&
-      (lastClickedPhotoId === selectedPhotoId || selectedPhotos.has(lastClickedPhotoId))) {
+      (lastClickedPhotoId === selectedPhotoId || selectedPhotos.has(lastClickedPhotoId)) &&
+      getBrowsePhotoElement(lastClickedPhotoId)) {
     return lastClickedPhotoId;
   }
   return selectedPhotoId;
@@ -12426,7 +12432,13 @@ document.addEventListener('contextmenu', function(e) {
     }
     loadDetail(pid);
   }
+  // A right-click is a click: it is the card the user is pointing at, and it
+  // is on screen by construction. Without this, a resize after right-clicking
+  // a card would still be judged against wherever the *previous* selection was
+  // scrolled to, and would refuse to keep this one visible.
+  lastClickedPhotoId = pid;
   refreshCardSelectionVisuals();
+  noteFocusedCardVisibility();
   updateBatchBar();
   openContextMenu(e, buildPhotoContextMenu(ids, pid));
 });

@@ -19,6 +19,31 @@ CARD_VISIBILITY = """
 # narrower grid, then let a frame pass so the correction has been applied.
 SETTLE = "() => new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)))"
 
+# Scrolling the selection out of view is only established once the grid's own
+# scroll handler has sampled it. The event is dispatched asynchronously, so
+# without this wait the sample can land after the next interaction and record
+# that interaction's card instead.
+SCROLL_SAMPLED = "() => focusedCardWasOnScreen === false"
+
+
+def _seed_extra_photos(live_server, count):
+    """Enough photos that a column-count change cannot fit the grid on one screen."""
+    import os
+
+    from PIL import Image
+
+    db = live_server["db"]
+    thumb_dir = live_server["app"].config["THUMB_CACHE_DIR"]
+    folder_id = live_server["data"]["folders"][0]
+    for i in range(count):
+        pid = db.add_photo(
+            folder_id=folder_id, filename=f"extra{i}.jpg", extension=".jpg",
+            file_size=1000, file_mtime=1.0,
+            timestamp=f"2024-03-11T{8 + i // 60:02d}:{i % 60:02d}:00",
+        )
+        Image.new("RGB", (100, 100), color="blue").save(
+            os.path.join(thumb_dir, f"{pid}.jpg")
+        )
 
 def test_browse_keeps_clicked_photo_visible_when_window_resizes(live_server, page):
     # The grid is an `auto-fill` grid, so narrowing the window drops the column
@@ -93,7 +118,7 @@ def test_browse_resize_leaves_a_deliberately_scrolled_away_selection_alone(live_
     cards.first.click()
 
     page.evaluate("() => { gridContainer.scrollTop = gridContainer.scrollHeight; }")
-    page.evaluate(SETTLE)
+    page.wait_for_function(SCROLL_SAMPLED)
     scrolled_away = page.evaluate("() => gridContainer.scrollTop")
     assert scrolled_away > 0
     assert page.evaluate(CARD_VISIBILITY)["fullyVisible"] is False
@@ -106,4 +131,92 @@ def test_browse_resize_leaves_a_deliberately_scrolled_away_selection_alone(live_
     after = page.evaluate("() => gridContainer.scrollTop")
     assert after == scrolled_away, (
         f"the resize scrolled back to the selection ({scrolled_away} → {after})"
+    )
+
+
+def test_browse_resize_falls_back_when_the_last_clicked_card_is_not_rendered(live_server, page):
+    # Collapsing a stack after a stack-wide "Select all" leaves the last-clicked
+    # member selected but unrendered, with selectedPhotoId pinned to the visible
+    # cover. Preferring the hidden member would find no element and disable the
+    # correction for the card the user can actually see.
+    page.set_viewport_size({"width": 1400, "height": 900})
+    page.goto(live_server["url"] + "/browse")
+
+    cards = page.locator(".grid-card")
+    cards.first.wait_for(state="visible")
+    cards.last.click()
+    visible_id = page.evaluate("selectedPhotoId")
+
+    # Stand in for the collapsed stack member: selected, last clicked, no card.
+    page.evaluate(
+        """() => {
+          lastClickedPhotoId = 999999;
+          selectedPhotos.add(999999);
+          noteFocusedCardVisibility();
+        }"""
+    )
+    assert page.evaluate("focusedBrowsePhotoId()") == visible_id
+
+    wide = page.evaluate("() => gridContainer.clientWidth")
+    page.set_viewport_size({"width": 780, "height": 900})
+    page.wait_for_function("width => gridContainer.clientWidth < width", arg=wide)
+    page.evaluate(SETTLE)
+
+    visibility = page.evaluate(CARD_VISIBILITY)
+    assert visibility["fullyVisible"] is True, (
+        f"an unrendered last-clicked photo disabled the correction: {visibility}"
+    )
+
+
+def test_browse_resize_keeps_a_right_clicked_photo_visible(live_server, page):
+    # Right-clicking an unselected card coerces the selection Finder-style,
+    # outside selectPhoto. That card is on screen and is the one the user is
+    # pointing at, so a following resize has to keep it visible even though the
+    # previous selection had been scrolled away from.
+    _seed_extra_photos(live_server, 40)
+
+    page.set_viewport_size({"width": 780, "height": 900})
+    page.goto(live_server["url"] + "/browse")
+
+    cards = page.locator(".grid-card")
+    cards.first.wait_for(state="visible")
+    cards.first.click()
+
+    # Scroll well away from the selection, then right-click a card that is on
+    # screen down here. Not the last card: a reflow that shortens the grid
+    # pins the scroll to the bottom, which would keep the final card visible
+    # for reasons that have nothing to do with the correction under test.
+    page.evaluate("() => { gridContainer.scrollTop = Math.round(gridContainer.scrollHeight * 0.6); }")
+    page.wait_for_function(SCROLL_SAMPLED)
+    assert page.evaluate(CARD_VISIBILITY)["fullyVisible"] is False
+    on_screen_id = page.evaluate(
+        """() => {
+          const view = gridContainer.getBoundingClientRect();
+          const card = Array.from(document.querySelectorAll('.grid-card')).find(c => {
+            const r = c.getBoundingClientRect();
+            return r.top >= view.top && r.bottom <= view.bottom;
+          });
+          return card ? Number(card.dataset.id) : null;
+        }"""
+    )
+    assert on_screen_id is not None
+    page.locator(f'.grid-card[data-id="{on_screen_id}"]').click(button="right")
+    page.keyboard.press("Escape")
+    assert page.evaluate("selectedPhotoId") == on_screen_id
+    # The coercion has to register as a click on a visible card, or the resize
+    # is judged against where the *previous* selection was scrolled to.
+    assert page.evaluate("lastClickedPhotoId") == on_screen_id
+    assert page.evaluate("focusedCardWasOnScreen") is True
+
+    narrow = page.evaluate("() => gridContainer.clientWidth")
+    page.set_viewport_size({"width": 1400, "height": 900})
+    page.wait_for_function("width => gridContainer.clientWidth > width", arg=narrow)
+    page.evaluate(SETTLE)
+    assert page.evaluate("() => gridContainer.scrollTop") > 0, (
+        "the reflow clamped the scroll to the top, so this asserts nothing"
+    )
+
+    visibility = page.evaluate(CARD_VISIBILITY)
+    assert visibility["fullyVisible"] is True, (
+        f"the right-clicked photo left the grid viewport after the resize: {visibility}"
     )

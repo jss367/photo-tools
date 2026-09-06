@@ -2925,6 +2925,95 @@ def test_orphan_cleanup_preserves_racing_publisher_uncommitted_bytes(
     )
 
 
+def test_post_loop_trim_adopts_a_quota_raised_mid_batch(
+    tmp_path, monkeypatch,
+):
+    """A quota raised during the batch must be honoured before trimming.
+
+    Raising ``working_copy_cache_max_mb`` runs the settings side effects,
+    which clear every capacity marker. If the trim then measures against
+    the ceiling this batch started with, it deletes output that now fits
+    and stamps fresh markers — so the capacity the user just added sits
+    unused until another quota or source-mtime change unblocks the rows.
+    """
+    import config as cfg
+    import scanner
+    from db import Database
+    from scanner import _extract_working_copies
+
+    monkeypatch.setattr(cfg, "CONFIG_PATH", str(tmp_path / "config.json"))
+    cfg.save({
+        **cfg.DEFAULTS,
+        "working_copy_max_size": 1000,
+        "working_copy_quality": 90,
+        "working_copy_cache_max_mb": 1,
+    })
+
+    folder = tmp_path / "photos"
+    folder.mkdir()
+    vireo_dir = tmp_path / "vireo"
+    vireo_dir.mkdir()
+    working_dir = vireo_dir / "working"
+    working_dir.mkdir()
+    db = Database(str(vireo_dir / "test.db"))
+    folder_id = db.add_folder(str(folder))
+
+    imported_ids = []
+    for i in range(10):
+        src = folder / f"photo-{i:02d}.jpg"
+        _make_jpeg(str(src), 2000, 1500)
+        imported_ids.append(
+            _photo_id_of_file(db, folder_id, f"photo-{i:02d}.jpg", src)
+        )
+
+    def fixed_extract(_source, output, **_kwargs):
+        # Ten ~110 KB files overshoot the starting 1 MB ceiling by one,
+        # and all ten fit comfortably under the raised 2 MB one.
+        with open(output, "wb") as handle:
+            handle.truncate(110 * 1024)
+        return True
+
+    monkeypatch.setattr(scanner, "extract_working_copy", fixed_extract)
+
+    # The user raises the ceiling after the loop's last quota read.
+    import working_copy_cache
+
+    real_stats = working_copy_cache.working_copy_stats
+
+    def stats_then_raise_quota(*args, **kwargs):
+        result = real_stats(*args, **kwargs)
+        cfg.save({
+            **cfg.load(),
+            "working_copy_cache_max_mb": 2,
+        })
+        return result
+
+    monkeypatch.setattr(
+        working_copy_cache, "working_copy_stats", stats_then_raise_quota,
+    )
+
+    _extract_working_copies(db, str(vireo_dir))
+
+    on_disk = sorted(
+        int(p.stem) for p in working_dir.glob("*.jpg")
+    )
+    assert on_disk == sorted(imported_ids), (
+        "the trim measured against the stale lower ceiling and discarded "
+        f"output that fits under the raised one: kept {len(on_disk)} of "
+        f"{len(imported_ids)}"
+    )
+    deferred = db.conn.execute(
+        "SELECT COUNT(*) FROM photos WHERE working_copy_evicted_mtime"
+        " IS NOT NULL"
+    ).fetchone()[0]
+    assert deferred == 0, (
+        "rows were stamped capacity-deferred against a ceiling that had "
+        "already been raised; the added capacity stays unused until some "
+        "later quota or mtime change unblocks them"
+    )
+    db.close()
+
+
 def test_small_sweep_near_ceiling_keeps_existing_coverage(
     tmp_path, monkeypatch,
 ):

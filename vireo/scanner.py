@@ -2488,6 +2488,17 @@ def _extract_working_copies(db, vireo_dir, progress_callback=None,
                     "the batch footprint alone"
                 )
                 existing_bytes = 0
+        # Re-read the ceiling rather than trusting the value this batch
+        # started with. A settings save that *raises* the quota runs
+        # ``_settings_post_save_side_effects``, which clears every capacity
+        # marker; if the trim then measures against the old lower number it
+        # deletes output that now fits and stamps fresh markers, so the
+        # capacity the user just added sits unused until some later quota or
+        # source-mtime change unblocks those rows. The mid-batch stop path
+        # already re-reads for exactly this reason.
+        refreshed_quota_mb = _configured_quota_mb()
+        if refreshed_quota_mb > 0:
+            quota_bytes = max(0, refreshed_quota_mb) * 1024 * 1024
         batch_over = existing_bytes + batch_bytes - quota_bytes
         if batch_over > 0:
             # Serialize the unlink and the deferred-marker UPDATE with

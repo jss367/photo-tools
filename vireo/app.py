@@ -11751,7 +11751,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         non_undoable = Database._NON_UNDOABLE
         placeholders = ",".join("?" for _ in non_undoable)
         latest = db.conn.execute(
-            f"SELECT * FROM edit_history WHERE workspace_id = ? AND undone = 0 AND action_type NOT IN ({placeholders}) "
+            f"SELECT id, description FROM edit_history WHERE workspace_id = ? AND undone = 0 AND action_type NOT IN ({placeholders}) "
             "ORDER BY created_at DESC, id DESC LIMIT 1",
             (db._ws_id(), *non_undoable),
         ).fetchone()
@@ -11811,7 +11811,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         non_undoable = Database._NON_UNDOABLE
         placeholders = ",".join("?" for _ in non_undoable)
         latest = db.conn.execute(
-            f"SELECT * FROM edit_history WHERE workspace_id = ? AND undone = 1 AND action_type NOT IN ({placeholders}) "
+            f"SELECT id, description FROM edit_history WHERE workspace_id = ? AND undone = 1 AND action_type NOT IN ({placeholders}) "
             "ORDER BY created_at ASC, id ASC LIMIT 1",
             (db._ws_id(), *non_undoable),
         ).fetchone()
@@ -27537,10 +27537,9 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                             "after": cached["encounters"],
                         }
                         if photo_edit_id is None:
-                            db.record_edit(
-                                "pipeline_grouping",
-                                cache_description + "1 burst",
-                                json.dumps(change), [], _commit=False,
+                            from services.grouping_history import record_grouping_edit
+                            record_grouping_edit(
+                                db, cache_description + "1 burst", change, [],
                             )
                 else:
                     set_encounter_confirmed_species(target_enc, new_species_list)
@@ -27583,10 +27582,8 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                         "after": cached["encounters"],
                         "photo_edit": dict(photo_edit),
                     }
-                    db.conn.execute(
-                        "UPDATE edit_history SET action_type = 'pipeline_grouping', new_value = ? WHERE id = ?",
-                        (json.dumps(change), photo_edit_id),
-                    )
+                    from services.grouping_history import convert_to_grouping_edit
+                    convert_to_grouping_edit(db, photo_edit_id, change)
                 save_results_raw(cached, cache_dir, db._active_workspace_id)
                 cache_saved = True
 

@@ -838,3 +838,132 @@ def test_stale_redo_reports_retirement_before_replaying_next_action(app_and_db):
     assert client.post('/api/redo').status_code == 200
     assert all(db.get_photo(pid)['flag'] == 'flagged' for pid in ids)
     assert _load(db) == newer
+
+
+def _grouping_rows(db):
+    return db.conn.execute(
+        "SELECT eh.id, eh.new_value, p.payload "
+        "FROM edit_history eh LEFT JOIN edit_history_payloads p ON p.edit_id = eh.id "
+        "WHERE eh.action_type = 'pipeline_grouping' ORDER BY eh.id"
+    ).fetchall()
+
+
+def test_grouping_snapshot_is_stored_outside_edit_history(app_and_db):
+    """The multi-MB before/after snapshot never lands in edit_history.new_value.
+
+    Kept inline it turns every edit_history scan (undo status after each
+    flag, the prune inside record_edit) into a walk of the snapshot blobs.
+    """
+    import json
+    app, db = app_and_db
+    client = app.test_client()
+    ids, original = _seed(db)
+    _detach(client)
+    after = _load(db)
+
+    rows = _grouping_rows(db)
+    assert len(rows) == 1
+    meta = json.loads(rows[0]['new_value'])
+    assert 'before' not in meta and 'after' not in meta
+    snapshot = json.loads(rows[0]['payload'])
+    assert snapshot['before'] == original['encounters']
+    assert snapshot['after'] == after['encounters']
+
+    # The status poll and the history list never need the snapshot.
+    listed = client.get('/api/edit-history').json
+    assert listed[0]['new_value'] is None
+    assert client.get('/api/undo/status').json['id'] == rows[0]['id']
+
+    # Undo/redo restore from the payload table.
+    assert client.post('/api/undo').status_code == 200
+    assert _load(db)['encounters'] == original['encounters']
+    assert client.post('/api/redo').status_code == 200
+    assert _load(db)['encounters'] == after['encounters']
+
+    # A new edit clears the redo stack; its snapshot goes with the row.
+    assert client.post('/api/undo').status_code == 200
+    _detach(client, 'photo', photo_id=ids[0])
+    rows = _grouping_rows(db)
+    assert len(rows) == 1
+    assert db.conn.execute(
+        "SELECT COUNT(*) FROM edit_history_payloads"
+    ).fetchone()[0] == 1
+
+
+def test_species_confirm_grouping_edit_stores_snapshot_outside_row(app_and_db):
+    """The species route's combined photo+grouping edit uses the same split."""
+    import json
+    app, db = app_and_db
+    client = app.test_client()
+    ids, original = _seed(db)
+    cache = _load(db)
+    cache['encounters'][0]['bursts'][0]['species_override'] = None
+    save_results_raw(cache, os.path.dirname(db._db_path), db._ws_id())
+    response = client.post('/api/encounters/species', json={
+        'encounter_index': 0, 'burst_index': 0, 'species': 'Verdin',
+        'photo_ids': ids[:2],
+    })
+    assert response.status_code == 200, response.get_json()
+    rows = _grouping_rows(db)
+    if not rows:
+        pytest.skip('this seed did not auto-detach; covered by the detach tests')
+    for row in rows:
+        meta = json.loads(row['new_value'])
+        assert 'before' not in meta and 'after' not in meta
+        assert row['payload'] is not None
+        assert set(json.loads(row['payload'])) == {'before', 'after'}
+
+
+def test_retired_stale_grouping_entry_drops_its_snapshot(app_and_db):
+    """Retiring a stale combined edit keeps the photo half, frees the blob."""
+    import json
+    app, db = app_and_db
+    client = app.test_client()
+    ids, _ = _seed(db)
+    client.post('/api/batch/flag', json={'photo_ids': ids, 'flag': 'flagged'})
+    _detach(client)
+    (row,) = _grouping_rows(db)
+    assert row['payload'] is not None
+    # Simulate a combined photo+grouping edit so retirement rewrites rather
+    # than deletes the row.
+    from services.grouping_history import convert_to_grouping_edit
+    convert_to_grouping_edit(db, row['id'], {
+        **json.loads(row['payload']),
+        'photo_edit': {'action_type': 'flag', 'new_value': 'flagged'},
+    })
+    db.conn.commit()
+    updated = _load(db)
+    updated['encounters'][0]['bursts'].append({'photo_ids': [ids[0]]})
+    save_results_raw(updated, os.path.dirname(db._db_path), db._ws_id())
+
+    assert client.post('/api/undo').status_code == 409
+    retired = db.conn.execute(
+        "SELECT new_value FROM edit_history WHERE id = ?", (row['id'],),
+    ).fetchone()
+    assert json.loads(retired['new_value'])['photo_only'] is True
+    assert db.conn.execute(
+        "SELECT COUNT(*) FROM edit_history_payloads WHERE edit_id = ?", (row['id'],),
+    ).fetchone()[0] == 0
+
+
+def test_legacy_inline_snapshot_still_restores(app_and_db):
+    """Rows written before the split (snapshot inline) undo without migration."""
+    import json
+    app, db = app_and_db
+    client = app.test_client()
+    ids, original = _seed(db)
+    _detach(client)
+    after = _load(db)
+    (row,) = _grouping_rows(db)
+    inline = {**json.loads(row['new_value']), **json.loads(row['payload'])}
+    db.conn.execute(
+        "UPDATE edit_history SET new_value = ? WHERE id = ?",
+        (json.dumps(inline), row['id']),
+    )
+    db.conn.execute("DELETE FROM edit_history_payloads WHERE edit_id = ?", (row['id'],))
+    db.conn.commit()
+
+    assert client.post('/api/undo').status_code == 200
+    assert _load(db)['encounters'] == original['encounters']
+    assert client.post('/api/redo').status_code == 200
+    assert _load(db)['encounters'] == after['encounters']

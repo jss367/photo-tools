@@ -2506,3 +2506,311 @@ def test_scoped_scan_still_displaces_older_copies_to_cover_new_photos(
         "candidates before standing down"
     )
     db.close()
+
+
+def test_extract_update_rejects_companion_swap_during_decode(
+    tmp_path, monkeypatch,
+):
+    """Companion swap during the slow decode must not stamp a working copy.
+
+    Regression for a P1 codex review finding on PR #1607: the post-extraction
+    UPDATE guard omitted ``companion_path`` and ``folders.path``, even though
+    ``_snapshot_row_still_current`` treats them as extraction inputs. When a
+    RAW+JPEG pair is re-paired to a different companion during the multi-
+    second decode, the four remaining identity columns still match and the
+    UPDATE happily commits bytes read from the old companion as the row's
+    working copy — the row's actual companion has different pixels.
+    """
+    import threading
+
+    import scanner
+
+    app, vireo_dir, ids = _prepare_backfill_app(
+        tmp_path, monkeypatch, ["target.jpg"],
+    )
+    target_id = ids[0]
+
+    real_extract = scanner.extract_working_copy
+    extract_started = threading.Event()
+    release_extract = threading.Event()
+
+    def gated_extract(*args, **kwargs):
+        result = real_extract(*args, **kwargs)
+        extract_started.set()
+        # Hold so the test can swap ``companion_path`` between the
+        # atomic write and the identity-guarded UPDATE — the exact
+        # window this guard was extended to cover.
+        assert release_extract.wait(timeout=30), (
+            "test never released extraction"
+        )
+        return result
+
+    monkeypatch.setattr(scanner, "extract_working_copy", gated_extract)
+
+    app._kickoff_working_copy_backfill()
+    assert extract_started.wait(timeout=30), "extraction never started"
+
+    from db import Database
+    db_path = app.config["DB_PATH"]
+    admin_db = Database(db_path)
+    # ``companion_path`` swap: original was NULL (no RAW pair); pretend
+    # a scan re-paired the row with a JPEG sibling. The pre-extraction
+    # snapshot captured companion_path=NULL, so the post-extraction
+    # UPDATE with the new companion value must not match.
+    admin_db.conn.execute(
+        "UPDATE photos SET companion_path='sibling.jpg' WHERE id=?",
+        (target_id,),
+    )
+    admin_db.conn.commit()
+    admin_db.conn.close()
+
+    release_extract.set()
+    job = _wait_for_backfill_terminal(app._job_runner)
+    assert job["status"] == "completed", f"job: {job}"
+
+    verify_db = Database(db_path)
+    wc_path = verify_db.conn.execute(
+        "SELECT working_copy_path FROM photos WHERE id=?", (target_id,),
+    ).fetchone()["working_copy_path"]
+    verify_db.conn.close()
+    assert wc_path is None, (
+        "post-extraction UPDATE committed a working_copy_path onto a row "
+        f"whose companion_path changed during extraction: {wc_path!r}"
+    )
+
+
+def test_extract_update_rejects_folder_relocation_during_decode(
+    tmp_path, monkeypatch,
+):
+    """Folder relocation during the decode must not stamp a working copy.
+
+    Regression for the same P1 finding: ``folders.path`` is half the source
+    path, and a relocated folder keeps its ``folder_id``. Without a
+    ``folders.path`` guard in the UPDATE, the loop extracts from the old
+    location's cached bytes (or fails and stamps a spurious failure marker)
+    and the four remaining identity columns still match the moved row.
+    """
+    import threading
+
+    import scanner
+
+    app, vireo_dir, ids = _prepare_backfill_app(
+        tmp_path, monkeypatch, ["target.jpg"],
+    )
+    target_id = ids[0]
+
+    real_extract = scanner.extract_working_copy
+    extract_started = threading.Event()
+    release_extract = threading.Event()
+
+    def gated_extract(*args, **kwargs):
+        result = real_extract(*args, **kwargs)
+        extract_started.set()
+        assert release_extract.wait(timeout=30), (
+            "test never released extraction"
+        )
+        return result
+
+    monkeypatch.setattr(scanner, "extract_working_copy", gated_extract)
+
+    app._kickoff_working_copy_backfill()
+    assert extract_started.wait(timeout=30), "extraction never started"
+
+    from db import Database
+    db_path = app.config["DB_PATH"]
+    admin_db = Database(db_path)
+    admin_db.conn.execute(
+        "UPDATE folders SET path=?"
+        " WHERE id=(SELECT folder_id FROM photos WHERE id=?)",
+        (str(tmp_path / "relocated"), target_id),
+    )
+    admin_db.conn.commit()
+    admin_db.conn.close()
+
+    release_extract.set()
+    job = _wait_for_backfill_terminal(app._job_runner)
+    assert job["status"] == "completed", f"job: {job}"
+
+    verify_db = Database(db_path)
+    row = verify_db.conn.execute(
+        "SELECT working_copy_path, working_copy_failed_at"
+        " FROM photos WHERE id=?", (target_id,),
+    ).fetchone()
+    verify_db.conn.close()
+    assert row["working_copy_path"] is None, (
+        "post-extraction UPDATE committed a working_copy_path onto a row "
+        f"whose folder path changed during extraction: {row['working_copy_path']!r}"
+    )
+    assert row["working_copy_failed_at"] is None, (
+        "identity-guarded failure UPDATE stamped a spurious marker on a "
+        "row whose folder path changed during extraction"
+    )
+
+
+def test_orphan_cleanup_preserves_replacement_publishers_bytes(
+    tmp_path, monkeypatch,
+):
+    """Do not delete a canonical file another publisher committed in the gap.
+
+    Regression for a P2 codex review finding on PR #1607: the previous
+    unconditional ``os.remove(wc_abs)`` on a zero-row identity-guarded UPDATE
+    could clobber a valid working copy that a replacement publisher (id
+    reuse, on-demand render) atomically wrote in the gap between extract's
+    guard release and the scanner's guard reacquire. The replacement's row
+    then keeps a ``working_copy_path`` pointing at a missing file.
+    """
+    import threading
+
+    import scanner
+
+    app, vireo_dir, ids = _prepare_backfill_app(
+        tmp_path, monkeypatch, ["target.jpg"],
+    )
+    target_id = ids[0]
+
+    real_extract = scanner.extract_working_copy
+    extract_started = threading.Event()
+    release_extract = threading.Event()
+
+    def gated_extract(*args, **kwargs):
+        result = real_extract(*args, **kwargs)
+        extract_started.set()
+        assert release_extract.wait(timeout=30), (
+            "test never released extraction"
+        )
+        return result
+
+    monkeypatch.setattr(scanner, "extract_working_copy", gated_extract)
+
+    app._kickoff_working_copy_backfill()
+    assert extract_started.wait(timeout=30), "extraction never started"
+
+    from db import Database
+    db_path = app.config["DB_PATH"]
+    admin_db = Database(db_path)
+    # Delete the original row, reinsert to reuse the id, then simulate a
+    # replacement publisher: (a) atomically replace ``wc_abs`` with the
+    # replacement's bytes, and (b) commit its ``working_copy_path``.
+    target_row = admin_db.conn.execute(
+        "SELECT p.folder_id, f.path AS folder_path"
+        " FROM photos p JOIN folders f ON f.id=p.folder_id"
+        " WHERE p.id=?",
+        (target_id,),
+    ).fetchone()
+    folder_id = target_row["folder_id"]
+    photos_dir = target_row["folder_path"]
+    admin_db.conn.execute("DELETE FROM photos WHERE id=?", (target_id,))
+    admin_db.conn.commit()
+
+    replacement_src = os.path.join(photos_dir, "replacement.jpg")
+    _make_jpeg(replacement_src, 1600, 1200)
+    new_id = admin_db.add_photo(
+        folder_id, "replacement.jpg", ".jpg",
+        file_size=os.path.getsize(replacement_src),
+        file_mtime=os.path.getmtime(replacement_src),
+        width=1600, height=1200,
+    )
+    assert new_id == target_id, (
+        f"id reuse setup failed: {new_id} != {target_id}"
+    )
+
+    wc_abs = vireo_dir / "working" / f"{target_id}.jpg"
+    replacement_bytes = b"REPLACEMENT PUBLISHER BYTES"
+    # Atomic replace mirrors what another publisher's ``os.replace`` would
+    # do inside the publication guard between our extract's release and
+    # our reacquire.
+    tmp_replace = wc_abs.parent / f".{target_id}.repl.jpg.tmp"
+    tmp_replace.write_bytes(replacement_bytes)
+    os.replace(str(tmp_replace), str(wc_abs))
+
+    wc_rel = f"working/{target_id}.jpg"
+    admin_db.conn.execute(
+        "UPDATE photos SET working_copy_path=? WHERE id=?",
+        (wc_rel, target_id),
+    )
+    admin_db.conn.commit()
+    admin_db.conn.close()
+
+    release_extract.set()
+    job = _wait_for_backfill_terminal(app._job_runner)
+    assert job["status"] == "completed", f"job: {job}"
+
+    assert wc_abs.exists(), (
+        "orphan cleanup unlinked the replacement publisher's working copy "
+        "even though its bytes and DB row both diverged from the extractor's"
+    )
+    assert wc_abs.read_bytes() == replacement_bytes, (
+        "wc_abs was clobbered — the orphan cleanup did not preserve the "
+        "replacement publisher's file identity"
+    )
+    verify_db = Database(db_path)
+    wc_path = verify_db.conn.execute(
+        "SELECT working_copy_path FROM photos WHERE id=?", (target_id,),
+    ).fetchone()["working_copy_path"]
+    verify_db.conn.close()
+    assert wc_path == wc_rel, (
+        "replacement publisher's working_copy_path was cleared alongside "
+        f"the unlink: {wc_path!r}"
+    )
+
+
+def test_desc_batch_protects_own_newest_import_from_mid_batch_eviction(
+    tmp_path, monkeypatch,
+):
+    """Mid-batch eviction must not reclaim this batch's newest-import file.
+
+    Regression for a P2 codex review finding on PR #1607: processing rows in
+    DESC id order gives the newest photo the OLDEST wall-clock mtime in the
+    batch (it's written first). ``_evict_once`` sorts by mtime ascending, so
+    once the batch crosses quota it evicts that newest photo first — the
+    very row the ordering was meant to prioritize — then the rotation check
+    stops the batch and leaves later-processed older imports covered
+    instead. Passing ``retained_new_files`` as ``protect_paths`` bounds
+    eviction to pre-existing content and preserves batch coverage.
+    """
+    import config as cfg
+    from db import Database
+    from scanner import _extract_working_copies
+
+    monkeypatch.setattr(cfg, "CONFIG_PATH", str(tmp_path / "config.json"))
+    cfg.save({
+        **cfg.DEFAULTS,
+        "working_copy_max_size": 1000,
+        "working_copy_quality": 90,
+        "working_copy_cache_max_mb": 1,
+    })
+
+    folder = tmp_path / "photos"
+    folder.mkdir()
+    vireo_dir = tmp_path / "vireo"
+    vireo_dir.mkdir()
+    working_dir = vireo_dir / "working"
+    working_dir.mkdir()
+    db = Database(str(vireo_dir / "test.db"))
+    folder_id = db.add_folder(str(folder))
+
+    imported_ids = []
+    for i in range(4):
+        src = folder / f"photo-{i}.jpg"
+        _make_noisy_jpeg(src, 2000, 1500)
+        imported_ids.append(
+            _photo_id_of_file(db, folder_id, f"photo-{i}.jpg", src)
+        )
+
+    newest_id = max(imported_ids)
+
+    # Force mid-batch enforcement to run early even on a tiny cache: a low
+    # incremental threshold ensures the ``_evict_once`` call fires while
+    # multiple batch files coexist, so the DESC-order regression path is
+    # actually exercised.
+    _extract_working_copies(db, str(vireo_dir))
+
+    newest_copy = working_dir / f"{newest_id}.jpg"
+    assert newest_copy.exists(), (
+        "DESC-id batch lost its highest-priority working copy to its own "
+        "mid-batch quota enforcement: mid-batch eviction picked the "
+        "oldest-mtime file (the newest import, born first) and the "
+        "rotation check deferred later-processed older imports, leaving "
+        "the newest imports uncovered"
+    )
+    db.close()

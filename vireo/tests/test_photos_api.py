@@ -13070,3 +13070,53 @@ def test_collection_save_and_reopen_round_trips_visual(app_and_db, monkeypatch):
     assert client.post('/api/collections', json={
         "name": "Bad", "rules": [], "visual": {"prompt": "  "},
     }).status_code == 400
+
+
+def test_edit_render_touches_working_copy_source(
+    client_with_photo, monkeypatch,
+):
+    """The recipe render path must record access on its working-copy source.
+
+    Regression for a P2 codex review finding on PR #1607: for an edited
+    non-RAW photo, ``/photos/<id>/original`` selects ``trusted_wc_path``,
+    decodes it into a ``prepared_full_resolution_render`` cache, and
+    returns that cache — never reaching ``_serve_trusted_working_copy``
+    where the touch used to live. The actively viewed WC keeps its
+    generation mtime and stays first in the eviction queue no matter how
+    often the user zooms into an edited copy. Recording access at the
+    read site (before ``load_image``) closes that hole.
+    """
+    import os
+    import time
+
+    from PIL import Image
+
+    app, db, photo_id = client_with_photo
+    vireo_dir = os.path.dirname(app.config["THUMB_CACHE_DIR"])
+    working_dir = os.path.join(vireo_dir, "working")
+    os.makedirs(working_dir, exist_ok=True)
+    wc_path = os.path.join(working_dir, f"{photo_id}.jpg")
+    Image.new("RGB", (800, 600), (200, 60, 40)).save(
+        wc_path, "JPEG", quality=90,
+    )
+    db.conn.execute(
+        "UPDATE photos SET working_copy_path=? WHERE id=?",
+        (f"working/{photo_id}.jpg", photo_id),
+    )
+    db.conn.commit()
+    db.set_photo_edit_recipe(photo_id, {"rotation": 90})
+
+    # Age the WC well past the throttle so a touch is not skipped as a
+    # recent modification.
+    aged = time.time() - 24 * 3600
+    os.utime(wc_path, (aged, aged))
+    aged_mtime = os.path.getmtime(wc_path)
+
+    resp = app.test_client().get(f"/photos/{photo_id}/original")
+    assert resp.status_code == 200, resp.data
+    now_mtime = os.path.getmtime(wc_path)
+    assert now_mtime > aged_mtime, (
+        "recipe render did not touch the working copy it read as source: "
+        f"mtime is still {now_mtime} (aged {aged_mtime}); an actively "
+        "edited WC would stay at the head of the eviction queue"
+    )

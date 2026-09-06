@@ -29472,6 +29472,20 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 else None
             )
             load_kwargs = {"raw_decode": raw_decode} if raw_decode else {}
+            # Stamp the working copy as recently used whenever we read it
+            # as an edit-render source. ``_serve_trusted_working_copy``
+            # only touches when the WC JPEG itself is returned via
+            # ``send_file``, so an actively edited non-RAW photo whose
+            # renders decode from ``trusted_wc_path`` and encode to a
+            # ``prepared_full_resolution_render`` cache would retain its
+            # generation mtime and stay first in the eviction queue no
+            # matter how often it was displayed at 1:1. Recording access
+            # here keeps the LRU ordering aligned with actual use.
+            if (
+                trusted_wc_path
+                and image_path == trusted_wc_path
+            ):
+                touch_working_copy_access(trusted_wc_path)
             img = load_image(image_path, max_size=None, **load_kwargs)
             if (
                 img is not None

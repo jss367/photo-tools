@@ -1791,6 +1791,19 @@ def _extract_working_copies(db, vireo_dir, progress_callback=None,
         publication_orphaned = False
         quota_lowered_during_extraction = False
         retained_before_quota_lowering = set()
+        # Fingerprint the file we just atomically replaced so the orphan
+        # cleanup below cannot delete a replacement publisher's newer bytes
+        # in the gap between extract's guard release and our reacquire. If
+        # ``_file_identity`` on the current file no longer matches this
+        # fingerprint, another publisher has replaced ``wc_abs`` and any
+        # unlink would clobber their file rather than our orphan.
+        from working_copy_cache import _file_identity as _wc_file_identity
+        published_identity = None
+        if ok:
+            try:
+                published_identity = _wc_file_identity(os.stat(wc_abs))
+            except OSError:
+                published_identity = None
         if ok:
             # ``extract_working_copy`` guards its atomic replace, but its
             # guard ends before returning. A competing job may already have
@@ -1828,8 +1841,21 @@ def _extract_working_copies(db, vireo_dir, progress_callback=None,
                 # identity through the WHERE so an id reuse that happens
                 # between the pre-extract revalidate and this commit still
                 # cannot stamp the deleted row's working_copy_path onto the
-                # replacement. Same NULL-safe (folder_id, filename,
-                # file_size, file_mtime) guard used for deferred rows below.
+                # replacement. Guard on every input the loop dereferences:
+                # (folder_id, filename, file_size, file_mtime) is not
+                # enough because a companion swap or a folder relocation
+                # during the multi-second decode leaves those four columns
+                # intact while ``companion_path`` and ``folders.path``
+                # change under us — and ``companion_path`` is the second
+                # extraction source, so committing under a stale value can
+                # attach the previous companion's pixels to a re-paired
+                # row. Same NULL-safe (folder_id, filename, companion_path,
+                # file_size, file_mtime, folders.path) guard used by the
+                # deferred-row and failure markers below and by the
+                # pre-extraction revalidation in ``_snapshot_row_still_current``.
+                # ``working_copy_path IS NULL`` matches the candidate
+                # predicate so a concurrent on-demand writer that already
+                # committed for this id is not overwritten.
                 update_cursor = None
                 if not publication_lost and raw_failed_then_companion:
                     # The companion-derived working copy is usable, but
@@ -1843,11 +1869,17 @@ def _extract_working_copies(db, vireo_dir, progress_callback=None,
                         " working_copy_failed_mtime=?,"
                         " working_copy_failed_source='source'"
                         " WHERE id=? AND folder_id=? AND filename=?"
-                        " AND file_size IS ? AND file_mtime IS ?",
+                        " AND companion_path IS ?"
+                        " AND file_size IS ? AND file_mtime IS ?"
+                        " AND working_copy_path IS NULL"
+                        " AND (SELECT path FROM folders"
+                        "        WHERE id = photos.folder_id) IS ?",
                         (
                             wc_rel, row["file_mtime"], row["id"],
                             row["folder_id"], row["filename"],
+                            row["companion_path"],
                             row["file_size"], row["file_mtime"],
+                            row["folder_path"],
                         ),
                     )
                 elif not publication_lost:
@@ -1858,11 +1890,16 @@ def _extract_working_copies(db, vireo_dir, progress_callback=None,
                         " working_copy_failed_mtime=NULL,"
                         " working_copy_failed_source=NULL"
                         " WHERE id=? AND folder_id=? AND filename=?"
-                        " AND file_size IS ? AND file_mtime IS ?",
+                        " AND companion_path IS ?"
+                        " AND file_size IS ? AND file_mtime IS ?"
+                        " AND working_copy_path IS NULL"
+                        " AND (SELECT path FROM folders"
+                        "        WHERE id = photos.folder_id) IS ?",
                         (
                             wc_rel, row["id"], row["folder_id"],
-                            row["filename"], row["file_size"],
-                            row["file_mtime"],
+                            row["filename"], row["companion_path"],
+                            row["file_size"], row["file_mtime"],
+                            row["folder_path"],
                         ),
                     )
                 # Identity-guarded UPDATE matched no row: the snapshot's
@@ -1885,18 +1922,63 @@ def _extract_working_copies(db, vireo_dir, progress_callback=None,
                     and update_cursor.rowcount == 0
                 ):
                     publication_orphaned = True
-                    try:
-                        os.remove(wc_abs)
-                    except FileNotFoundError:
-                        pass
-                    except OSError:
-                        # Quota eviction will reclaim the bytes on a later
-                        # pass; log so a persistently unremovable file (a
-                        # locked or read-only cache dir) is visible rather
-                        # than silently accumulating.
-                        log.warning(
-                            "Could not remove the orphaned working copy at "
-                            "%s", wc_abs, exc_info=True,
+                    # The publication guard released between our extract's
+                    # atomic replace and this reacquire, so a publisher for
+                    # a replacement row (id reuse, on-demand render) could
+                    # have already atomically replaced ``wc_abs`` with its
+                    # own bytes and committed its ``working_copy_path``.
+                    # Unlinking unconditionally would delete that valid
+                    # replacement and leave its committed path pointing at
+                    # a missing file. Compare the current file's identity
+                    # against the one we captured immediately after our
+                    # extract so a mismatched file (or one now claimed by
+                    # another row) survives.
+                    file_still_ours = False
+                    if published_identity is not None:
+                        try:
+                            current_identity = _wc_file_identity(
+                                os.stat(wc_abs)
+                            )
+                        except OSError:
+                            current_identity = None
+                        file_still_ours = (
+                            current_identity == published_identity
+                        )
+                    row_owned_by_replacement = db.conn.execute(
+                        "SELECT 1 FROM photos WHERE working_copy_path=?"
+                        " LIMIT 1",
+                        (wc_rel,),
+                    ).fetchone() is not None
+                    if file_still_ours and not row_owned_by_replacement:
+                        try:
+                            os.remove(wc_abs)
+                        except FileNotFoundError:
+                            pass
+                        except OSError:
+                            # Quota eviction will reclaim the bytes on a later
+                            # pass; log so a persistently unremovable file (a
+                            # locked or read-only cache dir) is visible rather
+                            # than silently accumulating.
+                            log.warning(
+                                "Could not remove the orphaned working copy at "
+                                "%s", wc_abs, exc_info=True,
+                            )
+                        log.info(
+                            "Discarding orphaned working-copy output for "
+                            "photo %s: row identity changed during extraction "
+                            "(deleted or reused for a new import); removed %s",
+                            row["id"], wc_abs,
+                        )
+                    else:
+                        log.info(
+                            "Discarding orphaned working-copy UPDATE for "
+                            "photo %s: row identity changed during "
+                            "extraction, but the canonical file at %s was "
+                            "replaced by another publisher (file_still_ours=%s,"
+                            " row_owned_by_replacement=%s); leaving their "
+                            "bytes intact",
+                            row["id"], wc_abs, file_still_ours,
+                            row_owned_by_replacement,
                         )
                     try:
                         db.conn.rollback()
@@ -1908,12 +1990,6 @@ def _extract_working_copies(db, vireo_dir, progress_callback=None,
                             "Rollback after an orphaned working-copy publish "
                             "failed", exc_info=True,
                         )
-                    log.info(
-                        "Discarding orphaned working-copy output for "
-                        "photo %s: row identity changed during extraction "
-                        "(deleted or reused for a new import); removed %s",
-                        row["id"], wc_abs,
-                    )
                 if not publication_lost and not publication_orphaned:
                     commit_with_retry(db.conn)
                     if quota_lowered_during_extraction:
@@ -1935,17 +2011,28 @@ def _extract_working_copies(db, vireo_dir, progress_callback=None,
             )
             # Same identity guard as the success path: don't stamp a
             # failure marker on a row whose id was reused for a new photo
-            # while this extraction was running.
+            # while this extraction was running, or whose companion or
+            # folder path changed (relocation, re-pairing) — in either case
+            # the row that now owns this id has different extraction inputs
+            # and the failure we saw is not its failure. ``working_copy_path
+            # IS NULL`` so a concurrent on-demand writer's successful
+            # publication is not clobbered with a failure marker.
             db.conn.execute(
                 "UPDATE photos SET working_copy_failed_at=datetime('now'),"
                 " working_copy_failed_mtime=?,"
                 " working_copy_failed_source=?"
                 " WHERE id=? AND folder_id=? AND filename=?"
-                " AND file_size IS ? AND file_mtime IS ?",
+                " AND companion_path IS ?"
+                " AND file_size IS ? AND file_mtime IS ?"
+                " AND working_copy_path IS NULL"
+                " AND (SELECT path FROM folders"
+                "        WHERE id = photos.folder_id) IS ?",
                 (
                     row["file_mtime"], failure_source, row["id"],
                     row["folder_id"], row["filename"],
+                    row["companion_path"],
                     row["file_size"], row["file_mtime"],
+                    row["folder_path"],
                 ),
             )
             commit_with_retry(db.conn)
@@ -1998,7 +2085,28 @@ def _extract_working_copies(db, vireo_dir, progress_callback=None,
                 retained_before_enforce = set(retained_new_files)
                 enforcement = None
                 try:
-                    enforcement = evict_if_over_quota(db, vireo_dir)
+                    # Protect this batch's own newly-written files from
+                    # eviction — but not the file we just wrote. Rows are
+                    # processed DESC by id, so the newest imports get the
+                    # OLDEST wall-clock mtime in the batch and would
+                    # otherwise be first in line for ``_evict_once``'s
+                    # ascending-mtime pass — precisely the rows the
+                    # ordering was meant to prioritize. Leaving ``wc_abs``
+                    # unprotected preserves the individually-oversized
+                    # case (a single JPEG larger than the whole budget is
+                    # still reclaimed and the batch continues with later
+                    # fitting candidates, per ``removed_batch_files ==
+                    # {wc_abs}`` below). With this protection, eviction
+                    # reclaims pre-existing copies first (caught by
+                    # ``displaced_existing`` below) or, on an
+                    # empty/all-batch cache, reports overshoot via
+                    # ``remaining_bytes > max_bytes`` (caught below) so
+                    # the batch still stops cleanly without dropping its
+                    # own highest-priority coverage.
+                    enforcement = evict_if_over_quota(
+                        db, vireo_dir,
+                        protect_paths=set(retained_new_files) - {wc_abs},
+                    )
                 except Exception:
                     log.exception(
                         "Working-copy quota enforcement failed mid-batch"
@@ -2022,10 +2130,42 @@ def _extract_working_copies(db, vireo_dir, progress_callback=None,
                 # Do not treat removal of only the current file as rotation:
                 # that is the individually-oversized case, where later
                 # candidates may still fit and must remain eligible.
+                #
+                # With ``protect_paths`` passed above, ``wc_abs`` is the
+                # only batch file eligible for eviction; the ``any path
+                # != wc_abs`` check therefore only fires when a batch
+                # write from before ``protect_paths`` was introduced
+                # snuck through (kept for defence in depth). The rotation
+                # signal that matters under protection is below.
                 removed_batch_files = (
                     retained_before_enforce - set(retained_new_files)
                 )
                 if any(path != wc_abs for path in removed_batch_files):
+                    stop_after_current = True
+
+                # DESC-ordering rotation under ``protect_paths``: eviction
+                # can only reclaim ``wc_abs`` from the batch, so watching
+                # for ``removed_batch_files != {wc_abs}`` (the old signal
+                # above) never catches "batch has filled the cache with
+                # its own newer files and is now rotating the just-written
+                # tail." When ``wc_abs`` was reclaimed AND other batch
+                # files remain retained, every future write will trip the
+                # same enforcement and land the same eviction — pure
+                # decode waste. When ``retained_new_files`` is empty the
+                # only removed file was an individually-oversized wc_abs
+                # (a single JPEG larger than the whole budget); later
+                # smaller candidates may still fit and the batch must
+                # remain eligible.
+                if (
+                    removed_batch_files == {wc_abs}
+                    and retained_new_files
+                ):
+                    log.info(
+                        "Working-copy batch rotated its own just-written "
+                        "file out to stay under the %.1f MB ceiling; "
+                        "deferring the rest rather than churning the tail",
+                        quota_bytes / 1024 / 1024,
+                    )
                     stop_after_current = True
 
                 # The same rotation, one step earlier: enforcement can stay
@@ -2059,6 +2199,41 @@ def _extract_working_copies(db, vireo_dir, progress_callback=None,
                         len(displaced_existing),
                     )
                     stop_after_current = True
+
+                # Protection can leave the cache above the ceiling when
+                # this batch has already filled it with its own newest-
+                # import files: eviction refused to reclaim them (as
+                # instructed), and there are no pre-existing copies left
+                # to shed. That is the natural stop point for a DESC-id
+                # backfill — the cache holds as much of the newest tail
+                # as it can, and decoding more would only overshoot the
+                # ceiling without displacing anything. A missing
+                # ``remaining_bytes`` (snapshot deferral) is treated as
+                # "unknown, do not force stop"; the mtime-rotation checks
+                # above still catch that case.
+                if enforcement is not None:
+                    remaining_bytes = enforcement.get("remaining_bytes")
+                    quota_bytes_from_enforcement = enforcement.get(
+                        "quota_bytes"
+                    )
+                    if (
+                        scope is None
+                        and remaining_bytes is not None
+                        and quota_bytes_from_enforcement is not None
+                        and remaining_bytes > quota_bytes_from_enforcement
+                    ):
+                        log.info(
+                            "Working-copy batch has filled the cache with "
+                            "its own newest-import files (%.1f MB over the "
+                            "%.1f MB ceiling); deferring the rest rather "
+                            "than overshooting further",
+                            (
+                                remaining_bytes
+                                - quota_bytes_from_enforcement
+                            ) / 1024 / 1024,
+                            quota_bytes_from_enforcement / 1024 / 1024,
+                        )
+                        stop_after_current = True
 
             # Once this batch alone has produced a full quota's worth of new
             # working copies, further generation would only displace files we

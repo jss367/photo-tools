@@ -256,7 +256,9 @@ def working_copy_stats(vireo_dir, quota_mb=None):
     }
 
 
-def evict_if_over_quota(db, vireo_dir, quota_mb=None, *, startup=False):
+def evict_if_over_quota(
+    db, vireo_dir, quota_mb=None, *, startup=False, protect_paths=None,
+):
     """Delete oldest canonical working copies until usage is within quota.
 
     Legacy Vireo versions wrote ``working/<photo_id>.jpg`` without recording
@@ -274,6 +276,17 @@ def evict_if_over_quota(db, vireo_dir, quota_mb=None, *, startup=False):
     reclaimed on the very first quota pass instead of waiting for another
     restart after the window closes.
 
+    ``protect_paths`` is an optional iterable of absolute working-copy paths
+    that this pass must not evict — used by the scanner's mid-batch quota
+    enforcement to keep its own newly-written files from being reclaimed as
+    the batch's oldest-mtime entries. Without it, DESC-id backfill would
+    watch eviction pick off its highest-priority files first (the newest
+    imports, born with the oldest wall-clock mtime) and defer the older
+    imports the rotation was meant to preserve. Protected files still count
+    toward usage, so a batch that fills the cache with protected content
+    triggers the ``remaining_bytes > max_bytes`` stop signal without losing
+    coverage of the very rows the ordering prioritizes.
+
     Returns a small result payload useful to startup/config callers and tests.
     """
     max_bytes = working_copy_quota_bytes(quota_mb)
@@ -284,9 +297,14 @@ def evict_if_over_quota(db, vireo_dir, quota_mb=None, *, startup=False):
             "quota_bytes": max_bytes, "evicted_paths": [],
         }
 
+    protected = frozenset(protect_paths or ())
+
     with _eviction_lock:
         for _snapshot_attempt in range(_EVICTION_SNAPSHOT_RETRIES):
-            result = _evict_once(db, working_dir, max_bytes, startup=startup)
+            result = _evict_once(
+                db, working_dir, max_bytes,
+                startup=startup, protect_paths=protected,
+            )
             if result is not None:
                 return result
         # A concurrent catalog writer kept invalidating our snapshot. Report
@@ -308,7 +326,9 @@ def evict_if_over_quota(db, vireo_dir, quota_mb=None, *, startup=False):
         }
 
 
-def _evict_once(db, working_dir, max_bytes, *, startup):
+def _evict_once(
+    db, working_dir, max_bytes, *, startup, protect_paths=frozenset(),
+):
     """One snapshot-consistent eviction pass; ``None`` on data_version change.
 
     Returns the same result payload as ``evict_if_over_quota`` when the pass
@@ -318,6 +338,8 @@ def _evict_once(db, working_dir, max_bytes, *, startup):
 
     ``_eviction_lock`` must already be held by the caller so this pass stays
     serialized with canonical publication.
+
+    ``protect_paths`` — see ``evict_if_over_quota``.
     """
     catalog_data_version = db.conn.execute(
         "PRAGMA data_version"
@@ -477,6 +499,16 @@ def _evict_once(db, working_dir, max_bytes, *, startup):
     ) in sorted(entries):
         if total <= max_bytes:
             break
+        if path in protect_paths:
+            # Caller is the scanner's mid-batch enforcement asking us to
+            # leave its just-written newest-import file in place. It has
+            # the oldest wall-clock mtime in the batch (born first, DESC
+            # id) and would otherwise be the first thing evicted, so the
+            # backfill would lose exactly the coverage the ordering was
+            # meant to buy. Continuing here bounds the transient overshoot
+            # to the caller's own writes; the caller detects this via the
+            # ``remaining_bytes > max_bytes`` return and stops the batch.
+            continue
         try:
             if _file_identity(os.stat(path)) != sampled_identity:
                 # Atomic publication replaced the sampled candidate after

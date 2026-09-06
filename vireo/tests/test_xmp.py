@@ -809,3 +809,134 @@ def test_sidecar_update_survives_unsettable_source_xattr(sample_xmp, monkeypatch
 
     write_rating(sample_xmp, 5)
     assert read_sync_preview_metadata(sample_xmp)["rating"] == "5"
+
+
+# ── SidecarEditor: one publish per sidecar ──────────────────────────────
+
+def _count_publishes(monkeypatch):
+    """Record every sidecar publish, delegating to the real writer."""
+    import xmp
+
+    published = []
+    original = xmp._write_tree_atomic
+
+    def counting(tree, xmp_path):
+        published.append(str(xmp_path))
+        return original(tree, xmp_path)
+
+    monkeypatch.setattr(xmp, "_write_tree_atomic", counting)
+    return published
+
+
+def test_editor_publishes_every_mutation_in_one_write(sample_xmp, monkeypatch):
+    """Keywords, flag, GPS, recipe and rating cost one publish, not five."""
+    from xmp import SidecarEditor
+
+    published = _count_publishes(monkeypatch)
+    editor = SidecarEditor(sample_xmp)
+    editor.remove_keywords({"Bird"})
+    editor.add_keywords({"Eagle"}, {"Animals|Birds|Eagle"})
+    editor.set_pick_flag("flagged")
+    editor.set_gps_location(48.8566, 2.3522)
+    editor.set_edit_recipe('{"exposure":1}')
+    editor.set_rating(4)
+    assert editor.commit() is True
+
+    assert len(published) == 1
+    metadata = read_sync_preview_metadata(sample_xmp)
+    assert metadata["keywords"] == {"Raptor", "Eagle"}
+    assert "Animals|Birds|Eagle" in metadata["hierarchical_keywords"]
+    assert metadata["flag"] == "flagged"
+    assert metadata["rating"] == "4"
+    assert metadata["location_source"] == "assigned"
+    assert metadata["edit_recipe"] == '{"exposure":1}'
+
+
+def test_editor_skips_the_write_when_nothing_changed(sample_xmp, monkeypatch):
+    """Re-applying metadata the sidecar already carries publishes nothing."""
+    from xmp import SidecarEditor
+
+    write_rating(sample_xmp, 4)
+    write_pick_flag(sample_xmp, "flagged")
+    original = Path(sample_xmp).read_bytes()
+
+    published = _count_publishes(monkeypatch)
+    editor = SidecarEditor(sample_xmp)
+    editor.add_keywords({"Bird", "Raptor"}, {"Location|Forest"})
+    editor.set_pick_flag("flagged")
+    editor.set_rating(4)
+    editor.remove_keywords({"Nothing here"})
+    assert editor.commit() is False
+
+    assert published == []
+    assert Path(sample_xmp).read_bytes() == original
+
+
+def test_editor_keeps_the_canonical_spelling_while_stripping_variants(tmp_path):
+    """``keep_exact`` removes only the variants of a keyword, not the keyword."""
+    from xmp import SidecarEditor
+
+    path = tmp_path / "photo.xmp"
+    path.write_text(SAMPLE_XMP.replace(
+        "<rdf:li>Bird</rdf:li>",
+        "<rdf:li>Bird</rdf:li>\n          <rdf:li>‘Bird</rdf:li>",
+    ))
+    editor = SidecarEditor(str(path))
+    assert editor.remove_keywords({"Bird"}, hierarchical=False, keep_exact=True)
+    editor.commit()
+
+    assert read_keywords(path) == {"Bird", "Raptor"}
+
+
+def test_editor_rating_persists_into_a_sidecar_the_same_batch_creates(missing_xmp):
+    """A rating alone creates nothing, but rides along when a flag does."""
+    from xmp import SidecarEditor
+
+    editor = SidecarEditor(missing_xmp)
+    editor.set_rating(5)
+    assert editor.commit() is False
+    assert not os.path.exists(missing_xmp)
+
+    editor = SidecarEditor(missing_xmp)
+    editor.set_pick_flag("rejected")
+    editor.set_rating(5)
+    assert editor.commit() is True
+
+    metadata = read_sync_preview_metadata(missing_xmp)
+    assert metadata["rating"] == "5"
+    assert metadata["flag"] == "rejected"
+
+
+def test_editor_removals_leave_a_corrupt_sidecar_untouched(tmp_path):
+    """Pruning operations never rebuild a sidecar they could not read."""
+    from xmp import SidecarEditor
+
+    path = tmp_path / "corrupt.xmp"
+    path.write_text("<x:xmpmeta><unclosed>")
+    editor = SidecarEditor(str(path))
+    assert editor.remove_keywords({"Bird"}) is False
+    assert editor.remove_vireo_gps_location() is False
+    assert editor.set_edit_recipe("") is False
+    assert editor.set_rating(3) is False
+    assert editor.commit() is False
+
+    assert path.read_text() == "<x:xmpmeta><unclosed>"
+
+
+def test_repeated_writer_calls_do_not_republish_unchanged_metadata(
+    sample_xmp, monkeypatch,
+):
+    """The module-level writers inherit the editor's no-op skip."""
+    write_rating(sample_xmp, 5)
+    write_gps_location(sample_xmp, 10, 20)
+
+    published = _count_publishes(monkeypatch)
+    write_rating(sample_xmp, 5)
+    write_gps_location(sample_xmp, 10, 20)
+    write_sidecar(sample_xmp, {"Bird"}, set())
+    assert remove_keywords(sample_xmp, {"Absent"}) is None
+    assert published == []
+
+    # A real change still publishes.
+    write_rating(sample_xmp, 3)
+    assert len(published) == 1

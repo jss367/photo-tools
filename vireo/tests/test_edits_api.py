@@ -926,7 +926,7 @@ def test_sync_preview_does_not_persist_rating_when_location_lacks_gps(
 def test_sync_preview_reports_rating_persisted_when_edit_recipe_creates_sidecar(
     client_with_photo,
 ):
-    """A non-empty edit recipe writes a sidecar via _load_or_create_xmp."""
+    """A non-empty edit recipe creates a sidecar through SidecarEditor."""
     app, db, photo_id = client_with_photo
     db.queue_change(photo_id, "rating", "5")
     db.queue_change(photo_id, "edit_recipe", '{"exposure": 0.5}')

@@ -10818,6 +10818,19 @@ def test_bulk_photo_id_apis_chunk_param_lists(tmp_path):
     det_map = db.get_detections_for_photos(huge, min_conf=0)
     assert det_map == {}
 
+    # Sidecar-path resolution takes the same whole-list treatment.
+    assert db.get_photo_filenames(huge) == {pid: (fid, "a.jpg")}
+
+
+def test_get_photo_filenames_returns_folder_and_name_for_existing_ids(db):
+    """Sync resolves sidecar paths from two columns, skipping deleted photos."""
+    fid = db.add_folder("/pics", name="pics")
+    pid = db.add_photo(folder_id=fid, filename="bird.jpg", extension=".jpg",
+                       file_size=10, file_mtime=1.0)
+
+    assert db.get_photo_filenames([]) == {}
+    assert db.get_photo_filenames([pid, pid + 999]) == {pid: (fid, "bird.jpg")}
+
 
 def test_move_folder_path_does_not_touch_wildcard_siblings(db):
     """LIKE treats _ and % as wildcards — moving /pics/my_dir must not

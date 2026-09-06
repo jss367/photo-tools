@@ -286,18 +286,6 @@ def _write_tree_atomic(tree, xmp_path):
             temp_path.unlink(missing_ok=True)
 
 
-def _get_or_create_bag(parent, tag_ns, tag_name):
-    """Find or create an rdf:Bag under a namespaced element."""
-    tag = f"{{{tag_ns}}}{tag_name}"
-    elem = parent.find(tag)
-    if elem is None:
-        elem = ET.SubElement(parent, tag)
-    bag = elem.find(f"{{{NS_RDF}}}Bag")
-    if bag is None:
-        bag = ET.SubElement(elem, f"{{{NS_RDF}}}Bag")
-    return bag
-
-
 def _read_bag_values(bag):
     """Read all rdf:li values from a bag."""
     values = set()
@@ -320,34 +308,6 @@ def _parse_xmp(xmp_path):
         return None
 
     return tree.getroot(), tree
-
-
-def _load_or_create_xmp(xmp_path):
-    """Load an XMP tree, or create a minimal sidecar tree."""
-    path = Path(xmp_path)
-
-    if path.exists():
-        try:
-            tree = ET.parse(path)
-            return tree.getroot(), tree
-        except ET.ParseError:
-            log.warning("Corrupt XMP file %s — creating new sidecar", path)
-
-    root = ET.Element(f"{{{NS_X}}}xmpmeta")
-    tree = ET.ElementTree(root)
-    return root, tree
-
-
-def _get_or_create_description(root):
-    """Find or create the first rdf:Description in an XMP tree."""
-    rdf = root.find(f"{{{NS_RDF}}}RDF")
-    if rdf is None:
-        rdf = ET.SubElement(root, f"{{{NS_RDF}}}RDF")
-
-    desc = rdf.find(f"{{{NS_RDF}}}Description")
-    if desc is None:
-        desc = ET.SubElement(rdf, f"{{{NS_RDF}}}Description")
-    return desc
 
 
 def _format_gps_coordinate(value, positive_ref, negative_ref):
@@ -533,6 +493,332 @@ def read_sync_preview_metadata(xmp_path):
     }
 
 
+class SidecarEditor:
+    """Accumulate sidecar edits and publish them in a single atomic write.
+
+    Every writer below used to parse the sidecar, mutate it, and republish it
+    on its own. One publish is a temp-file create, an fsync, an ACL and
+    extended-attribute copy, and a rename -- roughly 0.4s on an SMB-mounted
+    NAS -- so a photo whose sync queued keywords, a flag and a rating paid
+    that price four times over, re-reading the file before each one. The
+    editor parses once, applies every mutation to the same tree, and writes
+    once.
+
+    It also tracks whether any mutation actually changed something, so
+    re-syncing a sidecar that already carries the requested metadata costs a
+    read instead of a full network publish.
+
+    One editor drives one sidecar and is not thread-safe; callers that write
+    several sidecars concurrently use one editor per file.
+    """
+
+    def __init__(self, xmp_path):
+        self.path = xmp_path
+        self._root = None
+        self._tree = None
+        self._loaded = False
+        self._existed = False
+        self._parse_failed = False
+        self._dirty = False
+
+    # ── Loading ─────────────────────────────────────────────────────────
+
+    def _load(self):
+        """Parse the sidecar once, or start a fresh tree when there is none."""
+        if self._loaded:
+            return
+        self._loaded = True
+        path = Path(self.path)
+        try:
+            # Parse directly instead of stat-then-open: one fewer network
+            # round trip per sidecar on SMB/NFS.
+            tree = ET.parse(path)
+        except FileNotFoundError:
+            pass
+        except ET.ParseError:
+            self._existed = True
+            self._parse_failed = True
+            log.warning("Corrupt XMP file %s — creating new sidecar", path)
+        else:
+            self._existed = True
+            self._root = tree.getroot()
+            self._tree = tree
+            return
+        self._root = ET.Element(f"{{{NS_X}}}xmpmeta")
+        self._tree = ET.ElementTree(self._root)
+
+    def _readable(self):
+        """True when the sidecar existed on disk and parsed cleanly.
+
+        Operations that only ever prune existing metadata check this so a
+        missing or corrupt sidecar stays a no-op instead of being recreated
+        from an empty tree.
+        """
+        self._load()
+        return self._existed and not self._parse_failed
+
+    # ── Tree access ─────────────────────────────────────────────────────
+
+    def _description(self):
+        """Return the rdf:Description, creating the scaffolding if needed."""
+        self._load()
+        rdf = self._root.find(f"{{{NS_RDF}}}RDF")
+        if rdf is None:
+            rdf = ET.SubElement(self._root, f"{{{NS_RDF}}}RDF")
+            self._dirty = True
+        desc = rdf.find(f"{{{NS_RDF}}}Description")
+        if desc is None:
+            desc = ET.SubElement(rdf, f"{{{NS_RDF}}}Description")
+            self._dirty = True
+        return desc
+
+    def _find_description(self):
+        """Return the first rdf:Description, or None when there is none."""
+        self._load()
+        return self._root.find(f".//{{{NS_RDF}}}Description")
+
+    def _bag(self, desc, tag_ns, tag_name):
+        """Find or create an rdf:Bag under a namespaced element."""
+        tag = f"{{{tag_ns}}}{tag_name}"
+        elem = desc.find(tag)
+        if elem is None:
+            elem = ET.SubElement(desc, tag)
+            self._dirty = True
+        bag = elem.find(f"{{{NS_RDF}}}Bag")
+        if bag is None:
+            bag = ET.SubElement(elem, f"{{{NS_RDF}}}Bag")
+            self._dirty = True
+        return bag
+
+    def _set_attributes(self, desc, values):
+        """Set attributes, marking the tree dirty only for real changes."""
+        changed = False
+        for attr, value in values.items():
+            if desc.get(attr) != value:
+                desc.set(attr, value)
+                self._dirty = True
+                changed = True
+        return changed
+
+    # ── Mutations ───────────────────────────────────────────────────────
+
+    def add_keywords(self, flat_keywords=(), hierarchical_keywords=()):
+        """Merge keywords into dc:subject and lr:hierarchicalSubject."""
+        desc = self._description()
+        dc_bag = self._bag(desc, NS_DC, "subject")
+        existing_flat = _read_bag_values(dc_bag)
+        for kw in sorted(set(flat_keywords) - existing_flat):
+            ET.SubElement(dc_bag, f"{{{NS_RDF}}}li").text = kw
+            self._dirty = True
+
+        lr_bag = self._bag(desc, NS_LR, "hierarchicalSubject")
+        existing_hier = _read_bag_values(lr_bag)
+        for kw in sorted(set(hierarchical_keywords) - existing_hier):
+            ET.SubElement(lr_bag, f"{{{NS_RDF}}}li").text = kw
+            self._dirty = True
+
+    def remove_keywords(self, keywords_to_remove, *, hierarchical=True,
+                        keep_exact=False):
+        """Remove keywords from dc:subject and lr:hierarchicalSubject.
+
+        See ``remove_keywords`` for the ``hierarchical`` semantics.
+
+        ``keep_exact`` leaves an entry whose text is exactly one of
+        ``keywords_to_remove`` in place, so only spelling variants are
+        stripped. The sync path canonicalizes an add by removing variants of
+        it before writing the clean form; without this it would delete and
+        re-append the identical entry it already found, and a sidecar that
+        already says the right thing would never look unchanged.
+        """
+        if not self._readable():
+            return False
+
+        # Compare using the same normalized key add_keyword() uses on insert
+        # so a DB removal of `apapane` also clears a sidecar `‘apapane` (or
+        # `´apapane` / whitespace/casing variants). A plain `.lower()`
+        # comparison would leave the quoted <rdf:li> in place; the next XMP
+        # import path would then re-add the keyword the user removed. Drop
+        # empty keys so removing a keyword whose name normalizes to `""`
+        # doesn't accidentally match empty hierarchical segments (e.g.
+        # `"|Birds|"` -> `["", "Birds", ""]`).
+        remove_keys = {keyword_match_key(kw) for kw in keywords_to_remove}
+        remove_keys.discard("")
+        if not remove_keys:
+            return False
+        exact = set(keywords_to_remove) if keep_exact else set()
+        removed = []
+
+        for bag in self._root.findall(f".//{{{NS_DC}}}subject/{{{NS_RDF}}}Bag"):
+            for li in bag.findall(f"{{{NS_RDF}}}li"):
+                if not li.text or li.text in exact:
+                    continue
+                if keyword_match_key(li.text) in remove_keys:
+                    removed.append(li.text)
+                    bag.remove(li)
+
+        # Hierarchical entries match if any pipe-delimited segment matches.
+        # Skipped when hierarchical=False: the sync path uses the flat-only
+        # mode to canonicalize add-equivalent variants without accidentally
+        # deleting unrelated hierarchies that share a segment with the added
+        # flat leaf.
+        if hierarchical:
+            for bag in self._root.findall(
+                f".//{{{NS_LR}}}hierarchicalSubject/{{{NS_RDF}}}Bag"
+            ):
+                for li in bag.findall(f"{{{NS_RDF}}}li"):
+                    if not li.text or li.text in exact:
+                        continue
+                    segments = {keyword_match_key(s) for s in li.text.split("|")}
+                    segments.discard("")
+                    if segments & remove_keys:
+                        removed.append(li.text)
+                        bag.remove(li)
+
+        if removed:
+            self._dirty = True
+            log.info("Removed keywords from %s: %s", self.path, removed)
+        return bool(removed)
+
+    def set_rating(self, rating):
+        """Set xmp:Rating on a sidecar that exists or is already being written.
+
+        A rating alone never creates a sidecar. Within one editor an earlier
+        keyword, flag, location or edit mutation may have created one, and the
+        rating then belongs in it -- which is why callers apply the rating
+        last.
+        """
+        if not self._dirty and not self._readable():
+            return False
+        desc = self._find_description()
+        if desc is None:
+            return False
+        return self._set_attributes(desc, {f"{{{NS_XMP}}}Rating": str(rating)})
+
+    def set_pick_flag(self, flag):
+        """Set the Lightroom-compatible pick state, creating a sidecar if needed."""
+        values = {
+            "flagged": "1",
+            "none": "0",
+            "rejected": "-1",
+        }
+        if flag not in values:
+            raise ValueError("flag must be 'none', 'flagged', or 'rejected'")
+        desc = self._description()
+        return self._set_attributes(desc, {f"{{{NS_XMPDM}}}pick": values[flag]})
+
+    def set_gps_location(self, latitude, longitude, source="assigned"):
+        """Write Lightroom-compatible GPS coordinates, creating a sidecar if needed."""
+        lat = float(latitude)
+        lon = float(longitude)
+        if not math.isfinite(lat) or not (-90.0 <= lat <= 90.0):
+            raise ValueError("latitude must be between -90 and 90")
+        if not math.isfinite(lon) or not (-180.0 <= lon <= 180.0):
+            raise ValueError("longitude must be between -180 and 180")
+
+        desc = self._description()
+        marker = f"{{{NS_VIREO}}}gpsSource"
+        exif_attrs = {
+            "GPSLatitude": f"{{{NS_EXIF}}}GPSLatitude",
+            "GPSLongitude": f"{{{NS_EXIF}}}GPSLongitude",
+            "GPSMapDatum": f"{{{NS_EXIF}}}GPSMapDatum",
+            "GPSVersionID": f"{{{NS_EXIF}}}GPSVersionID",
+        }
+
+        # First Vireo write: preserve any GPS another app had already written
+        # so clearing the Vireo-assigned location can restore it. Rewrites of
+        # an existing Vireo GPS keep the original backup.
+        changed = False
+        if marker not in desc.attrib:
+            for name, attr in exif_attrs.items():
+                if attr in desc.attrib:
+                    changed |= self._set_attributes(
+                        desc, {f"{{{NS_VIREO}}}previous{name}": desc.attrib[attr]},
+                    )
+
+        changed |= self._set_attributes(desc, {
+            exif_attrs["GPSLatitude"]: _format_gps_coordinate(lat, "N", "S"),
+            exif_attrs["GPSLongitude"]: _format_gps_coordinate(lon, "E", "W"),
+            exif_attrs["GPSMapDatum"]: "WGS-84",
+            exif_attrs["GPSVersionID"]: "2.3.0.0",
+            marker: source or "assigned",
+        })
+        return changed
+
+    def remove_vireo_gps_location(self):
+        """Remove GPS fields only when Vireo previously wrote them."""
+        if not self._readable():
+            return False
+        desc = self._find_description()
+        if desc is None:
+            return False
+
+        marker = f"{{{NS_VIREO}}}gpsSource"
+        if marker not in desc.attrib:
+            return False
+
+        removed = False
+        for name in ("GPSLatitude", "GPSLongitude", "GPSMapDatum", "GPSVersionID"):
+            gps_attr = f"{{{NS_EXIF}}}{name}"
+            previous_attr = f"{{{NS_VIREO}}}previous{name}"
+            if previous_attr in desc.attrib:
+                desc.set(gps_attr, desc.attrib[previous_attr])
+                del desc.attrib[previous_attr]
+                removed = True
+            elif gps_attr in desc.attrib:
+                del desc.attrib[gps_attr]
+                removed = True
+
+        if marker in desc.attrib:
+            del desc.attrib[marker]
+            removed = True
+
+        if removed:
+            self._dirty = True
+        return removed
+
+    def set_edit_recipe(self, recipe_json):
+        """Write or clear Vireo's non-destructive edit recipe marker."""
+        recipe_json = recipe_json or ""
+        recipe_attr = f"{{{NS_VIREO}}}editRecipe"
+        version_attr = f"{{{NS_VIREO}}}editRecipeSchema"
+
+        if recipe_json:
+            desc = self._description()
+            return self._set_attributes(
+                desc, {recipe_attr: recipe_json, version_attr: "1"},
+            )
+
+        if not self._readable():
+            return False
+        desc = self._find_description()
+        if desc is None:
+            return False
+        removed = False
+        for attr in (recipe_attr, version_attr):
+            if attr in desc.attrib:
+                del desc.attrib[attr]
+                removed = True
+        if removed:
+            self._dirty = True
+        return removed
+
+    # ── Publication ─────────────────────────────────────────────────────
+
+    def commit(self):
+        """Publish the accumulated edits; a no-op when nothing changed.
+
+        Returns True when the sidecar was written.
+        """
+        if not self._dirty:
+            return False
+        ET.indent(self._tree, space="  ")
+        _write_tree_atomic(self._tree, self.path)
+        self._dirty = False
+        self._existed = True
+        self._parse_failed = False
+        return True
+
+
 def write_sidecar(xmp_path, flat_keywords, hierarchical_keywords):
     """Write or merge keywords into an XMP sidecar file.
 
@@ -541,47 +827,9 @@ def write_sidecar(xmp_path, flat_keywords, hierarchical_keywords):
         flat_keywords: set of keyword strings for dc:subject
         hierarchical_keywords: set of pipe-delimited hierarchy strings for lr:hierarchicalSubject
     """
-    path = Path(xmp_path)
-
-    if path.exists():
-        try:
-            tree = ET.parse(path)
-            root = tree.getroot()
-        except ET.ParseError:
-            log.warning("Corrupt XMP file %s — creating new sidecar", path)
-            root = ET.Element(f"{{{NS_X}}}xmpmeta")
-            tree = ET.ElementTree(root)
-    else:
-        root = ET.Element(f"{{{NS_X}}}xmpmeta")
-        tree = ET.ElementTree(root)
-
-    # Find or create rdf:RDF
-    rdf = root.find(f"{{{NS_RDF}}}RDF")
-    if rdf is None:
-        rdf = ET.SubElement(root, f"{{{NS_RDF}}}RDF")
-
-    # Find or create rdf:Description
-    desc = rdf.find(f"{{{NS_RDF}}}Description")
-    if desc is None:
-        desc = ET.SubElement(rdf, f"{{{NS_RDF}}}Description")
-
-    # Merge flat keywords into dc:subject
-    dc_bag = _get_or_create_bag(desc, NS_DC, "subject")
-    existing_flat = _read_bag_values(dc_bag)
-    for kw in sorted(flat_keywords - existing_flat):
-        li = ET.SubElement(dc_bag, f"{{{NS_RDF}}}li")
-        li.text = kw
-
-    # Merge hierarchical keywords into lr:hierarchicalSubject
-    lr_bag = _get_or_create_bag(desc, NS_LR, "hierarchicalSubject")
-    existing_hier = _read_bag_values(lr_bag)
-    for kw in sorted(hierarchical_keywords - existing_hier):
-        li = ET.SubElement(lr_bag, f"{{{NS_RDF}}}li")
-        li.text = kw
-
-    # Write with XML declaration
-    ET.indent(tree, space="  ")
-    _write_tree_atomic(tree, xmp_path)
+    editor = SidecarEditor(xmp_path)
+    editor.add_keywords(flat_keywords, hierarchical_keywords)
+    editor.commit()
 
 
 def write_rating(xmp_path, rating):
@@ -589,23 +837,9 @@ def write_rating(xmp_path, rating):
 
     No-op if the file does not exist (we don't create an XMP just for a rating).
     """
-    path = Path(xmp_path)
-
-    if path.exists():
-        try:
-            tree = ET.parse(path)
-            root = tree.getroot()
-        except ET.ParseError:
-            return
-    else:
-        return  # Don't create XMP just for rating
-
-    # Find rdf:Description and set xmp:Rating attribute
-    desc = root.find(f".//{{{NS_RDF}}}Description")
-    if desc is not None:
-        desc.set(f"{{{NS_XMP}}}Rating", str(rating))
-        ET.indent(tree, space="  ")
-        _write_tree_atomic(tree, xmp_path)
+    editor = SidecarEditor(xmp_path)
+    editor.set_rating(rating)
+    editor.commit()
 
 
 def write_pick_flag(xmp_path, flag):
@@ -615,19 +849,9 @@ def write_pick_flag(xmp_path, flag):
     Classic 13.2+ persists the equivalent pick state in ``xmpDM:pick`` using
     values ``1`` / ``0`` / ``-1``.
     """
-    values = {
-        "flagged": "1",
-        "none": "0",
-        "rejected": "-1",
-    }
-    if flag not in values:
-        raise ValueError("flag must be 'none', 'flagged', or 'rejected'")
-
-    root, tree = _load_or_create_xmp(xmp_path)
-    desc = _get_or_create_description(root)
-    desc.set(f"{{{NS_XMPDM}}}pick", values[flag])
-    ET.indent(tree, space="  ")
-    _write_tree_atomic(tree, xmp_path)
+    editor = SidecarEditor(xmp_path)
+    editor.set_pick_flag(flag)
+    editor.commit()
 
 
 def write_gps_location(xmp_path, latitude, longitude, source="assigned"):
@@ -637,107 +861,25 @@ def write_gps_location(xmp_path, latitude, longitude, source="assigned"):
     so ``remove_vireo_gps_location`` can clear stale assigned-location GPS
     without touching unrelated GPS metadata from another application.
     """
-    lat = float(latitude)
-    lon = float(longitude)
-    if not math.isfinite(lat) or not (-90.0 <= lat <= 90.0):
-        raise ValueError("latitude must be between -90 and 90")
-    if not math.isfinite(lon) or not (-180.0 <= lon <= 180.0):
-        raise ValueError("longitude must be between -180 and 180")
-
-    root, tree = _load_or_create_xmp(xmp_path)
-    desc = _get_or_create_description(root)
-    marker = f"{{{NS_VIREO}}}gpsSource"
-    exif_attrs = {
-        "GPSLatitude": f"{{{NS_EXIF}}}GPSLatitude",
-        "GPSLongitude": f"{{{NS_EXIF}}}GPSLongitude",
-        "GPSMapDatum": f"{{{NS_EXIF}}}GPSMapDatum",
-        "GPSVersionID": f"{{{NS_EXIF}}}GPSVersionID",
-    }
-
-    # First Vireo write: preserve any GPS another app had already written so
-    # clearing the Vireo-assigned location can restore it. Rewrites of an
-    # existing Vireo GPS keep the original backup.
-    if marker not in desc.attrib:
-        for name, attr in exif_attrs.items():
-            if attr in desc.attrib:
-                desc.set(f"{{{NS_VIREO}}}previous{name}", desc.attrib[attr])
-
-    desc.set(exif_attrs["GPSLatitude"], _format_gps_coordinate(lat, "N", "S"))
-    desc.set(exif_attrs["GPSLongitude"], _format_gps_coordinate(lon, "E", "W"))
-    desc.set(exif_attrs["GPSMapDatum"], "WGS-84")
-    desc.set(exif_attrs["GPSVersionID"], "2.3.0.0")
-    desc.set(marker, source or "assigned")
-    ET.indent(tree, space="  ")
-    _write_tree_atomic(tree, xmp_path)
+    editor = SidecarEditor(xmp_path)
+    editor.set_gps_location(latitude, longitude, source=source)
+    editor.commit()
 
 
 def remove_vireo_gps_location(xmp_path):
     """Remove GPS fields only when Vireo previously wrote them."""
-    result = _parse_xmp(xmp_path)
-    if result is None:
-        return False
-
-    root, tree = result
-    desc = root.find(f".//{{{NS_RDF}}}Description")
-    if desc is None:
-        return False
-
-    marker = f"{{{NS_VIREO}}}gpsSource"
-    if marker not in desc.attrib:
-        return False
-
-    removed = False
-    for name in ("GPSLatitude", "GPSLongitude", "GPSMapDatum", "GPSVersionID"):
-        gps_attr = f"{{{NS_EXIF}}}{name}"
-        previous_attr = f"{{{NS_VIREO}}}previous{name}"
-        if previous_attr in desc.attrib:
-            desc.set(gps_attr, desc.attrib[previous_attr])
-            del desc.attrib[previous_attr]
-            removed = True
-        elif gps_attr in desc.attrib:
-            del desc.attrib[gps_attr]
-            removed = True
-
-    if marker in desc.attrib:
-        del desc.attrib[marker]
-        removed = True
-
-    if removed:
-        ET.indent(tree, space="  ")
-        _write_tree_atomic(tree, xmp_path)
+    editor = SidecarEditor(xmp_path)
+    removed = editor.remove_vireo_gps_location()
+    editor.commit()
     return removed
 
 
 def write_edit_recipe(xmp_path, recipe_json):
     """Write or clear Vireo's non-destructive edit recipe marker."""
-    recipe_json = recipe_json or ""
-    recipe_attr = f"{{{NS_VIREO}}}editRecipe"
-    version_attr = f"{{{NS_VIREO}}}editRecipeSchema"
-
-    if recipe_json:
-        root, tree = _load_or_create_xmp(xmp_path)
-        desc = _get_or_create_description(root)
-        desc.set(recipe_attr, recipe_json)
-        desc.set(version_attr, "1")
-    else:
-        result = _parse_xmp(xmp_path)
-        if result is None:
-            return False
-        root, tree = result
-        desc = root.find(f".//{{{NS_RDF}}}Description")
-        if desc is None:
-            return False
-        removed = False
-        for attr in (recipe_attr, version_attr):
-            if attr in desc.attrib:
-                del desc.attrib[attr]
-                removed = True
-        if not removed:
-            return False
-
-    ET.indent(tree, space="  ")
-    _write_tree_atomic(tree, xmp_path)
-    return True
+    editor = SidecarEditor(xmp_path)
+    changed = editor.set_edit_recipe(recipe_json)
+    editor.commit()
+    return changed
 
 
 def remove_keywords(xmp_path, keywords_to_remove, *, hierarchical=True):
@@ -756,53 +898,6 @@ def remove_keywords(xmp_path, keywords_to_remove, *, hierarchical=True):
             ``apapane``) without deleting an unrelated hierarchy whose
             leaf happens to match the added flat keyword.
     """
-    path = Path(xmp_path)
-    if not path.exists():
-        return
-
-    try:
-        tree = ET.parse(path)
-    except ET.ParseError:
-        log.warning("Corrupt XMP file, cannot remove keywords: %s", xmp_path)
-        return
-
-    root = tree.getroot()
-    # Compare using the same normalized key add_keyword() uses on insert so a
-    # DB removal of `apapane` also clears a sidecar `‘apapane` (or `´apapane`
-    # / whitespace/casing variants). A plain `.lower()` comparison would leave
-    # the quoted <rdf:li> in place; the next XMP import path would then
-    # re-add the keyword the user removed. Drop empty keys so removing a
-    # keyword whose name normalizes to `""` doesn't accidentally match empty
-    # hierarchical segments (e.g. `"|Birds|"` -> `["", "Birds", ""]`).
-    remove_keys = {keyword_match_key(kw) for kw in keywords_to_remove}
-    remove_keys.discard("")
-    if not remove_keys:
-        return
-    removed = []
-
-    # Remove from dc:subject bag
-    for bag in root.findall(f".//{{{NS_DC}}}subject/{{{NS_RDF}}}Bag"):
-        for li in bag.findall(f"{{{NS_RDF}}}li"):
-            if li.text and keyword_match_key(li.text) in remove_keys:
-                removed.append(li.text)
-                bag.remove(li)
-
-    # Remove from lr:hierarchicalSubject bag (matches if any segment matches).
-    # Skipped when hierarchical=False: the sync path uses the flat-only mode
-    # to canonicalize add-equivalent variants without accidentally deleting
-    # unrelated hierarchies that share a segment with the added flat leaf.
-    if hierarchical:
-        for bag in root.findall(f".//{{{NS_LR}}}hierarchicalSubject/{{{NS_RDF}}}Bag"):
-            for li in bag.findall(f"{{{NS_RDF}}}li"):
-                if li.text:
-                    # Hierarchical keywords use pipe-delimited paths like "Animals|Birds|Hawk"
-                    segments = {keyword_match_key(s) for s in li.text.split("|")}
-                    segments.discard("")
-                    if segments & remove_keys:
-                        removed.append(li.text)
-                        bag.remove(li)
-
-    if removed:
-        ET.indent(tree, space="  ")
-        _write_tree_atomic(tree, xmp_path)
-        log.info("Removed keywords from %s: %s", xmp_path, removed)
+    editor = SidecarEditor(xmp_path)
+    editor.remove_keywords(keywords_to_remove, hierarchical=hierarchical)
+    editor.commit()

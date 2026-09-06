@@ -6568,6 +6568,28 @@ class Database:
             f"SELECT {self.PHOTO_DETAIL_COLS} FROM photos WHERE id = ?", (photo_id,)
         ).fetchone()
 
+    def get_photo_filenames(self, photo_ids):
+        """Return {photo_id: (folder_id, filename)} for the ids that exist.
+
+        Path resolution needs two columns; selecting whole photo rows for
+        thousands of photos drags along ``exif_data`` and every measurement
+        column for nothing. Ids with no photo row are simply absent, which is
+        how callers detect a deleted photo.
+        """
+        if not photo_ids:
+            return {}
+        result = {}
+        for chunk in _chunks(photo_ids):
+            placeholders = ",".join("?" for _ in chunk)
+            rows = self.conn.execute(
+                f"SELECT id, folder_id, filename FROM photos "
+                f"WHERE id IN ({placeholders})",
+                list(chunk),
+            ).fetchall()
+            for row in rows:
+                result[row["id"]] = (row["folder_id"], row["filename"])
+        return result
+
     def get_photos_by_ids(self, photo_ids):
         """Return photos for a list of IDs.
 

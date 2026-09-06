@@ -637,3 +637,172 @@ def test_review_keeps_homonymous_predictions_and_confirmed_tags_distinct(db, tmp
               + "\nprocess.stdout.write(JSON.stringify(hasMixedSpecies({})));\n")
     result = subprocess.run([node, "-e", script], capture_output=True, text=True, check=True, timeout=15)
     assert json.loads(result.stdout) == (not same_taxon)
+
+
+def _confirmed_species_photo(db, tmp_path, entry, name="photo.jpg"):
+    """A photo tagged with a plain common-name keyword linked to its taxon —
+    the shape a real catalog carries after an accept or an XMP read.
+    """
+    pid, _ = _photo(db, tmp_path, name)
+    keyword_id = db.add_keyword(entry["common_name"], is_species=True)
+    local = db.conn.execute("SELECT id FROM taxa WHERE inat_id = ?", (entry["taxon_id"],)).fetchone()["id"]
+    db.conn.execute("UPDATE keywords SET taxon_id = ?, source_taxon_id = ? WHERE id = ?",
+                    (local, entry["taxon_id"], keyword_id))
+    db.tag_photo(pid, keyword_id)
+    return pid
+
+
+def _review_conflict(data, expected_species):
+    """Run the review page's own conflict analysis over a results payload."""
+    html = (Path(__file__).parents[1] / "templates/pipeline_review.html").read_text()
+    start = html.index("var SPECIES_CONFLICT_THRESHOLDS")
+    source = ("var pipelineResults = " + json.dumps(data) + ";\n"
+              + html[start:html.index("function buildSpeciesConflictEvidence", start)]
+              + "\nprocess.stdout.write(JSON.stringify(analyzePhotoSpeciesConflict("
+                "pipelineResults.photos[0], " + json.dumps(expected_species) + ")));")
+    result = subprocess.run([shutil.which("node"), "-e", source],
+                            capture_output=True, text=True, check=True, timeout=15)
+    return json.loads(result.stdout)
+
+
+def test_unstamped_catalog_does_not_flag_a_species_against_itself(db, tmp_path):
+    """A catalog whose taxonomy never recorded common-name provenance leaves
+    every predicted common name unresolved (``name:``) while the confirmed
+    keyword keeps its taxon identity. Review must not read that plumbing
+    difference as two species disagreeing under one name.
+    """
+    from pipeline import attach_species_identities
+
+    if not shutil.which("node"):
+        pytest.skip("Node is required to execute the review comparison")
+    # No stamp: SpeciesResolver distrusts every common name in this catalog.
+    db.set_meta("common_name_identity_version", "")
+    pid = _confirmed_species_photo(db, tmp_path, LILAC)
+    resolver = SpeciesResolver(db=db)
+    assert resolver.resolve(LILAC["common_name"]).key == "name:lilac-crowned parrot"
+    data = {"photos": [{"id": pid, "species_top5": [
+        [LILAC["common_name"], .9995, "BioCLIP-2.5"],
+        [LILAC["common_name"], .8813, "iNat21 (EVA-02 Large)"],
+    ]}]}
+    attach_species_identities(data, resolver)
+    assert data["photos"][0]["confirmed_species_identities"] == [
+        {"name": LILAC["common_name"], "key": f"taxon:{LILAC['taxon_id']}"},
+    ]
+
+    evidence = _review_conflict(data, LILAC["common_name"])
+    assert evidence["severity"] is None
+    # The predictions support the suggestion instead of arguing against it.
+    assert evidence["expectedSupport"] == pytest.approx(.9404)
+    assert evidence.get("alternativeSpecies") is None
+
+
+def test_same_name_fold_does_not_hide_a_different_species(db, tmp_path):
+    """The fold is display-name equality only: a genuinely different name at
+    the same strength must still surface as a conflict.
+    """
+    from pipeline import attach_species_identities
+
+    if not shutil.which("node"):
+        pytest.skip("Node is required to execute the review comparison")
+    db.set_meta("common_name_identity_version", "")
+    pid = _confirmed_species_photo(db, tmp_path, LILAC)
+    data = {"photos": [{"id": pid, "species_top5": [
+        [BROWED["common_name"], .9995, "BioCLIP-2.5"],
+        [BROWED["common_name"], .8813, "iNat21 (EVA-02 Large)"],
+    ]}]}
+    attach_species_identities(data, SpeciesResolver(db=db))
+
+    evidence = _review_conflict(data, LILAC["common_name"])
+    assert evidence["severity"] == "strong"
+    assert evidence["alternativeSpecies"] == BROWED["common_name"]
+
+
+def test_group_review_modal_reads_the_same_conflict_as_the_card(db, tmp_path):
+    """The modal and the photo card behind it must agree. The modal has to
+    resolve the review unit's own species key to do that: an encounter holding
+    two identified taxa that share one display name leaves ``species_identities``
+    on the ambiguous ``name:`` fallback, which the modal would otherwise read as
+    agreement while the card reads a conflict.
+    """
+    from encounters import encounter_species_label
+    from pipeline import attach_species_identities, serialize_results
+
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("Node is required to execute the review comparison")
+    display = "Sharedus species"
+    db.conn.execute("UPDATE taxa SET name = ?, common_name = NULL WHERE inat_id IN (18976, 18997)", (display,))
+    for i, tid in enumerate((18976, 18997)):
+        _, det = _photo(db, tmp_path, f"modal-homonym-{i}.jpg")
+        db.add_prediction(det, display, .99, "BioCLIP", labels_fingerprint="custom", taxonomy={"taxon_id": tid})
+    photos = load_photo_features(db)
+    data = serialize_results({"photos": photos, "summary": {}, "encounters": [
+        {"photos": photos, "species": encounter_species_label(photos), "bursts": [photos]},
+    ]})
+    data = json.loads(json.dumps(data))
+    attach_species_identities(data, SpeciesResolver(db=db))
+    # The shared name itself cannot identify either taxon.
+    assert data["species_identities"][display]["key"].startswith("name:")
+
+    html = (Path(__file__).parents[1] / "templates/pipeline_review.html").read_text()
+    helpers = html[html.index("var SPECIES_CONFLICT_THRESHOLDS"):html.index("function buildSpeciesConflictEvidence")]
+    modal_start = html.index("var conflictEnc = pipelineResults")
+    modal = html[modal_start:html.index("  // Species predictions:", modal_start)]
+    script = ("var pipelineResults = " + json.dumps(data) + ";\n"
+              + "var grmState = {encIdx: 0, burstIdx: 0};\n"
+              + "var photo = pipelineResults.photos[1];\n"
+              + "function escapeHtml(s) { return String(s); }\n"
+              + "function formatSpeciesConfidence(v) { return Math.round(v * 100) + '%'; }\n"
+              + helpers + "\nvar html = '';\n" + modal + "\nprocess.stdout.write(html);")
+    result = subprocess.run([node, "-e", script], capture_output=True, text=True, check=True, timeout=15)
+    assert "Strong classification conflict" in result.stdout
+
+
+def test_partially_confirmed_encounter_keeps_a_same_name_taxon_visible(db, tmp_path):
+    """A mixed encounter carries ``confirmed_species`` with ``species_confirmed``
+    false, so the review unit offers no identity key and the expected side falls
+    back to the ambiguous shared name. An untagged frame whose prediction names
+    a *different* identified taxon is still a real conflict — the fold only
+    absorbs predictions that carry no identity of their own.
+    """
+    from encounters import encounter_species_label
+    from pipeline import attach_species_identities, serialize_results
+
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("Node is required to execute the review comparison")
+    display = "Sharedus species"
+    db.conn.execute("UPDATE taxa SET name = ?, common_name = NULL WHERE inat_id IN (18976, 18997)", (display,))
+    pids = []
+    for i, tid in enumerate((18976, 18997)):
+        pid, det = _photo(db, tmp_path, f"partial-{i}.jpg")
+        pids.append(pid)
+        db.add_prediction(det, display, .99, "BioCLIP", labels_fingerprint="custom", taxonomy={"taxon_id": tid})
+    # Only the first frame is tagged: the encounter is partially confirmed.
+    keyword_id = db.conn.execute(
+        "INSERT INTO keywords (name, is_species, type, taxon_id, source_taxon_id) "
+        "SELECT ?, 1, 'taxonomy', id, inat_id FROM taxa WHERE inat_id = ?", (display, 18976),
+    ).lastrowid
+    db.tag_photo(pids[0], keyword_id)
+
+    photos = load_photo_features(db)
+    data = serialize_results({"photos": photos, "summary": {}, "encounters": [
+        {"photos": photos, "species": encounter_species_label(photos), "bursts": [photos]},
+    ]})
+    data = json.loads(json.dumps(data))
+    attach_species_identities(data, SpeciesResolver(db=db))
+    encounter = data["encounters"][0]
+    assert encounter["confirmed_species"] == display
+    assert encounter["species_confirmed"] is False
+    assert data["species_identities"][display]["key"].startswith("name:")
+
+    html = (Path(__file__).parents[1] / "templates/pipeline_review.html").read_text()
+    source = html[html.index("var SPECIES_CONFLICT_THRESHOLDS"):html.index("function formatSpeciesConfidence")]
+    script = ("var pipelineResults = " + json.dumps(data) + ";\n" + source
+              + "\nvar photoMap = {}; pipelineResults.photos.forEach(function(p) { photoMap[p.id] = p; });"
+                "process.stdout.write(JSON.stringify(buildSpeciesConflictEvidence(photoMap)));")
+    result = subprocess.run([node, "-e", script], capture_output=True, text=True, check=True, timeout=15)
+    evidence = json.loads(result.stdout)
+    # The untagged frame predicts the other taxon under the same name.
+    assert evidence[str(pids[1])]["severity"] == "strong"
+    assert evidence[str(pids[0])]["severity"] is None

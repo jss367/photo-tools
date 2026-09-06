@@ -2894,6 +2894,17 @@ function normalizedSpeciesName(name) {
   return String(name || '').trim().toLocaleLowerCase().replace(/\s+/g, ' ');
 }
 
+function speciesDisplayKey(name) {
+  return String(name || '').trim().toLocaleLowerCase().replace(/\s+/g, ' ');
+}
+
+// A "name:" key is the resolver's way of saying it could not identify the
+// species at all — the key is the display text itself, not evidence about a
+// taxon. "taxon:"/"scientific:" keys are evidence.
+function speciesKeyIsUnidentified(key) {
+  return String(key || '').indexOf('name:') === 0;
+}
+
 function speciesCandidateForReviewUnit(enc, burst) {
   var override = burst && burst.species_override;
   if (override && override.species) return override.species;
@@ -2909,6 +2920,7 @@ function analyzePhotoSpeciesConflict(photo, expectedSpecies, normalizeSpecies, e
     var confirmed = (photo.confirmed_species_identities || []).filter(function(entry) { return entry.name === expectedSpecies; });
     if (confirmed.length === 1) expectedKey = confirmed[0].key;
   }
+  var expectedDisplayKey = speciesDisplayKey(expectedSpecies);
   var top5 = (photo && photo.species_top5) || [];
   if (!expectedKey || top5.length === 0) return null;
 
@@ -2920,6 +2932,18 @@ function analyzePhotoSpeciesConflict(photo, expectedSpecies, normalizeSpecies, e
     if (!entry || entry.length < 2) return;
     var display = String(entry[0] || '').trim();
     var species = entry[3] || normalizeSpecies(display);
+    // A prediction the resolver could not identify is bare text: a catalog
+    // whose taxonomy never recorded its common-name provenance leaves every
+    // predicted name at "name:mallard" while the confirmed keyword holds
+    // "taxon:6930". Under one name with no identity of its own, such a
+    // prediction supports the current suggestion instead of arguing against
+    // it. An *identified* prediction is never folded, even when the expected
+    // side is the ambiguous fallback key: a same-name taxon the source can
+    // tell apart is exactly the homonym review must keep visible.
+    if (species !== expectedKey && speciesKeyIsUnidentified(species) &&
+        speciesDisplayKey(display) === expectedDisplayKey) {
+      species = expectedKey;
+    }
     displayNames[species] = display;
     var confidence = Number(entry[1]);
     var model = String(entry[2] || 'unknown');
@@ -6739,7 +6763,13 @@ function buildPipelineMetadataHtml(photo) {
   var conflictBurst = conflictEnc && conflictEnc.bursts &&
     conflictEnc.bursts[grmState.burstIdx];
   var conflictExpected = speciesCandidateForReviewUnit(conflictEnc, conflictBurst);
-  var speciesConflict = analyzePhotoSpeciesConflict(photo, conflictExpected);
+  // Same expected identity the card behind this modal used: without the
+  // review unit's own candidate key, an encounter holding two identified taxa
+  // that share a display name falls back to the ambiguous "name:" key, and
+  // the modal would read that as agreement while the card reads a conflict.
+  var speciesConflict = analyzePhotoSpeciesConflict(
+    photo, conflictExpected, null,
+    speciesCandidateKeyForReviewUnit(conflictEnc, conflictBurst, conflictExpected));
   if (speciesConflict && speciesConflict.severity) {
     var conflictHeading = speciesConflict.severity === 'strong'
       ? 'Strong classification conflict'

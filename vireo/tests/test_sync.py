@@ -1460,6 +1460,7 @@ def test_sync_resolves_paths_once_per_run_and_folder(tmp_path, monkeypatch):
     assert len([p for p in isdir_calls if str(tmp_path) in str(p)]) == 1
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="symlink creation needs elevation")
 def test_sync_serializes_photos_reached_through_folder_alias(tmp_path):
     """A folder symlink and its target resolve to one sidecar, on one worker.
 
@@ -1493,27 +1494,36 @@ def test_sync_serializes_photos_reached_through_folder_alias(tmp_path):
     assert read_keywords(xmp_path) == {"Osprey", "Kestrel"}
 
 
-def test_sync_serializes_case_aliases_on_case_insensitive_filesystems(tmp_path, monkeypatch):
-    """Case-different sidecar paths on a case-insensitive FS are one file.
+def test_sync_serializes_case_variant_sidecars_without_merging_them(tmp_path):
+    """Case-variant sidecar paths share a worker but keep their own files.
 
     ``Bird.CR3`` and ``BIRD.JPG`` in one folder derive sidecar paths ending in
-    ``Bird.xmp`` and ``BIRD.xmp``, distinct Python strings but the same file
-    on macOS APFS or an SMB share. Without alias detection each ran on its
-    own worker and one photo's changes were overwritten.
+    ``Bird.xmp`` and ``BIRD.xmp`` -- distinct strings, but the same file on
+    APFS, SMB and NTFS. They must never be published in parallel, or one
+    photo's tree overwrites the other's while both report synced.
+
+    Both properties are asserted without depending on the host filesystem's
+    case behaviour, because that is exactly what the code no longer probes:
+    the two writes must land on one worker thread, and each photo's keyword
+    must reach the path that photo names. On a case-insensitive host those
+    two paths are one file holding both keywords; on a case-sensitive host
+    they are two files holding one each. Either way nothing is lost and
+    nothing is written into the wrong sidecar.
     """
-    import sync as sync_module
+    import threading
+
+    import xmp as xmp_module
     from db import Database
     from sync import sync_to_xmp
-    from xmp import read_keywords
-
-    monkeypatch.setattr(sync_module, "_is_case_insensitive_dir", lambda folder: True)
+    from xmp import read_keywords, write_sidecar
 
     db = Database(str(tmp_path / "test.db"))
     db.set_active_workspace(db.ensure_default_workspace())
     a_id, xmp_path = _setup_photo_with_xmp(tmp_path, db)
+    folder = os.path.dirname(xmp_path)
     folder_id = db.get_photo(a_id)["folder_id"]
     # Rename the sidecar and the photo so it looks like the mixed-case source.
-    mixed_path = os.path.join(os.path.dirname(xmp_path), "Bird.xmp")
+    mixed_path = os.path.join(folder, "Bird.xmp")
     os.rename(xmp_path, mixed_path)
     db.conn.execute(
         "UPDATE photos SET filename = ?, extension = ? WHERE id = ?",
@@ -1523,101 +1533,27 @@ def test_sync_serializes_case_aliases_on_case_insensitive_filesystems(tmp_path, 
         folder_id=folder_id, filename="BIRD.JPG", extension=".JPG",
         file_size=100, file_mtime=1.0,
     )
+    upper_path = os.path.join(folder, "BIRD.xmp")
+    write_sidecar(upper_path, flat_keywords=set(), hierarchical_keywords=set())
     db.queue_change(a_id, "keyword_add", "Osprey")
     db.queue_change(b_id, "keyword_add", "Kestrel")
 
-    result = sync_to_xmp(db)
+    threads = []
+    original = xmp_module._write_tree_atomic
+
+    def record_thread(tree, path):
+        threads.append(threading.current_thread().name)
+        return original(tree, path)
+
+    xmp_module._write_tree_atomic = record_thread
+    try:
+        result = sync_to_xmp(db)
+    finally:
+        xmp_module._write_tree_atomic = original
 
     assert result["synced"] == 2, result["errors"]
-    # Only one sidecar exists on disk under a case-insensitive FS emulation;
-    # both photos' keywords must be in it.
-    assert read_keywords(mixed_path) == {"Osprey", "Kestrel"}
-
-
-def test_sync_keeps_case_variant_sidecars_separate_on_case_sensitive_fs(tmp_path, monkeypatch):
-    """A case-sensitive filesystem must not merge distinct case-variant sidecars.
-
-    Guard against over-grouping: two photos whose sidecar basenames only
-    differ in case are separate files here, so their writes must not collapse
-    onto one path -- that would leave the other file untouched and drop the
-    losing photo's changes into the wrong sidecar.
-    """
-    import sync as sync_module
-    from db import Database
-    from sync import sync_to_xmp
-    from xmp import read_keywords
-
-    monkeypatch.setattr(sync_module, "_is_case_insensitive_dir", lambda folder: False)
-
-    db = Database(str(tmp_path / "test.db"))
-    db.set_active_workspace(db.ensure_default_workspace())
-    a_id, xmp_a = _setup_photo_with_xmp(tmp_path, db)
-    folder = os.path.dirname(xmp_a)
-    folder_id = db.get_photo(a_id)["folder_id"]
-    # Second photo whose sidecar is the same basename with the case flipped.
-    b_id = db.add_photo(
-        folder_id=folder_id, filename="BIRD.JPG", extension=".JPG",
-        file_size=100, file_mtime=1.0,
-    )
-    xmp_b = os.path.join(folder, "BIRD.xmp")
-    from xmp import write_sidecar
-    write_sidecar(xmp_b, flat_keywords=set(), hierarchical_keywords=set())
-
-    db.queue_change(a_id, "keyword_add", "Osprey")
-    db.queue_change(b_id, "keyword_add", "Kestrel")
-
-    result = sync_to_xmp(db)
-
-    assert result["synced"] == 2, result["errors"]
-    assert read_keywords(xmp_a) == {"Osprey"}
-    assert read_keywords(xmp_b) == {"Kestrel"}
-
-
-def test_is_case_insensitive_dir_probes_folder_not_ancestors(tmp_path, monkeypatch):
-    """Probe the folder's own filesystem, not an ancestor with letters.
-
-    A numerics-only path like ``/mnt/share/2026/09/06`` used to walk up to
-    ``share`` (a mount-point entry on the parent filesystem) and probe its
-    case there. On a case-sensitive Linux parent with a case-insensitive SMB
-    mount inside, that probe returned False and the alias race for
-    ``bird.CR3`` / ``BIRD.JPG`` came back. The probe now stays inside
-    ``folder`` — either an existing letter-bearing child or a short-lived
-    temp file — so a case-insensitive mount is detected regardless of how the
-    outer ancestor spelling behaves.
-    """
-    from sync import _is_case_insensitive_dir
-
-    # An all-numeric ancestry that would answer False on a case-sensitive
-    # filesystem if we walked up out of it; the folder itself is a normal
-    # case-sensitive tmpfs on Linux CI, so the detector must report False
-    # regardless of what ``2026`` would resolve to.
-    numeric_folder = tmp_path / "2026" / "09" / "06"
-    numeric_folder.mkdir(parents=True)
-    assert _is_case_insensitive_dir(str(numeric_folder)) is False
-
-    # Existing alphabetic entry inside the folder: the probe must consult
-    # that entry, not any ancestor. Force ``os.path.samefile`` to return True
-    # to prove the detector is actually reaching into ``folder`` for the
-    # answer rather than short-circuiting on ancestor spelling.
-    import sync as sync_module
-
-    (numeric_folder / "sample.txt").write_text("x")
-    calls = []
-
-    def fake_samefile(a, b):
-        calls.append((a, b))
-        return True
-
-    monkeypatch.setattr(sync_module.os.path, "samefile", fake_samefile)
-    assert _is_case_insensitive_dir(str(numeric_folder)) is True
-    assert calls, "detector must probe inside the folder"
-    probed_left, probed_right = calls[0]
-    assert os.path.dirname(probed_left) == os.path.abspath(str(numeric_folder))
-    assert os.path.dirname(probed_right) == os.path.abspath(str(numeric_folder))
-
-
-def test_is_case_insensitive_dir_returns_false_when_folder_missing(tmp_path):
-    """An unreadable or missing folder cannot be probed; report False."""
-    from sync import _is_case_insensitive_dir
-
-    assert _is_case_insensitive_dir(str(tmp_path / "does-not-exist")) is False
+    # One group means one worker: the publishes cannot have overlapped.
+    assert len(set(threads)) == 1, threads
+    # And each photo's change reached the path that photo names.
+    assert "Osprey" in read_keywords(mixed_path)
+    assert "Kestrel" in read_keywords(upper_path)

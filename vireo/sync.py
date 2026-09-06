@@ -1,9 +1,7 @@
 """Sync engine: reconcile database and XMP sidecars."""
 
-import contextlib
 import logging
 import os
-import tempfile
 from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
@@ -68,62 +66,6 @@ def _write_assigned_location_to_xmp_enabled(db):
 
 
 _KEYWORD_CHANGE_TYPES = ("keyword_add", "keyword_remove", "keyword_remove_flat")
-
-
-def _is_case_insensitive_dir(folder):
-    """Detect whether the filesystem holding ``folder`` is case-insensitive.
-
-    macOS APFS's default variant, NTFS, and SMB shares treat ``Bird.xmp`` and
-    ``BIRD.xmp`` as the same file, but ``os.path.normcase`` only lowercases on
-    Windows. Probe the filesystem that owns ``folder`` itself: an SMB share
-    mounted at ``/mnt/share`` may sit on a case-sensitive Linux parent, so an
-    ancestor-spelling probe (``/mnt/share`` vs ``/mnt/SHARE``) reads the
-    parent filesystem's case rules and misses that the mount inside is
-    case-insensitive, which reintroduces the alias race for a numerics-only
-    path like ``/mnt/share/2026/09/06``. Look for an existing alphabetic
-    entry inside ``folder`` and probe its case-swapped path; if none exists,
-    create a short-lived temp file with an alphabetic name so the probe still
-    exercises the folder's own filesystem. Returns False when the folder is
-    missing, unreadable, unwritable, or the probe raises.
-    """
-    folder = os.path.abspath(folder)
-    try:
-        with os.scandir(folder) as it:
-            for entry in it:
-                name = entry.name
-                swapped = name.swapcase()
-                if swapped == name:
-                    continue
-                try:
-                    return os.path.samefile(
-                        os.path.join(folder, name),
-                        os.path.join(folder, swapped),
-                    )
-                except OSError:
-                    return False
-    except OSError:
-        return False
-
-    # Empty folder, or every entry's name is caseless (digits, symbols).
-    # Drop a probe file whose prefix is guaranteed to contain letters so a
-    # numerics-only path like ``/mnt/share/2026/09/06`` still gets its own
-    # filesystem probed rather than an ancestor's.
-    try:
-        fd, probe = tempfile.mkstemp(
-            prefix="vireo-case-probe-", suffix=".tmp", dir=folder,
-        )
-    except OSError:
-        return False
-    os.close(fd)
-    try:
-        swapped_path = os.path.join(folder, os.path.basename(probe).swapcase())
-        try:
-            return os.path.samefile(probe, swapped_path)
-        except OSError:
-            return False
-    finally:
-        with contextlib.suppress(OSError):
-            os.remove(probe)
 
 
 def _select_changes(changes, change_ids):
@@ -409,7 +351,6 @@ def sync_to_xmp(db, progress_callback=None, change_ids=None):
     plans = {}
     folder_accessible = {}
     canonical_folders = {}
-    folder_case_insensitive = {}
     for photo_id, photo_changes in by_photo.items():
         xmp_path = xmp_paths.get(photo_id)
         if not xmp_path:
@@ -420,9 +361,9 @@ def sync_to_xmp(db, progress_callback=None, change_ids=None):
 
         # Check if the folder exists (NAS might be offline). Cache the answer
         # per folder: on a slow or offline mount this is a network round trip,
-        # and a folder holds thousands of photos. Resolve symlinks and probe
-        # case sensitivity here too so the sidecar-grouping below sees one
-        # canonical answer per folder rather than one syscall per photo.
+        # and a folder holds thousands of photos. Resolve symlinks here too so
+        # the sidecar grouping below sees one canonical folder per folder
+        # rather than one syscall per photo.
         folder = os.path.dirname(xmp_path)
         if folder not in folder_accessible:
             folder_accessible[folder] = os.path.isdir(folder)
@@ -431,7 +372,6 @@ def sync_to_xmp(db, progress_callback=None, change_ids=None):
                     canonical_folders[folder] = os.path.realpath(folder)
                 except OSError:
                     canonical_folders[folder] = folder
-                folder_case_insensitive[folder] = _is_case_insensitive_dir(folder)
         if not folder_accessible[folder]:
             prepare_failures[photo_id] = {
                 "photo_id": photo_id,
@@ -462,34 +402,38 @@ def sync_to_xmp(db, progress_callback=None, change_ids=None):
                     "reason": _failure_reason(e),
                 }
 
-    # Group by sidecar, not by photo: a RAW and a JPEG sharing a basename
-    # share one .xmp, and two threads publishing the same file would clobber
-    # each other. Aliases produce different Python strings for the same file
-    # -- symlinked folders, and case variants on case-insensitive filesystems
-    # (macOS APFS, SMB, NTFS) -- so canonicalize the key: the folder resolved
-    # once via ``realpath``, ``normcase`` for Windows, and a case-folded
-    # basename when the filesystem probe says the folder is case-insensitive.
-    # Keep any one of the alias paths for the write itself; on the filesystems
-    # that make them aliases they all open the same file. Photos on one
-    # sidecar stay on one worker, in queue order.
+    # Group photos that may share a sidecar, so no two threads publish the
+    # same file: a RAW and a JPEG with one basename share one .xmp, and
+    # aliases spell the same file differently -- a folder reached through a
+    # symlink, or basenames differing only in case on APFS/SMB/NTFS. The key
+    # is the realpath'd folder plus a normcase'd, case-folded basename, so
+    # every alias lands in one group.
+    #
+    # Grouping decides ordering only; each photo is still written through its
+    # own path. That makes an over-grouping harmless: two names a
+    # case-sensitive filesystem keeps distinct (`Masse.xmp` / `Maße.xmp`,
+    # which case-fold alike) are written to their own files, one after the
+    # other, instead of in parallel. Deciding instead to keep one path per
+    # group would silently write one photo's metadata into the other's
+    # sidecar, and knowing which case applies would mean probing the
+    # filesystem's case sensitivity -- a heuristic that is wrong for any
+    # mount whose in-mount path components carry no letters, and an extra
+    # round trip per folder on the NAS this loop exists to keep fast.
     by_sidecar = defaultdict(list)
-    sidecar_write_path = {}
     for photo_id in plans:
         xmp_path = xmp_paths[photo_id]
-        folder = os.path.dirname(xmp_path)
-        canonical_folder = canonical_folders.get(folder, folder)
-        basename = os.path.basename(xmp_path)
-        if folder_case_insensitive.get(folder, False):
-            basename = basename.casefold()
-        canonical_key = os.path.normcase(os.path.join(canonical_folder, basename))
-        by_sidecar[canonical_key].append(photo_id)
-        sidecar_write_path.setdefault(canonical_key, xmp_path)
+        canonical_folder = canonical_folders.get(
+            os.path.dirname(xmp_path), os.path.dirname(xmp_path),
+        )
+        canonical_key = os.path.normcase(
+            os.path.join(canonical_folder, os.path.basename(xmp_path).casefold())
+        )
+        by_sidecar[canonical_key].append((photo_id, xmp_path))
 
     def write_sidecar_group(canonical_key):
         """Write every photo queued against one sidecar; never raises."""
-        xmp_path = sidecar_write_path[canonical_key]
         outcomes = {}
-        for photo_id in by_sidecar[canonical_key]:
+        for photo_id, xmp_path in by_sidecar[canonical_key]:
             try:
                 _write_photo_sync(
                     xmp_path, plans[photo_id], locations.get(photo_id),
@@ -502,7 +446,12 @@ def sync_to_xmp(db, progress_callback=None, change_ids=None):
 
     results = {}
     total = len(by_photo)
-    completed = 0
+    # Photos that failed preparation are finished work: an offline NAS
+    # otherwise leaves the panel reading "0 of 2,240" while the run walks
+    # through every one of them.
+    completed = len(prepare_failures)
+    if progress_callback and completed:
+        progress_callback(completed, total)
     if by_sidecar:
         workers = min(_SYNC_MAX_WORKERS, len(by_sidecar))
         with ThreadPoolExecutor(

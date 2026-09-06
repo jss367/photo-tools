@@ -610,11 +610,41 @@ def load_working_image(
 
     if photo.get("working_copy_path"):
         wc_path = os.path.join(vireo_dir, photo["working_copy_path"])
-        if os.path.exists(wc_path):
+        if record_access:
+            # Hold ``working_copy_publication_guard`` across the
+            # existence check, decode, AND the touch — the same
+            # invariant ``_serve_trusted_working_copy`` and the
+            # interactive render routes (`/original`, `/edit-preview`,
+            # `/crop`) rely on. Without one guarded block:
+            #
+            # * eviction can unlink the file after ``os.path.exists``
+            #   but before ``_load_standard`` opens it, turning an
+            #   otherwise healthy interactive read into a transient
+            #   fallback to the source; and
+            # * a publisher can atomically replace the canonical path
+            #   between the decode and the touch, so
+            #   ``touch_working_copy_access`` stamps recency onto
+            #   bytes that were NOT the ones we just decoded — and
+            #   the decoded image is not the one whose access we
+            #   are recording.
+            #
+            # Job callers pass ``record_access=False`` (the default)
+            # and keep the pre-consolidation behavior: no lock, since
+            # a background sweep that holds the eviction guard across
+            # every decode would serialize the whole library.
+            from working_copy_cache import (
+                touch_working_copy_access,
+                working_copy_publication_guard,
+            )
+            with working_copy_publication_guard():
+                if os.path.exists(wc_path):
+                    working_image = _load_standard(wc_path, max_size)
+                    if working_image is not None:
+                        touch_working_copy_access(wc_path)
+                        return _result(working_image, "working_copy")
+        elif os.path.exists(wc_path):
             working_image = _load_standard(wc_path, max_size)
             if working_image is not None:
-                if record_access:
-                    _record_working_copy_access(wc_path)
                 return _result(working_image, "working_copy")
 
     # No usable working copy — load original (may be JPEG or RAW). This also

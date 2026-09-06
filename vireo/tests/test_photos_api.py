@@ -2040,11 +2040,14 @@ def test_original_serves_full_res_working_copy(app_and_db):
 def test_original_stamps_the_working_copy_it_serves(app_and_db):
     """Serving a working copy marks it as recently used.
 
-    Quota eviction orders candidates by mtime, which on a generated file
-    means "written longest ago" unless something records use. Without this
-    stamp a full cache reclaims the copies for the photos being worked on
-    right now — they are the ones that have been on disk the longest —
-    while an archive nobody opens survives.
+    Quota eviction sorts by ``max(mtime_ns, atime_ns)``. Access recency
+    is advanced via atime so the WC's mtime stays reserved as the
+    content-version key (``_external_edit_handoff_path`` regenerates
+    the external-editor handoff when it changes, which would overwrite
+    the file the external editor saved into). Without an atime advance
+    a full cache reclaims the copies for the photos being worked on
+    right now — they are the ones that have been on disk the longest
+    — while an archive nobody opens survives.
     """
     from PIL import Image
 
@@ -2071,9 +2074,16 @@ def test_original_stamps_the_working_copy_it_serves(app_and_db):
 
     resp = client.get(f"/photos/{pid}/original")
     assert resp.status_code == 200
-    assert os.path.getmtime(wc_path) > stale, (
-        "the served working copy kept its month-old mtime, so quota "
-        "eviction still reads it as the least valuable file in the cache"
+    stat_after = os.stat(wc_path)
+    assert stat_after.st_atime > stale, (
+        "the served working copy kept its month-old atime, so quota "
+        "eviction (sort key: max(mtime, atime)) still reads it as the "
+        "least valuable file in the cache"
+    )
+    assert stat_after.st_mtime == stale, (
+        "the served working copy's mtime advanced — that key must stay "
+        "stable for the external-edit handoff and display-cache "
+        "freshness gates"
     )
 
 
@@ -13110,15 +13120,21 @@ def test_edit_render_touches_working_copy_source(
     # recent modification.
     aged = time.time() - 24 * 3600
     os.utime(wc_path, (aged, aged))
-    aged_mtime = os.path.getmtime(wc_path)
+    aged_atime = os.stat(wc_path).st_atime
+    aged_mtime = os.stat(wc_path).st_mtime
 
     resp = app.test_client().get(f"/photos/{photo_id}/original")
     assert resp.status_code == 200, resp.data
-    now_mtime = os.path.getmtime(wc_path)
-    assert now_mtime > aged_mtime, (
+    stat_after = os.stat(wc_path)
+    assert stat_after.st_atime > aged_atime, (
         "recipe render did not touch the working copy it read as source: "
-        f"mtime is still {now_mtime} (aged {aged_mtime}); an actively "
-        "edited WC would stay at the head of the eviction queue"
+        f"atime is still {stat_after.st_atime} (aged {aged_atime}); an "
+        "actively edited WC would stay at the head of the eviction queue"
+    )
+    assert stat_after.st_mtime == aged_mtime, (
+        "recipe render advanced the WC's mtime — the external-edit "
+        "handoff would treat this as a content change and overwrite "
+        "the file the external editor saved into"
     )
 
 
@@ -13240,7 +13256,8 @@ def test_edit_preview_touches_working_copy_under_guard(
 
     aged = time.time() - 24 * 3600
     os.utime(wc_path, (aged, aged))
-    aged_mtime = os.path.getmtime(wc_path)
+    aged_atime = os.stat(wc_path).st_atime
+    aged_mtime = os.stat(wc_path).st_mtime
 
     lock_held_when_touched = []
     real_touch = working_copy_cache.touch_working_copy_access
@@ -13273,9 +13290,15 @@ def test_edit_preview_touches_working_copy_under_guard(
             f"reclaiming it, overshooting a lowered quota: {path}"
         )
 
-    now_mtime = os.path.getmtime(wc_path)
-    assert now_mtime > aged_mtime, (
-        "edit-preview render did not advance the WC's mtime; an "
-        f"actively edited photo would stay first in the eviction queue: "
-        f"mtime is still {now_mtime} (aged {aged_mtime})"
+    stat_after = os.stat(wc_path)
+    assert stat_after.st_atime > aged_atime, (
+        "edit-preview render did not advance the WC's atime; an "
+        "actively edited photo would stay first in the eviction queue "
+        f"(sort key: max(mtime, atime)): atime is still "
+        f"{stat_after.st_atime} (aged {aged_atime})"
+    )
+    assert stat_after.st_mtime == aged_mtime, (
+        "edit-preview render advanced the WC's mtime — the external-"
+        "edit handoff would treat this as a content change and "
+        "overwrite the file the external editor saved into"
     )

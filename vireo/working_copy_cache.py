@@ -85,18 +85,26 @@ _ACCESS_TOUCH_INTERVAL_SECONDS = 6 * 60 * 60
 def touch_working_copy_access(path):
     """Record a working-copy cache hit for eviction ordering.
 
-    Only ever moves mtime *forward*, and only when the file is already
-    older than ``_ACCESS_TOUCH_INTERVAL_SECONDS``. Both properties matter
-    for the display-cache freshness gates in ``/photos/<id>/original``,
-    which serve a cached rendition when its mtime is ``>=`` its sources':
-    advancing an old stamp to now keeps that true, and skipping files
-    stamped in the future (clock skew, archives with forward-dated
-    timestamps — the case ``_peg_display_cache_mtime`` exists for) avoids
-    dragging a deliberately pegged mtime backwards into a re-decode loop.
+    Advances the file's ATIME only, leaving its mtime stable. Callers
+    that key off the working copy's mtime treat it as a content-version
+    marker — ``_external_edit_handoff_path`` stamps the WC's mtime into
+    the handoff meta and regenerates ``external-edits/<id>.jpg`` (via
+    ``os.replace``) whenever it changes, which would overwrite anything
+    the external editor saved into that file. Advancing atime instead
+    keeps the content-version key stable while still giving
+    ``_evict_once`` an LRU signal — it sorts by ``max(mtime_ns,
+    atime_ns)`` for that reason.
 
-    Best-effort: callers are serving bytes, so a failed stat/utime costs
-    only eviction-ordering accuracy and must never fail the request.
-    Returns True when the stamp moved.
+    Display-cache freshness (``/photos/<id>/original``) also compares
+    the render's mtime against its sources' mtimes; keeping the WC's
+    mtime stable avoids spuriously invalidating that cache on serve.
+
+    Throttled to ``_ACCESS_TOUCH_INTERVAL_SECONDS`` (using
+    ``max(atime, mtime)`` as the current recency) so a burst of 1:1
+    zoom requests costs one ``utime``. Best-effort: callers are
+    serving bytes, so a failed stat/utime costs only eviction-ordering
+    accuracy and must never fail the request. Returns True when the
+    stamp moved.
     """
     if not path:
         return False
@@ -105,10 +113,12 @@ def touch_working_copy_access(path):
         stat_result = os.stat(path)
     except OSError:
         return False
-    if now - stat_result.st_mtime < _ACCESS_TOUCH_INTERVAL_SECONDS:
+    current_recency = max(stat_result.st_atime, stat_result.st_mtime)
+    if now - current_recency < _ACCESS_TOUCH_INTERVAL_SECONDS:
         return False
     try:
-        os.utime(path, (now, now))
+        # Advance atime only; keep mtime as the content-version key.
+        os.utime(path, (now, stat_result.st_mtime))
     except OSError:
         return False
     return True
@@ -431,9 +441,17 @@ def _evict_once(
             # runtime; startup bypasses the grace because no cache writer
             # can be active yet — the file is safe to reclaim.
             continue
+        # LRU key is ``max(mtime_ns, atime_ns)``: mtime is the content-
+        # version stamp (only advances on write), atime is the access-
+        # recency stamp advanced by ``touch_working_copy_access``. Taking
+        # the max means a freshly published file (whose atime tracks its
+        # own write) still reads as fresh, and a served-recently file
+        # (whose atime we advanced) also reads as fresh, without either
+        # side lying about the other.
         entries.append(
             (
-                st.st_mtime_ns, row["id"], st.st_size, path,
+                max(st.st_mtime_ns, st.st_atime_ns),
+                row["id"], st.st_size, path,
                 expected_rel, _file_identity(st),
             )
         )
@@ -452,7 +470,8 @@ def _evict_once(
             photo_id = int(stem)
             entries.append(
                 (
-                    st.st_mtime_ns, photo_id, st.st_size, path,
+                    max(st.st_mtime_ns, st.st_atime_ns),
+                    photo_id, st.st_size, path,
                     f"working/{photo_id}.jpg", _file_identity(st),
                 )
             )

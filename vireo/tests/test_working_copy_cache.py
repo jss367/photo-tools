@@ -799,7 +799,13 @@ def test_eviction_result_reports_which_files_were_removed(tmp_path):
 
 
 def test_touch_marks_an_old_working_copy_as_recently_used(tmp_path):
-    """A cache hit advances mtime so eviction reads it as recently used."""
+    """A cache hit advances atime so eviction reads it as recently used.
+
+    mtime must stay stable — callers key content-version off it
+    (``_external_edit_handoff_path`` regenerates the external-editor
+    handoff whenever the WC's mtime changes, which would overwrite
+    anything the external editor saved into that file).
+    """
     import time
 
     from working_copy_cache import touch_working_copy_access
@@ -810,8 +816,14 @@ def test_touch_marks_an_old_working_copy_as_recently_used(tmp_path):
     os.utime(path, (stale, stale))
 
     assert touch_working_copy_access(str(path)) is True
-    assert path.stat().st_mtime > stale
-    assert path.stat().st_mtime >= time.time() - 60
+    stat_after = path.stat()
+    assert stat_after.st_atime > stale
+    assert stat_after.st_atime >= time.time() - 60
+    assert stat_after.st_mtime == stale, (
+        "touch advanced mtime — that key must stay stable so the "
+        "external-edit handoff and display-cache freshness gates "
+        "don't see spurious content changes"
+    )
 
 
 def test_touch_skips_a_freshly_stamped_working_copy(tmp_path):
@@ -826,7 +838,9 @@ def test_touch_skips_a_freshly_stamped_working_copy(tmp_path):
     os.utime(path, (recent, recent))
 
     assert touch_working_copy_access(str(path)) is False
-    assert path.stat().st_mtime == recent
+    stat_after = path.stat()
+    assert stat_after.st_atime == recent
+    assert stat_after.st_mtime == recent
 
 
 def test_touch_never_drags_a_future_stamped_copy_backwards(tmp_path):
@@ -836,7 +850,7 @@ def test_touch_never_drags_a_future_stamped_copy_backwards(tmp_path):
     ``>=`` its sources'. A copy pegged into the future (clock skew, an
     archive with forward-dated timestamps) is pegged there deliberately;
     stamping it with "now" would fail that gate and re-decode the RAW on
-    every request.
+    every request. Both atime AND mtime must stay unchanged.
     """
     import time
 
@@ -848,7 +862,135 @@ def test_touch_never_drags_a_future_stamped_copy_backwards(tmp_path):
     os.utime(path, (future, future))
 
     assert touch_working_copy_access(str(path)) is False
-    assert path.stat().st_mtime == future
+    stat_after = path.stat()
+    assert stat_after.st_atime == future
+    assert stat_after.st_mtime == future
+
+
+def test_touch_preserves_content_version_mtime_for_external_edit_handoff(
+    tmp_path,
+):
+    """Regression for a P1 codex finding on PR #1607.
+
+    ``_external_edit_handoff_path`` stamps the working copy's mtime
+    into ``external-edits/<id>.json`` and regenerates
+    ``external-edits/<id>.jpg`` via ``os.replace`` whenever that
+    stamp changes. If ``touch_working_copy_access`` advanced mtime
+    for LRU purposes, viewing the photo through ``/original`` or
+    ``/edit-preview`` after the 6-hour throttle would tick mtime
+    forward with no pixel change, the next Open External call would
+    see the handoff as stale, and regenerating would overwrite the
+    file the external editor had saved into. The fix advances atime
+    only; mtime is reserved as the content-version key.
+    """
+    import time
+
+    from working_copy_cache import touch_working_copy_access
+
+    path = tmp_path / "1.jpg"
+    path.write_bytes(b"x" * 100)
+    stale = time.time() - 30 * 24 * 3600
+    os.utime(path, (stale, stale))
+    published_mtime = path.stat().st_mtime
+
+    # Simulate many LRU touches (each throttled, but at least the first
+    # one lands after 30 days of staleness).
+    for _ in range(5):
+        touch_working_copy_access(str(path))
+
+    assert path.stat().st_mtime == published_mtime, (
+        "LRU access touch advanced the working copy's mtime — the "
+        "external-edit handoff would treat this as a content change "
+        "and overwrite the file the external editor saved into"
+    )
+    # Access-recency did move forward, so eviction still sees it.
+    assert path.stat().st_atime > stale
+
+
+def test_eviction_reads_atime_as_recency_alongside_mtime(tmp_path):
+    """``_evict_once`` sort key is max(mtime, atime).
+
+    Regression for the same P1 finding: since mtime no longer advances
+    on LRU touches, eviction must consult atime as well, otherwise a
+    touched-recently file with a stale mtime looks like the coldest
+    candidate and gets reclaimed first — the exact opposite of what
+    the touch is meant to signal.
+    """
+    import time
+
+    import config as cfg
+    from db import Database
+    from working_copy_cache import (
+        evict_if_over_quota,
+        touch_working_copy_access,
+    )
+
+    vireo_dir = tmp_path / "vireo"
+    vireo_dir.mkdir()
+    working_dir = vireo_dir / "working"
+    working_dir.mkdir()
+    monkey_cfg = tmp_path / "config.json"
+    cfg.CONFIG_PATH = str(monkey_cfg)
+    cfg.save({**cfg.DEFAULTS, "working_copy_cache_max_mb": 1})
+
+    db = Database(str(vireo_dir / "test.db"))
+    try:
+        folder_id = db.add_folder(str(tmp_path / "photos"))
+        (tmp_path / "photos").mkdir()
+        ids = []
+        for i in range(2):
+            src = tmp_path / "photos" / f"photo-{i}.jpg"
+            src.write_bytes(b"x" * 100)
+            ids.append(db.add_photo(
+                folder_id, f"photo-{i}.jpg", ".jpg",
+                file_size=100, file_mtime=src.stat().st_mtime,
+                width=100, height=100,
+            ))
+
+        # File A: recently-touched (fresh atime), stale mtime.
+        recent_id = ids[0]
+        recent_path = working_dir / f"{recent_id}.jpg"
+        recent_path.write_bytes(b"a" * (700 * 1024))
+        db.conn.execute(
+            "UPDATE photos SET working_copy_path=? WHERE id=?",
+            (f"working/{recent_id}.jpg", recent_id),
+        )
+        stale_mtime = time.time() - 30 * 24 * 3600
+        os.utime(str(recent_path), (stale_mtime, stale_mtime))
+        touch_working_copy_access(str(recent_path))
+
+        # File B: born just now (fresh mtime, matching atime).
+        fresh_id = ids[1]
+        fresh_path = working_dir / f"{fresh_id}.jpg"
+        fresh_path.write_bytes(b"b" * (700 * 1024))
+        db.conn.execute(
+            "UPDATE photos SET working_copy_path=? WHERE id=?",
+            (f"working/{fresh_id}.jpg", fresh_id),
+        )
+        # Age B so its (atime, mtime) recency lands BEFORE A's touched
+        # atime — the fresh-mtime side wins under max() otherwise.
+        aged = time.time() - 60 * 60
+        os.utime(str(fresh_path), (aged, aged))
+        db.conn.commit()
+
+        result = evict_if_over_quota(db, str(vireo_dir))
+        db.conn.close()
+
+        # Under max(mtime, atime): A's recency = fresh atime > B's
+        # aged (atime, mtime). So B should evict first.
+        assert not fresh_path.exists(), (
+            "eviction reclaimed the file with newer max(mtime, atime); "
+            "it should have picked the older one"
+        )
+        assert recent_path.exists(), (
+            "eviction reclaimed the recently-touched file — it "
+            "ignored the LRU atime advance"
+        )
+        assert result["evicted"] >= 1
+    finally:
+        import contextlib as _ctxlib
+        with _ctxlib.suppress(Exception):
+            db.close()
 
 
 def test_touch_is_best_effort_on_a_missing_file(tmp_path):

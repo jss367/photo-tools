@@ -305,6 +305,36 @@ def test_paging_walks_the_sorted_list_without_repeating_rows():
     assert seen == [1, 2, 3, 4, 5, 6, 7]
 
 
+def test_paging_past_the_end_clamps_to_the_last_page():
+    """After a decision shrinks the queue, the caller may still be past the
+    final page. The selection reports the clamped page and returns its rows
+    so the pager cannot land on "page 3 of 2" with an empty slice."""
+    photos = [
+        _photo([_subject({"a": [_pred("Cardinal")]})], photo_id=i)
+        for i in range(1, 4)
+    ]
+    records = _records(photos)
+
+    selection = ic.select(
+        records, ["a"], filter_id="all", sort="filename",
+        page=7, per_page=2,
+    )
+
+    assert selection.total == 3
+    assert selection.page == 2
+    assert selection.photo_ids == [3]
+
+
+def test_paging_an_empty_selection_reports_page_one():
+    """An empty result still has a valid page — the pager has to render
+    something rather than a caller-supplied phantom page number."""
+    selection = ic.select([], ["a"], filter_id="all", page=5, per_page=2)
+
+    assert selection.total == 0
+    assert selection.page == 1
+    assert selection.photo_ids == []
+
+
 def test_review_priority_sorts_pending_conflicts_first():
     settled = _photo([_subject({"a": [_pred("Cardinal", category="conflict", status="accepted")]})], photo_id=1)
     pending_match = _photo([_subject({"a": [_pred("Cardinal", category="match")]})], photo_id=2)

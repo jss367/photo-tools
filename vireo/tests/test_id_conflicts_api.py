@@ -181,6 +181,20 @@ def test_per_page_is_capped(compare_collection):
     assert payload["per_page"] == 200
 
 
+def test_page_past_the_end_is_clamped_to_the_last_page(compare_collection):
+    """A decision that shrinks the queue can leave the caller on a page that
+    no longer exists. The endpoint clamps the page rather than echoing an
+    impossible one like "page 3 of 2" with an empty row list."""
+    app, _db, cid, photo_ids = compare_collection
+
+    payload = _get(app, cid, filter="all", per_page=2, page=99)
+
+    expected_last = (len(photo_ids) + 1) // 2
+    assert payload["page"] == expected_last
+    assert payload["total"] == len(photo_ids)
+    assert payload["photos"]
+
+
 def test_search_narrows_the_listed_rows(compare_collection):
     app, db, cid, photo_ids = compare_collection
 

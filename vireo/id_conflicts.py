@@ -1087,7 +1087,7 @@ def _matches_query(record, tokens, match_case, whole_word):
 class Selection:
     """One page of rows plus every count the page displays."""
 
-    __slots__ = ("photo_ids", "total", "summary", "filter_counts",
+    __slots__ = ("photo_ids", "total", "page", "summary", "filter_counts",
                  "exclusion_counts")
 
 
@@ -1164,11 +1164,18 @@ def select(
 
     ordered = sort_records(matched, sort)
     per_page = max(1, per_page)
-    page = max(1, page)
+    total = len(ordered)
+    # Clamp the page to the last one that still holds a row. A decision that
+    # removes the last matching row on the final page would otherwise leave
+    # the caller past the end — the slice would come back empty and the
+    # pager would read "page 3 of 2" until the user paged back manually.
+    last_page = max(1, (total + per_page - 1) // per_page)
+    page = min(last_page, max(1, page))
     start = (page - 1) * per_page
     result = Selection()
     result.photo_ids = [record.photo_id for record in ordered[start:start + per_page]]
-    result.total = len(ordered)
+    result.total = total
+    result.page = page
     result.summary = summary
     result.filter_counts = filter_counts
     result.exclusion_counts = exclusion_counts

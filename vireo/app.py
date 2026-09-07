@@ -15913,7 +15913,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 db, collection_id, selection.photo_ids,
                 snapshot.models, snapshot.min_confidence,
             ),
-            "page": request.args.get("page", 1, type=int) or 1,
+            "page": selection.page,
             "per_page": per_page,
             "total": selection.total,
             "summary": selection.summary,

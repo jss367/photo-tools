@@ -22322,6 +22322,30 @@ class Database:
                 return f"({column} IS NULL OR LOWER({column}) != LOWER(?))", [text]
             return None
 
+        def _species_keyword_from(sfx=""):
+            """FROM/WHERE fragment selecting a photo's species-rank keywords.
+
+            Shared by ``has_species`` and ``species_count`` so the two can
+            never disagree about what counts as a species: a keyword
+            qualifies when either the legacy ``is_species`` flag is set OR
+            it is a taxonomy row, AND its linked taxon (if any) has rank
+            ``species``. This mirrors
+            ``get_species_keywords_for_photos`` — the resolver behind the
+            species shown in Browse, the life list, and species
+            representatives — so the filters agree with what the UI shows.
+
+            ``sfx`` suffixes the table aliases so callers that need more
+            than one species subquery in the same statement don't collide.
+            """
+            return (
+                f"FROM photo_keywords pk{sfx} "
+                f"JOIN keywords k{sfx} ON k{sfx}.id = pk{sfx}.keyword_id "
+                f"LEFT JOIN taxa t{sfx} ON t{sfx}.id = k{sfx}.taxon_id "
+                f"WHERE pk{sfx}.photo_id = p.id "
+                f"AND (k{sfx}.is_species = 1 OR k{sfx}.type = 'taxonomy') "
+                f"AND (t{sfx}.rank = 'species' OR t{sfx}.rank IS NULL)"
+            )
+
         def _keyword_exists(predicate, predicate_params):
             return (
                 "EXISTS (SELECT 1 FROM photo_keywords pk "
@@ -22578,27 +22602,35 @@ class Database:
                         return f"NOT {cond}", params
                     return cond, params
             if field == "has_species":
-                # Mirror the species-filter / get_species_keywords_for_photos
-                # eligibility: a keyword counts as a species when either the
-                # legacy ``is_species`` flag is set OR it is a taxonomy row,
-                # AND its linked taxon (if any) has rank ``species``. Falling
-                # back to ``k.is_species = 1`` would exclude photos whose
-                # species is a ``type='taxonomy', is_species=0`` row —
+                # Falling back to ``k.is_species = 1`` would exclude photos
+                # whose species is a ``type='taxonomy', is_species=0`` row —
                 # exactly the shape upgraded libraries store — so the "Has
                 # species" chip would disagree with everywhere the species
-                # is actually shown.
-                has_species_exists = (
-                    "EXISTS (SELECT 1 FROM photo_keywords pk "
-                    "JOIN keywords k ON k.id = pk.keyword_id "
-                    "LEFT JOIN taxa t ON t.id = k.taxon_id "
-                    "WHERE pk.photo_id = p.id "
-                    "AND (k.is_species = 1 OR k.type = 'taxonomy') "
-                    "AND (t.rank = 'species' OR t.rank IS NULL))"
-                )
+                # is actually shown. ``_species_keyword_from`` holds that
+                # eligibility rule.
+                has_species_exists = f"EXISTS (SELECT 1 {_species_keyword_from()})"
                 if op in ("equals", "is") and _falsey(value):
                     return f"NOT {has_species_exists}", []
                 if op in ("equals", "is") and _truthy(value):
                     return has_species_exists, []
+            if field == "species_count":
+                # Count distinct species the way the app presents them:
+                # ``get_species_keywords_for_photos`` keys each species by
+                # its ``taxon_id`` when linked and falls back to the exact
+                # stored name otherwise, so a photo carrying both the
+                # ``Verdin`` root and the ``Birds|Verdin`` hierarchy leaf
+                # shows one species and must count as one — counting
+                # keyword rows would make it multi-species. The literal
+                # prefixes keep a taxon id from colliding with a keyword
+                # named like a number, and concatenation drops any column
+                # collation so the name branch compares exactly, matching
+                # the resolver's dict-key semantics.
+                expr = (
+                    "(SELECT COUNT(DISTINCT CASE WHEN ksc.taxon_id IS NOT NULL "
+                    "THEN 'taxon:' || ksc.taxon_id ELSE 'name:' || ksc.name END) "
+                    + _species_keyword_from("sc") + ")"
+                )
+                return _numeric_condition(expr, op, value)
             if field == "has_subject":
                 subject_types = sorted(self.get_subject_types())
                 if not subject_types:

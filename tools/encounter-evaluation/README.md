@@ -147,8 +147,12 @@ prediction coverage is visible rather than silently excluded.
 
 Entire capture days across folders receive stable 60% training, 20% development,
 and 20% test assignments. Exact file hashes link duplicate capture days. Split
-membership is persisted beside the run directories in `split-membership.json`;
-use the same registry and seed across experiments. Newly discovered duplicate
+membership is persisted beside the run directories in `split-membership-<namespace>.json`.
+The namespace uses the resolved database path and workspace ID, so unrelated
+libraries and workspaces do not share assignments or quarantined dates. The
+manifest records the exact registry path. Use the same registry and seed across
+experiments; when moving a library or retaining an older `split-membership.json`,
+pass its registry explicitly with `--split-registry`. Newly discovered duplicate
 links that cross existing partitions quarantine those days rather than leaking
 them across splits. Label changes do not reshuffle membership. Different-date
 near-duplicates without matching hashes still need an audit. Missing timestamps

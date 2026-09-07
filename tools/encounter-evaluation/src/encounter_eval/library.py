@@ -255,10 +255,6 @@ def prepare(db_path, output, *, workspace=None, seed=42, max_sessions=None,
     grouping = {**GROUP_DEFAULTS, **{k: v for k, v in cfg["pipeline"].items() if k in GROUP_DEFAULTS}}
     output = Path(output)
     (output / "inputs").mkdir(parents=True, exist_ok=True)
-    registry_path = Path(split_registry) if split_registry else output.parent / "split-membership.json"
-    registry = json.loads(registry_path.read_text()) if registry_path.exists() else {"seed": seed, "days": {}}
-    if registry["seed"] != seed:
-        raise ValueError("Split registry uses a different seed; reuse that seed or choose a separate registry")
     conn = open_library(db_path)
     try:
         workspaces = [dict(r) for r in conn.execute("SELECT id, name FROM workspaces ORDER BY id")]
@@ -269,6 +265,12 @@ def prepare(db_path, output, *, workspace=None, seed=42, max_sessions=None,
             workspace = workspaces[0]["id"]
         if workspace not in {w["id"] for w in workspaces}:
             raise ValueError(f"Unknown workspace {workspace}")
+        namespace = digest([str(Path(db_path).expanduser().resolve()), workspace])[:16]
+        registry_path = (Path(split_registry) if split_registry else
+                         output.parent / f"split-membership-{namespace}.json")
+        registry = json.loads(registry_path.read_text()) if registry_path.exists() else {"seed": seed, "days": {}}
+        if registry["seed"] != seed:
+            raise ValueError("Split registry uses a different seed; reuse that seed or choose a separate registry")
         rows = [dict(r) for r in conn.execute("""SELECT p.id, p.folder_id, p.filename, p.timestamp,
             p.file_hash, p.thumb_path, f.path AS folder_path FROM photos p
             JOIN folders f ON f.id = p.folder_id JOIN workspace_folders wf ON wf.folder_id = f.id
@@ -374,6 +376,7 @@ def prepare(db_path, output, *, workspace=None, seed=42, max_sessions=None,
                     "label_source": label_source, "complete_folders": sorted(complete_folders),
                     "inventory": {**inventory, **dict(counts)}, "sessions": entries,
                     "taxonomy_display": taxonomy.display, "split_registry_digest": digest(registry),
+                    "split_registry_path": str(registry_path.resolve()),
                     "data_digest": digest([entries, cfg, label_source, sorted(complete_folders)]),
                     "limitations": ["Labels are positive-only unless folder completeness is explicitly declared.",
                         "Exclusive classifier mode is assumed; custom multi-label sources need an adapter.",

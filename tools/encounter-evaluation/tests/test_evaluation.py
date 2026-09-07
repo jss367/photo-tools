@@ -1,6 +1,8 @@
 import json
+import shutil
 import sqlite3
 from datetime import datetime, timedelta
+from pathlib import Path
 
 import pytest
 
@@ -365,3 +367,27 @@ def test_independent_tuning_only_searches_effective_default_parameters(library, 
     assert set(result["search_space"]) == {"confidence", "margin"}
     assert all(set(r["params"]) == {"confidence", "margin"} for r in trained)
     assert len({(r["params"]["confidence"], r["params"]["margin"]) for r in trained}) == 12
+
+
+def test_default_split_registry_is_scoped_to_library_and_workspace(library, tmp_path):
+    other_library = tmp_path / "other.db"
+    shutil.copy2(library, other_library)
+    first = prepare(library, tmp_path / "first")
+    registry_path = Path(first["split_registry_path"])
+    registry = json.loads(registry_path.read_text())
+    registry["days"]["2026-01-01"] = "quarantined"
+    write_json(registry_path, registry)
+    repeated = prepare(library, tmp_path / "repeated", workspace=1)
+    assert repeated["split_registry_path"] == first["split_registry_path"]
+    assert repeated["sessions"] == []
+    other = prepare(other_library, tmp_path / "other")
+    assert other["sessions"]
+    conn = sqlite3.connect(library)
+    conn.execute("INSERT INTO workspaces VALUES(2, 'Another workspace')")
+    conn.execute("INSERT INTO workspace_folders VALUES(2, 1)")
+    conn.commit()
+    conn.close()
+    workspace = prepare(library, tmp_path / "workspace", workspace=2)
+    assert workspace["sessions"]
+    assert len({m["split_registry_path"] for m in (first, other, workspace)}) == 3
+    assert json.loads(registry_path.read_text())["days"]["2026-01-01"] == "quarantined"

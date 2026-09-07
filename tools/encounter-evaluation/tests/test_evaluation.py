@@ -189,6 +189,29 @@ def test_split_registry_does_not_reshuffle_and_quarantines_cross_partition_dupli
     assert manifest["sessions"] == []
 
 
+def test_default_split_registry_is_namespaced_per_library(library, tmp_path):
+    from shutil import copyfile
+
+    other = tmp_path / "other-library.db"
+    copyfile(library, other)
+    shared_parent = tmp_path / "runs"
+    shared_parent.mkdir()
+    # A stale registry at the pre-fix default location would either abort
+    # preparation (mismatched seed) or contaminate day assignments; the
+    # per-library default must ignore it entirely.
+    write_json(shared_parent / "split-membership.json",
+               {"seed": 7, "days": {"2026-01-01": "quarantined", "2026-01-02": "quarantined"}})
+    first = prepare(library, shared_parent / "first")
+    second = prepare(other, shared_parent / "second")
+    assert first["inventory"]["quarantined_day_clusters"] == 0
+    assert second["inventory"]["quarantined_day_clusters"] == 0
+    assert first["sessions"] and second["sessions"]
+    namespaced = sorted(shared_parent.glob("split-membership-*.json"))
+    assert len(namespaced) == 2
+    assert (shared_parent / "split-membership.json").read_text() == \
+        '{"days":{"2026-01-01":"quarantined","2026-01-02":"quarantined"},"seed":7}\n'
+
+
 def test_search_is_deterministic_and_bounded():
     space = {"a": [1, 2, 3], "b": [4, 5]}
     assert parameter_trials(space, "random", 3, 42) == parameter_trials(space, "random", 3, 42)

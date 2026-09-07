@@ -1,7 +1,7 @@
 """Capture-time suggestions for reviewing photos without usable GPS."""
 
 import math
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
 
 
 def has_usable_coordinates(photo):
@@ -16,13 +16,13 @@ def capture_time(value):
     """Keep camera wall time separate from timestamps with known offsets.
 
     A date alone is insufficient evidence for grouping. Unknown offsets must
-    not silently be interpreted in the server's timezone.
+    not silently be interpreted in the server's timezone. Retain the camera's
+    local date; aware datetime comparisons and subtraction account for offsets.
     """
     if not isinstance(value, str) or len(value) < 16:
         return None
     try:
-        result = datetime.fromisoformat(value)
-        return result.astimezone(UTC) if result.tzinfo else result
+        return datetime.fromisoformat(value)
     except (ValueError, OverflowError):
         return None
 

@@ -77,6 +77,16 @@ def test_gap_can_be_tightened_and_equal_times_have_stable_order():
     assert ids(time_review_groups(photos, 30)) == [[1, 2, 3]]
 
 
+@pytest.mark.parametrize("timestamps, expected", [
+    (["2026-08-01T16:50:00-07:00", "2026-08-01T17:10:00-07:00"], [[1, 2]]),
+    (["2026-08-01T23:50:00-07:00", "2026-08-02T00:10:00-07:00"], [[1], [2]]),
+    (["2026-08-01T06:50:00+07:00", "2026-08-01T07:10:00+07:00"], [[1, 2]]),
+])
+def test_day_boundaries_use_camera_local_dates(timestamps, expected):
+    photos = [photo(index + 1, timestamp) for index, timestamp in enumerate(timestamps)]
+    assert ids(time_review_groups(photos)) == expected
+
+
 def test_time_preview_skips_existing_locations_and_gps(app_and_db):
     app, db = app_and_db
     p1, p2, p3 = db.get_photo_ids()

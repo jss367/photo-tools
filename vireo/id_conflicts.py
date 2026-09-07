@@ -1044,7 +1044,14 @@ def _sort_key(sort):
     if sort == "top_confidence":
         return lambda r: (-r.max_confidence, _text_key(r.filename))
     if sort == "low_confidence":
-        return lambda r: (r.min_confidence or 999, _text_key(r.filename))
+        # A row with no top prediction has no confidence to be low, so it sorts
+        # to the end. A stored confidence of exactly 0.0 is a real reading and
+        # the least confident one there is, so it has to be told apart from
+        # that absence rather than falsified by it.
+        return lambda r: (
+            999 if r.min_confidence is None else r.min_confidence,
+            _text_key(r.filename),
+        )
     if sort == "filename":
         return lambda r: _text_key(r.filename)
     return lambda r: (

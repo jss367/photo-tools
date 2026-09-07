@@ -120,9 +120,16 @@ def test_compare_reject_updates_in_place_without_reloading_collection(
     photo_id = row.get_attribute("data-photo-id")
     compare_requests.clear()
 
-    with page.expect_response("**/reject") as response_info:
+    # The scoped refresh is only sent once /reject has returned, and the page
+    # patches the pill optimistically before that. Waiting on the pill alone
+    # would let the count below be read before the refresh was ever issued, so
+    # wait for the refresh request itself.
+    with page.expect_response("**/reject") as response_info, page.expect_response(
+        lambda r: "/api/predictions/compare?" in r.url and "refresh_photo_id=" in r.url
+    ) as refresh_info:
         row.get_by_role("button", name="Reject", exact=True).first.click()
     assert response_info.value.ok
+    assert refresh_info.value.ok
 
     row = page.locator(f'tr[data-photo-id="{photo_id}"]')
     expect(row.locator(".status-pill.rejected")).to_be_visible()
@@ -154,9 +161,14 @@ def test_compare_accept_refreshes_only_the_changed_photo(live_server, page):
     expect(row).to_be_visible()
     compare_requests.clear()
 
-    with page.expect_response("**/accept") as response_info:
+    # Same ordering as the reject case: the keyword pill can render from the
+    # local patch, so the refresh request has to be waited on separately.
+    with page.expect_response("**/accept") as response_info, page.expect_response(
+        lambda r: "/api/predictions/compare?" in r.url and "refresh_photo_id=" in r.url
+    ) as refresh_info:
         row.get_by_role("button", name="Add keyword", exact=True).click()
     assert response_info.value.ok
+    assert refresh_info.value.ok
 
     expect(row.locator(".keyword-pill.species")).to_contain_text(
         "Red-tailed Hawk"

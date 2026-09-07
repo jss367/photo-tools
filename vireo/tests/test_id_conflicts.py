@@ -362,6 +362,26 @@ def test_newest_and_oldest_sorts_are_opposites():
     assert oldest == [1, 2]
 
 
+def test_low_confidence_sorts_a_zero_reading_first_and_no_reading_last():
+    """A stored confidence of 0.0 is a real reading, and the least confident
+    one there is, so it heads the Low confidence list. A row whose only
+    prediction was rejected has no reading at all — that is an absence, not a
+    low number, so it sorts to the end instead of ahead of every real score."""
+    photos = [
+        _photo([_subject({"a": [_pred("Cardinal", confidence=0.5)]})], photo_id=1),
+        _photo([_subject({"a": [_pred("Blue Jay", confidence=0.0)]})], photo_id=2),
+        _photo([_subject({"a": [_pred("Crow", status="rejected")]})], photo_id=3),
+    ]
+    records = _records(photos)
+    # The two cases the sort has to tell apart really do differ here: one row
+    # carries 0.0, the other carries nothing.
+    assert [r.min_confidence for r in records] == [0.5, 0.0, None]
+
+    ordered = ic.select(records, ["a"], filter_id="all", sort="low_confidence")
+
+    assert ordered.photo_ids == [2, 1, 3]
+
+
 def test_search_matches_keywords_species_and_filenames():
     photos = [
         _photo([_subject({"a": [_pred("Cooper's Hawk")]})], photo_id=1),

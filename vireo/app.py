@@ -3817,6 +3817,12 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
     app.config["CARD_CLEANUP_DIR"] = os.path.join(
         os.path.dirname(os.path.abspath(db_path)), "card_cleanup"
     )
+    # Built here rather than on first request: a check-then-set in the request
+    # path lets two concurrent first requests each build their own store, and a
+    # token handed out by whichever store loses the race is never found again.
+    # The endpoint would then silently re-derive the whole comparison — the
+    # multi-second cost this store exists to avoid.
+    app.config["ID_CONFLICTS_SNAPSHOTS"] = id_conflicts.SnapshotStore()
 
     # Schema creation and migrations are startup work, never request work.
     # `:memory:` is the development exception because each SQLite connection
@@ -15799,14 +15805,6 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
 
     _COMPARE_MAX_PER_PAGE = 200
 
-    def _compare_snapshots():
-        """Per-app store of ID Conflicts snapshots."""
-        store = app.config.get("ID_CONFLICTS_SNAPSHOTS")
-        if store is None:
-            store = id_conflicts.SnapshotStore()
-            app.config["ID_CONFLICTS_SNAPSHOTS"] = store
-        return store
-
     def _compare_photo_ids(name="photo_id"):
         """Parse repeated photo id args, or ``(None, None)`` when absent."""
         values = request.args.getlist(name)
@@ -15871,7 +15869,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             return err
 
         workspace_id = db._ws_id()
-        store = _compare_snapshots()
+        store = app.config["ID_CONFLICTS_SNAPSHOTS"]
         snapshot = store.get(request.args.get("token"))
         if snapshot is not None and not snapshot.matches(
             collection_id, workspace_id,

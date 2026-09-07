@@ -36,6 +36,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 import id_conflicts
+import location_review
 import places
 import remote_setup
 from artifact_flight import (
@@ -8328,10 +8329,21 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
 
     @app.route("/api/location-review/preview", methods=["POST"])
     def api_location_review_preview():
-        """Return coordinate-derived groups without choosing place names."""
+        """Return coordinate or capture-time groups without assigning places."""
         body = request.get_json(silent=True) or {}
+        mode = body.get("mode", "coordinates")
+        if mode not in ("coordinates", "time"):
+            return json_error("mode must be coordinates or time", 400)
+        gap_minutes = body.get("gap_minutes", 60)
+        if type(gap_minutes) is not int or gap_minutes not in (15, 30, 60, 120):
+            return json_error("gap_minutes must be 15, 30, 60, or 120", 400)
         db = _get_db()
-        photo_ids, error = _bulk_gps_location_source_ids(db, body)
+        if body.get("scope") == "all":
+            if "photo_ids" in body or "collection_id" in body:
+                return json_error("Choose all photos, photo_ids, or collection_id, not multiple sources", 400)
+            photo_ids, error = db.get_photo_ids(), None
+        else:
+            photo_ids, error = _bulk_gps_location_source_ids(db, body)
         if error is not None:
             return error
         if not photo_ids:
@@ -8362,7 +8374,15 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             for photo_id in photo_ids
             if photo_id not in assigned_ids
         ]
-        groups, unresolved = _location_review_groups(review_photos)
+        if mode == "time":
+            groups = location_review.time_review_groups(review_photos, gap_minutes)
+            unresolved = []
+            skipped.extend({
+                "photo_id": photo["id"], "filename": photo["filename"],
+                "reason": "has_coordinates",
+            } for photo in review_photos if location_review.has_usable_coordinates(photo))
+        else:
+            groups, unresolved = _location_review_groups(review_photos)
         return jsonify({
             "total": len(photo_ids),
             "reviewable": sum(group["count"] for group in groups),

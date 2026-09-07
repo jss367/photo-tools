@@ -1031,3 +1031,120 @@ def test_invalidate_caches_drops_verdicts_and_rereads_the_mount_table(monkeypatc
         assert refreshes == [{"force_refresh": True}]
     finally:
         gate.clear()
+
+
+def test_clear_discards_a_probe_that_was_already_running():
+    """A probe launched before ``clear`` must not publish its answer after it.
+
+    A probe of a dead share takes seconds, so the manual recheck can land
+    mid-probe. Publishing that pre-clear "offline" would make the fresh walk
+    skip a volume the user has just remounted — the exact failure the recheck
+    exists to prevent.
+    """
+    import threading
+
+    started = threading.Event()
+    release = threading.Event()
+    probes = []
+
+    def probe(root):
+        probes.append(root)
+        if len(probes) == 1:
+            started.set()
+            release.wait(5)
+            return False
+        return True
+
+    gate = vr.VolumeReachability(probe=probe)
+    worker = threading.Thread(
+        target=lambda: gate.root_reachable("/Volumes/NAS"), daemon=True,
+    )
+    worker.start()
+    assert started.wait(2)
+
+    gate.clear()
+    release.set()
+    worker.join(5)
+    assert not worker.is_alive()
+
+    # The in-flight answer was dropped rather than written back...
+    assert gate._verdicts == {}
+    # ...so the next caller probes again and sees the remounted volume.
+    assert gate.root_reachable("/Volumes/NAS") is True
+    assert probes == ["/Volumes/NAS", "/Volumes/NAS"]
+
+
+class _WedgedProcess:
+    """Killed probe still stuck in uninterruptible I/O: never exits until the
+    test releases it, so ``poll()`` keeps reporting it as running."""
+
+    def __init__(self):
+        import threading
+        self.released = threading.Event()
+
+    def kill(self):
+        pass
+
+    def poll(self):
+        return 0 if self.released.is_set() else None
+
+    def communicate(self, timeout=None):
+        self.released.wait(10)
+        return ("", "")
+
+
+def test_invalidate_caches_lets_a_wedged_macos_probe_be_retried(monkeypatch):
+    """A probe that timed out keeps its root registered so automatic polls
+    fail fast. An explicit recheck must be able to probe anyway — otherwise
+    "Check again" answers offline from the registration alone, without ever
+    looking at the volume the user just remounted."""
+    root = "/Volumes/WedgedNAS"
+    process = _WedgedProcess()
+    monkeypatch.setattr(vr, "_system_mount_roots", lambda **kwargs: set())
+    try:
+        with vr._NETWORK_PROBE_CONDITION:
+            vr._NETWORK_PROBES[root] = process
+        vr._abandon_network_probe(root, process)
+        assert vr._reserve_network_probe(root) is False
+
+        vr.invalidate_caches()
+
+        assert vr._reserve_network_probe(root) is True
+        # The wedged process is untracked as a blocker but still counts
+        # against the global cap while it runs.
+        assert process in vr._FORGOTTEN_NETWORK_PROBES
+    finally:
+        vr._release_network_probe(root, vr._NETWORK_PROBE_RESERVED)
+        process.released.set()
+        with vr._NETWORK_PROBE_CONDITION:
+            vr._NETWORK_PROBES.pop(root, None)
+            vr._ABANDONED_NETWORK_PROBES.discard(root)
+            vr._FORGOTTEN_NETWORK_PROBES.discard(process)
+
+
+def test_invalidate_caches_lets_a_wedged_generic_probe_be_retried(monkeypatch):
+    """Same for the non-macOS thread probe: a live wedged thread makes every
+    later check fail closed without probing."""
+    import threading
+
+    root = "/mnt/wedged"
+    release = threading.Event()
+    stuck = threading.Thread(target=lambda: release.wait(10), daemon=True)
+    stuck.start()
+    monkeypatch.setattr(vr, "_system_mount_roots", lambda **kwargs: set())
+    monkeypatch.setattr(vr, "_classify_generic_root", lambda r: True)
+    try:
+        with vr._GENERIC_PROBE_LOCK:
+            vr._GENERIC_PROBES[root] = stuck
+        assert vr._probe_root_generic(root, 0.5) is False
+
+        vr.invalidate_caches()
+
+        assert vr._probe_root_generic(root, 2) is True
+        assert stuck in vr._FORGOTTEN_GENERIC_PROBES
+    finally:
+        release.set()
+        stuck.join(5)
+        with vr._GENERIC_PROBE_LOCK:
+            vr._GENERIC_PROBES.pop(root, None)
+            vr._FORGOTTEN_GENERIC_PROBES.discard(stuck)

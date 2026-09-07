@@ -419,3 +419,39 @@ def test_check_again_is_not_swallowed_by_an_in_flight_poll(fresh_server, page, m
 
     page.evaluate("window.__release()")
     expect(msg).to_contain_text("1 new image", timeout=15000)
+
+
+def test_check_again_releases_the_button_when_the_recheck_fails(
+    fresh_server, page, monkeypatch,
+):
+    """A rejected recheck POST clears nothing, so polling would redraw the
+    same cached answer and read as "checked again, still offline". The button
+    comes back instead, so the click can be retried."""
+    import volume_reachability
+
+    url = fresh_server["url"]
+    photo_dir = fresh_server["photo_dir"]
+    _write_jpeg(photo_dir / "IMG_0007.JPG")
+    gate = _RemountableGate(photo_dir)
+    monkeypatch.setattr(volume_reachability, "get_shared", lambda: gate)
+    _clear_new_images_cache()
+
+    page.goto(f"{url}/browse")
+    msg = page.locator("#newImagesMsg")
+    expect(msg).to_contain_text("Couldn't check for new images", timeout=5000)
+
+    page.evaluate("""() => {
+      const realFetch = window.fetch;
+      window.fetch = (u, o) => (String(u).includes('recheck')
+        ? Promise.resolve(new Response('', {status: 500}))
+        : realFetch(u, o));
+    }""")
+    # Even with the volume back, a failed recheck must not be reported as a
+    # completed check: nothing was invalidated, so the cached answer stands.
+    gate.online = True
+    page.locator("#newImagesRecheck").click()
+    expect(page.locator("#newImagesCheckedAt")).to_contain_text(
+        "recheck failed", timeout=5000,
+    )
+    expect(page.locator("#newImagesRecheck")).to_be_enabled()
+    expect(msg).to_contain_text("Couldn't check for new images")

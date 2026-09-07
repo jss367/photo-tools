@@ -13622,9 +13622,22 @@ async function recheckNewImages() {
   const btn = document.getElementById('newImagesRecheck');
   if (btn && btn.disabled) return;
   _setNewImagesRecheckBusy(true);
+  let invalidated = false;
   try {
-    await fetch('/api/workspaces/active/new-images/recheck', {method: 'POST'});
-  } catch (e) { /* the poll below reports whatever the real state is */ }
+    const resp = await fetch(
+      '/api/workspaces/active/new-images/recheck', {method: 'POST'},
+    );
+    invalidated = resp.ok;
+  } catch (e) { invalidated = false; }
+  if (!invalidated) {
+    // Nothing was cleared, so polling now would redraw the same cached
+    // answer and read as "checked again, still offline". Say the request
+    // failed and hand the button back so the click can be retried.
+    const stamp = document.getElementById('newImagesCheckedAt');
+    if (stamp) stamp.textContent = 'recheck failed \u2014 try again';
+    _setNewImagesRecheckBusy(false);
+    return;
+  }
   await checkNewImages({force: true});
 }
 

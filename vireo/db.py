@@ -258,6 +258,12 @@ def _escape_like(s: str) -> str:
     return s.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
+# Sentinel for ``resolve_species_display_name(case_convention=...)``: absent
+# means "work it out", which is different from an explicit ``None`` ("there is
+# no convention, leave the caller's spelling alone").
+_DETECT_CASE_CONVENTION = object()
+
+
 def _is_keyword_word_char(ch):
     return ch.isalnum()
 
@@ -10857,7 +10863,10 @@ class Database:
             return "".join(chars)
         return word[0].upper() + word[1:]
 
-    def resolve_species_display_name(self, name, apply_case_convention=True):
+    def resolve_species_display_name(
+        self, name, apply_case_convention=True,
+        case_convention=_DETECT_CASE_CONVENTION,
+    ):
         """Predict the stored species name that add_keyword(is_species=True) would use.
 
         Species relabel endpoints snapshot curation dst_existed before
@@ -10973,14 +10982,29 @@ class Database:
                 return leaf["name"]
         if not apply_case_convention:
             return name
-        import config as cfg
-        override = cfg.get("keyword_case")
-        if override and override != "auto":
-            return self._apply_case_convention(name, override)
-        convention = self.detect_keyword_case_convention()
+        convention = (
+            self.species_case_convention()
+            if case_convention is _DETECT_CASE_CONVENTION
+            else case_convention
+        )
         if convention:
             return self._apply_case_convention(name, convention)
         return name
+
+    def species_case_convention(self):
+        """The casing ``add_keyword`` would apply to a brand-new species name.
+
+        The configured override wins; otherwise it is detected from the
+        existing species keywords. Both readings cost a config load and a
+        scan of every species keyword, which is why bulk callers resolve it
+        once and hand it back to ``resolve_species_display_name`` instead of
+        paying for it per name.
+        """
+        import config as cfg
+        override = cfg.get("keyword_case")
+        if override and override != "auto":
+            return override
+        return self.detect_keyword_case_convention()
 
     def _species_root_name_for_taxon(self, taxon_id):
         """Canonical root keyword spelling for a species taxon, if any.

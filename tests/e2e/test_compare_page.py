@@ -113,20 +113,32 @@ def test_compare_reject_updates_in_place_without_reloading_collection(
     )
     page.goto(f"{live_server['url']}/id-conflicts")
     page.wait_for_function("() => window.compareData !== null")
-    compare_requests.clear()
 
     page.locator("#filterRow button", has_text="All").click()
     row = page.locator(".compare-table tbody tr").first
+    expect(row).to_be_visible()
     photo_id = row.get_attribute("data-photo-id")
-    with page.expect_response("**/reject") as response_info:
+    compare_requests.clear()
+
+    # The scoped refresh is only sent once /reject has returned, and the page
+    # patches the pill optimistically before that. Waiting on the pill alone
+    # would let the count below be read before the refresh was ever issued, so
+    # wait for the refresh request itself.
+    with page.expect_response("**/reject") as response_info, page.expect_response(
+        lambda r: "/api/predictions/compare?" in r.url and "refresh_photo_id=" in r.url
+    ) as refresh_info:
         row.get_by_role("button", name="Reject", exact=True).first.click()
     assert response_info.value.ok
+    assert refresh_info.value.ok
 
     row = page.locator(f'tr[data-photo-id="{photo_id}"]')
     expect(row.locator(".status-pill.rejected")).to_be_visible()
     assert len(compare_requests) == 1
     query = parse_qs(urlparse(compare_requests[0]).query)
-    assert query["photo_id"] == [photo_id]
+    # The one request names the photo it changed: the stored comparison
+    # rebuilds that row, and nothing else in the collection is touched.
+    assert query["refresh_photo_id"] == [photo_id]
+    assert "photo_id" not in query
 
 
 def test_compare_accept_refreshes_only_the_changed_photo(live_server, page):
@@ -143,20 +155,28 @@ def test_compare_accept_refreshes_only_the_changed_photo(live_server, page):
     )
     page.goto(f"{live_server['url']}/id-conflicts")
     page.wait_for_function("() => window.compareData !== null")
-    compare_requests.clear()
 
     page.locator("#filterRow button", has_text="All").click()
     row = page.locator(f'tr[data-photo-id="{photo_id}"]')
-    with page.expect_response("**/accept") as response_info:
+    expect(row).to_be_visible()
+    compare_requests.clear()
+
+    # Same ordering as the reject case: the keyword pill can render from the
+    # local patch, so the refresh request has to be waited on separately.
+    with page.expect_response("**/accept") as response_info, page.expect_response(
+        lambda r: "/api/predictions/compare?" in r.url and "refresh_photo_id=" in r.url
+    ) as refresh_info:
         row.get_by_role("button", name="Add keyword", exact=True).click()
     assert response_info.value.ok
+    assert refresh_info.value.ok
 
     expect(row.locator(".keyword-pill.species")).to_contain_text(
         "Red-tailed Hawk"
     )
     assert len(compare_requests) == 1
     query = parse_qs(urlparse(compare_requests[0]).query)
-    assert query["photo_id"] == [str(photo_id)]
+    assert str(photo_id) in query["refresh_photo_id"]
+    assert "photo_id" not in query
 
 
 def test_compare_serializes_scoped_decision_refreshes(live_server, page):
@@ -236,25 +256,16 @@ def test_compare_scoped_refresh_exits_empty_needs_review_filter(live_server, pag
     result = page.evaluate(
         """async () => {
           var originalFetch = jsonFetch;
-          var refreshed = JSON.parse(JSON.stringify(compareData));
-          refreshed.photos.forEach(function(photo) {
-            Object.keys(photo.predictions || {}).forEach(function(model) {
-              (photo.predictions[model] || []).forEach(function(pred) {
-                pred.status = 'reviewed';
-              });
-            });
-            (photo.subjects || []).forEach(function(subject) {
-              Object.keys(subject.predictions || {}).forEach(function(model) {
-                (subject.predictions[model] || []).forEach(function(pred) {
-                  pred.status = 'reviewed';
-                });
-              });
-            });
-          });
-          jsonFetch = async function() { return refreshed; };
+          // Answer the decision refresh the way the server would once the
+          // last pending row is settled: nothing left needing review.
+          var settled = JSON.parse(JSON.stringify(compareData));
+          settled.summary.needs_review = 0;
+          settled.photos = [];
+          settled.total = 0;
+          jsonFetch = async function() { return settled; };
           activeFilter = 'needs_review';
           try {
-            await refreshComparisonPhotos(refreshed.photos.map(function(photo) {
+            await refreshComparisonPhotos(compareData.photos.map(function(photo) {
               return photo.photo_id;
             }));
             return {
@@ -385,23 +396,16 @@ def test_compare_treats_second_detected_species_as_additional(live_server, page)
 
     page.goto(f"{live_server['url']}/compare")
     page.wait_for_function("() => window.compareData !== null")
-    subject_state = page.evaluate(
-        """(photoId) => {
-          const photo = compareData.photos.find(item => item.photo_id === photoId);
-          const assessment = photoSubjectAssessment(photo);
-          return {
-            subjectCount: assessment.subjects.length,
-            categories: assessment.statuses.map(item => item.category),
-            species: assessment.signals.map(item => item.consensus_species),
-          };
-        }""",
-        photo_id,
+
+    page.locator("#filterRow button", has_text="All").click()
+    subject_summaries = page.locator(
+        f'tr[data-photo-id="{photo_id}"] .subject-summary'
     )
-    assert subject_state == {
-        "subjectCount": 2,
-        "categories": ["match", "additional"],
-        "species": ["Red-tailed Hawk", "Cooper's Hawk"],
-    }
+    expect(subject_summaries).to_have_count(2)
+    expect(subject_summaries.nth(0)).to_contain_text("Red-tailed Hawk")
+    expect(subject_summaries.nth(0)).to_contain_text("Match")
+    expect(subject_summaries.nth(1)).to_contain_text("Cooper's Hawk")
+    expect(subject_summaries.nth(1)).to_contain_text("Additional species suggested")
 
     page.locator("#filterRow button", has_text="Models disagree").click()
     expect(page.locator(f'tr[data-photo-id="{photo_id}"]')).to_have_count(0)
@@ -461,32 +465,15 @@ def test_compare_missing_prediction_filter_includes_subjectless_photos(live_serv
     page.goto(f"{live_server['url']}/compare")
     page.wait_for_function("() => window.compareData !== null")
 
-    row_status = page.evaluate(
-        """(photoId) => {
-          const photo = compareData.photos.find(item => item.photo_id === photoId);
-          if (!photo) return null;
-          const assessment = photoSubjectAssessment(photo);
-          const status = photoReviewStatus(photo);
-          return {
-            statusCount: assessment.statuses.length,
-            category: status.category,
-            matchesFilter: photoMatchesFilter(photo, 'missing_prediction'),
-          };
-        }""",
-        subjectless_pid,
-    )
-    assert row_status == {
-        "statusCount": 0,
-        "category": "missing_prediction",
-        "matchesFilter": True,
-    }
-
     summary_missing = page.evaluate("() => effectiveSummary().missing_predictions")
     assert summary_missing >= 1
 
     page.locator("#filterRow button", has_text="Missing predictions").click()
     row = page.locator(f'tr[data-photo-id="{subjectless_pid}"]')
     expect(row).to_be_visible()
+    expect(row.locator("td:nth-child(3) .category-pill")).to_have_text(
+        "Missing prediction"
+    )
 
 
 def test_compare_row_status_surfaces_unclassified_over_pending_match(
@@ -515,37 +502,28 @@ def test_compare_row_status_surfaces_unclassified_over_pending_match(
 
     page.goto(f"{live_server['url']}/compare")
     page.wait_for_function("() => window.compareData !== null")
+    page.locator("#filterRow button", has_text="All").click()
 
-    status = page.evaluate(
-        """(photoId) => {
-          const photo = compareData.photos.find(item => item.photo_id === photoId);
-          const assessment = photoSubjectAssessment(photo);
-          const rowStatus = photoReviewStatus(photo);
-          return {
-            categories: assessment.statuses.map(item => item.category),
-            rowCategory: rowStatus.category,
-          };
-        }""",
-        photo_id,
-    )
-    # Both subjects should be present: the original with a pending match and
-    # the new detection with no predictions (unclassified).
-    assert sorted(status["categories"]) == ["match", "unclassified"]
+    row = page.locator(f'tr[data-photo-id="{photo_id}"]')
+    expect(row).to_be_visible()
+    # Both subjects are present: the original with a pending match and the
+    # new detection with no predictions (unclassified).
+    summaries = row.locator(".subject-summary")
+    expect(summaries).to_have_count(2)
+    expect(summaries.nth(0)).to_contain_text("Match")
+    expect(summaries.nth(1)).to_contain_text("Unclassified subject")
     # The row surfaces the unclassified subject rather than the pending match.
-    assert status["rowCategory"] == "unclassified"
+    expect(row.locator("td:nth-child(3) .category-pill")).to_have_text(
+        "Unclassified subject"
+    )
 
 
-def test_compare_full_load_resets_filter_when_stale_cache_reports_needs_review(
+def test_compare_full_load_lands_on_the_collection_when_nothing_needs_review(
     live_server, page
 ):
-    """A full ``loadComparison()`` must clear ``signalCache`` before it calls
-    ``effectiveSummary()``. Full loads still happen on initial navigation and
-    as a fallback when a targeted decision refresh fails; stale assessments
-    must not select a filter that disagrees with the freshly loaded rows.
-
-    Regression for a bug where the cache clear only fired inside
-    ``renderCompare()`` — after ``effectiveSummary()`` had already returned
-    pre-action data.
+    """The page opens on the Needs review queue. When that queue is empty it
+    must show the collection instead of an empty table — the filter the page
+    chose for itself has to follow the data it was chosen from.
     """
     from labels_fingerprint import TOL_SENTINEL
 
@@ -555,44 +533,9 @@ def test_compare_full_load_resets_filter_when_stale_cache_reports_needs_review(
     page.goto(f"{live_server['url']}/compare")
     page.wait_for_function("() => window.compareData !== null")
 
-    # Force activeFilter to 'all' so we can observe whether the reload
-    # re-pins it to 'needs_review' based on a stale cache read.
-    page.evaluate(
-        """(photoId) => {
-          window.activeFilter = 'all';
-          // Plant an assessment cache entry that claims THIS photo has a
-          // pending prediction. The key uses the same shape
-          // photoSubjectAssessment() builds — see compare.html.
-          var key = 'assessment|' + String(photoId) + '|' +
-                    visibleModels().join('|');
-          signalCache.set(key, {
-            subjects: [{detection_id: null, kind: 'full_image'}],
-            signals: [{all_predictions: [{status: 'pending'}]}],
-            statuses: [{
-              category: 'conflict',
-              label: 'Conflict',
-              needs_review: true,
-              has_prediction: true,
-              signal: {all_predictions: [{status: 'pending'}]},
-            }],
-          });
-        }""",
-        photo_id,
-    )
-    # Sanity: with the planted entry in the cache, effectiveSummary() sees
-    # a needs_review count of at least 1 — this is what the reload's
-    # activeFilter check would key off of if the cache were not cleared.
-    stale_needs_review = page.evaluate(
-        "() => effectiveSummary().needs_review",
-    )
-    assert stale_needs_review >= 1
-
-    # Wipe the real pending prediction from the DB so a fresh assessment
-    # would report needs_review=0 — mirroring the state after a
-    # predictionAction() accept/reject on the last pending row. The
-    # predictions table has no ``status`` column — per-workspace review
-    # state lives in ``prediction_review`` (absence == pending) — so we
-    # upsert accepted rows via update_prediction_status().
+    # Settle every pending row. The predictions table has no ``status``
+    # column — per-workspace review state lives in ``prediction_review``,
+    # where an absent row means pending — so accept them explicitly.
     pred_ids = [
         row["id"]
         for row in db.conn.execute("SELECT id FROM predictions").fetchall()
@@ -600,12 +543,8 @@ def test_compare_full_load_resets_filter_when_stale_cache_reports_needs_review(
     for pred_id in pred_ids:
         db.update_prediction_status(pred_id, "accepted", _commit=False)
     db.conn.commit()
-    # Also make the initial dataset explicit: seed a fresh non-pending row
-    # so photoReviewStatus() doesn't collapse to missing_prediction.
-    # status="accepted" writes a matching prediction_review row so the
-    # zero-pending fixture doesn't rely on the seed's status="pending"
-    # default when this add_prediction actually inserts a new row instead
-    # of colliding with the seeded Red-tailed Hawk entry.
+    # Seed one settled row so the photo does not collapse to
+    # missing_prediction once the pending ones are gone.
     det_id = db.conn.execute(
         "SELECT id FROM detections WHERE photo_id = ? ORDER BY id LIMIT 1",
         (photo_id,),
@@ -621,12 +560,9 @@ def test_compare_full_load_resets_filter_when_stale_cache_reports_needs_review(
     )
     db.conn.commit()
 
-    # Exercise the full-load path directly.
+    page.evaluate("() => { window.activeFilter = 'needs_review'; }")
     page.evaluate("async () => { await loadComparison(); }")
 
-    # The reload must have cleared the cache before computing the summary,
-    # so activeFilter reflects the fresh dataset (0 pending → 'all'), not
-    # the stale planted count.
     result = page.evaluate(
         """() => ({
           filter: window.activeFilter,
@@ -635,3 +571,253 @@ def test_compare_full_load_resets_filter_when_stale_cache_reports_needs_review(
     )
     assert result["needsReview"] == 0
     assert result["filter"] == "all"
+    expect(page.locator("#filterRow .active")).to_contain_text("All")
+
+
+def test_compare_initial_filter_ignores_an_unavailable_model_assessment(
+    live_server, page
+):
+    """A collection switch that drops the selected model must not let the
+    dropped model's empty queue decide the filter. The response was assessed
+    under a model this collection does not carry, so its ``needs_review: 0``
+    says nothing about the collection; the corrected re-query the reset starts
+    is the one entitled to fall back to All.
+    """
+    page.goto(f"{live_server['url']}/compare")
+    page.wait_for_function("() => window.compareData !== null")
+
+    result = page.evaluate(
+        """async () => {
+          // Select a model the next response will not list, the way a
+          // collection switch leaves a stale specific model selected.
+          var modelA = document.getElementById('modelA');
+          modelA.innerHTML += '<option value="Ghost-Model">Ghost-Model</option>';
+          modelA.value = 'Ghost-Model';
+
+          var models = (compareData.models || []).filter(function(name) {
+            return name !== 'Ghost-Model';
+          });
+          var stale = JSON.parse(JSON.stringify(compareData));
+          stale.models = models;
+          stale.visible_models = ['Ghost-Model'];
+          stale.summary.needs_review = 0;
+          stale.photos = [];
+          stale.total = 0;
+          var corrected = JSON.parse(JSON.stringify(compareData));
+          corrected.models = models;
+          corrected.visible_models = models;
+          corrected.summary.needs_review = 3;
+
+          var originalFetch = jsonFetch;
+          var calls = [];
+          jsonFetch = async function(url) {
+            calls.push(url);
+            return calls.length === 1 ? stale : corrected;
+          };
+          activeFilter = 'needs_review';
+          try {
+            await fetchRows({initial: true, page: 1});
+            // The corrected re-query is started from the response handler and
+            // not awaited, so let it settle before reading the outcome.
+            for (var i = 0; i < 50 && calls.length < 2; i++) {
+              await new Promise(function(resolve) { setTimeout(resolve, 0); });
+            }
+            await new Promise(function(resolve) { setTimeout(resolve, 20); });
+            return {
+              filter: activeFilter,
+              calls: calls.length,
+              needsReview: (compareData.summary || {}).needs_review,
+              selectedModel: document.getElementById('modelA').value,
+            };
+          } finally {
+            jsonFetch = originalFetch;
+          }
+        }"""
+    )
+
+    # Two requests: the stale one and its correction. A third would mean the
+    # stale assessment had already switched the filter to All.
+    assert result == {
+        "filter": "needs_review",
+        "calls": 2,
+        "needsReview": 3,
+        "selectedModel": "all",
+    }
+    expect(page.locator("#filterRow .active")).to_contain_text("Needs review")
+
+
+def test_compare_pages_the_queue_instead_of_rendering_the_collection(
+    live_server, page
+):
+    """The table is a page of the queue, not the whole thing.
+
+    A catalog-sized collection used to be rendered in one go — tens of
+    thousands of rows in a single table — which is what made this page
+    unusable. The pager has to say where in the queue the user is, and
+    the table has to hold only that page.
+    """
+    from PIL import Image
+
+    db = live_server["db"]
+    folder_id = live_server["data"]["folders"][0]
+    thumb_dir = live_server["app"].config["THUMB_CACHE_DIR"]
+    for index in range(8):
+        pid = db.add_photo(
+            folder_id=folder_id, filename=f"paged{index:02d}.jpg",
+            extension=".jpg", file_size=1000, file_mtime=1.0,
+            timestamp=f"2024-04-{index + 1:02d}T09:00:00",
+        )
+        Image.new("RGB", (60, 60), color="green").save(f"{thumb_dir}/{pid}.jpg")
+    db.conn.commit()
+
+    page.goto(f"{live_server['url']}/id-conflicts")
+    page.wait_for_function("() => window.compareData !== null")
+    page.locator("#filterRow button", has_text="All").click()
+    page.select_option("#pagerPerPage", "30")
+    page.select_option("#pagerPerPage", "60")
+
+    total = page.evaluate("() => compareTotal")
+    assert total >= 9
+    page.select_option("#pagerPerPage", "30")
+    expect(page.locator("#pagerSummary")).to_contain_text(f"of {total}")
+
+    # One page of rows, never the collection.
+    rows = page.locator(".compare-table tbody tr")
+    expect(rows).to_have_count(min(30, total))
+
+    first_page_ids = page.evaluate(
+        "() => compareRows.map(function(p) { return p.photo_id; })"
+    )
+    assert len(first_page_ids) <= 30
+
+
+def test_compare_next_page_shows_different_rows(live_server, page):
+    from PIL import Image
+
+    db = live_server["db"]
+    folder_id = live_server["data"]["folders"][0]
+    thumb_dir = live_server["app"].config["THUMB_CACHE_DIR"]
+    for index in range(4):
+        pid = db.add_photo(
+            folder_id=folder_id, filename=f"next{index:02d}.jpg",
+            extension=".jpg", file_size=1000, file_mtime=1.0,
+            timestamp=f"2024-05-{index + 1:02d}T09:00:00",
+        )
+        Image.new("RGB", (60, 60), color="green").save(f"{thumb_dir}/{pid}.jpg")
+    db.conn.commit()
+
+    page.goto(f"{live_server['url']}/id-conflicts")
+    page.wait_for_function("() => window.compareData !== null")
+    page.locator("#filterRow button", has_text="All").click()
+    page.evaluate("async () => { comparePerPage = 2; await reloadRows(); }")
+
+    expect(page.locator("#pagerSummary")).to_contain_text("page 1 of")
+    first = page.evaluate("() => compareRows.map(p => p.photo_id)")
+    assert len(first) == 2
+
+    page.locator("#pagerNext").click()
+    expect(page.locator("#pagerSummary")).to_contain_text("page 2 of")
+    second = page.evaluate("() => compareRows.map(p => p.photo_id)")
+
+    assert set(first).isdisjoint(second)
+    expect(page.locator("#pagerPrev")).to_be_enabled()
+
+
+def test_compare_controls_stay_reachable_while_scrolling(live_server, page):
+    """Filter chips, pager and batch actions follow the list down the page.
+
+    Scrolling past them used to strand the user mid-queue with no way to
+    change what they were looking at.
+    """
+    page.goto(f"{live_server['url']}/id-conflicts")
+    page.wait_for_function("() => window.compareData !== null")
+
+    position = page.evaluate(
+        "() => getComputedStyle(document.getElementById('stickyControls')).position"
+    )
+    assert position == "sticky"
+
+    page.mouse.wheel(0, 2000)
+    expect(page.locator("#filterRow")).to_be_in_viewport()
+    expect(page.locator("#pagerRow")).to_be_in_viewport()
+
+
+def test_compare_search_narrows_the_listed_rows(live_server, page):
+    page.goto(f"{live_server['url']}/id-conflicts")
+    page.wait_for_function("() => window.compareData !== null")
+    page.locator("#filterRow button", has_text="All").click()
+
+    before = page.evaluate("() => compareTotal")
+    page.fill("#compareSearch", "Red-tailed")
+    page.wait_for_function(
+        "(before) => compareTotal < before", arg=before,
+    )
+
+    rows = page.locator(".compare-table tbody tr")
+    expect(rows.first).to_contain_text("Red-tailed Hawk")
+
+
+def test_compare_control_query_waits_for_an_in_flight_decision_refresh(
+    live_server, page,
+):
+    """A filter touched mid-decision reads the comparison the decision made.
+
+    Without the ordering the control query reads the stored comparison before
+    the refresh has patched it, then wins the staleness guard with its newer
+    sequence number and paints pre-decision counts.
+    """
+    page.goto(f"{live_server['url']}/id-conflicts")
+    page.wait_for_function("() => window.compareData !== null")
+
+    result = page.evaluate(
+        """async () => {
+          var baseline = JSON.parse(JSON.stringify(compareData));
+          var photoId = baseline.photos[0].photo_id;
+          var originalFetch = jsonFetch;
+          var calls = [];
+          var releaseRefresh;
+          var refreshGate = new Promise(function(resolve) {
+            releaseRefresh = resolve;
+          });
+          // Stands in for the server's stored comparison: the decision only
+          // shows up in the counts once its refresh has been answered.
+          var serverNeedsReview = 7;
+          jsonFetch = async function(url) {
+            var isRefresh = url.indexOf('refresh_photo_id') >= 0;
+            calls.push(isRefresh ? 'refresh' : 'control');
+            if (isRefresh) {
+              await refreshGate;
+              serverNeedsReview = 3;
+            }
+            var body = JSON.parse(JSON.stringify(baseline));
+            body.summary.needs_review = serverNeedsReview;
+            return body;
+          };
+          try {
+            var refresh = refreshDecisionPhotos([photoId]);
+            await new Promise(function(resolve) { setTimeout(resolve, 0); });
+            // Every user control -- filter, sort, search, threshold, per-page
+            // -- re-queries through reloadRows.
+            activeFilter = 'all';
+            var control = reloadRows();
+            await new Promise(function(resolve) { setTimeout(resolve, 0); });
+            var beforeRelease = calls.slice();
+            releaseRefresh();
+            await refresh;
+            await control;
+            return {
+              beforeRelease: beforeRelease,
+              afterRelease: calls,
+              needsReview: effectiveSummary().needs_review,
+            };
+          } finally {
+            jsonFetch = originalFetch;
+          }
+        }"""
+    )
+
+    assert result == {
+        "beforeRelease": ["refresh"],
+        "afterRelease": ["refresh", "control"],
+        "needsReview": 3,
+    }

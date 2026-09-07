@@ -84,6 +84,62 @@ body { padding-bottom: 36px; }
   color: var(--text-muted);
 }
 
+/* The filter chips, pager and batch actions follow the table down the page.
+   A review queue is a long list, and controls that scroll away leave the
+   user stranded mid-list with no way to change what they are looking at. */
+.sticky-controls {
+  position: sticky;
+  top: 0;
+  z-index: 3;
+  padding-top: 8px;
+  margin-bottom: 12px;
+  background: var(--bg-primary);
+  border-bottom: 1px solid var(--border-subtle);
+}
+.sticky-controls .filter-row,
+.sticky-controls .batch-row,
+.sticky-controls .pager-row { margin-bottom: 8px; }
+
+.pager-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+}
+.pager-summary {
+  color: var(--text-secondary);
+  font-size: 12px;
+  margin-right: 4px;
+}
+.pager-btn {
+  background: var(--bg-tertiary);
+  color: var(--text-secondary);
+  border: 1px solid var(--border-primary);
+  border-radius: 4px;
+  padding: 6px 10px;
+  font-size: 12px;
+  cursor: pointer;
+}
+.pager-btn:disabled { opacity: 0.45; cursor: default; }
+.pager-size {
+  color: var(--text-muted);
+  font-size: 11px;
+  text-transform: uppercase;
+}
+.pager-row select {
+  background: var(--bg-input);
+  color: var(--text-primary);
+  border: 1px solid var(--border-primary);
+  border-radius: 4px;
+  padding: 5px 7px;
+  font-size: 12px;
+}
+.pager-note { color: var(--text-muted); font-size: 12px; }
+
+/* The table stays readable while the next page is on its way, but visibly
+   belongs to the previous query until the new rows land. */
+#compareContent.loading { opacity: 0.55; }
+
 .filter-row,
 .sort-row,
 .exclude-row,
@@ -370,13 +426,13 @@ body { padding-bottom: 36px; }
     </div>
     <div class="control">
       <label for="modelA">Model A</label>
-      <select id="modelA" onchange="renderCompare()">
+      <select id="modelA" onchange="setVisibleModels()">
         <option value="all">All models</option>
       </select>
     </div>
     <div class="control">
       <label for="modelB">Model B</label>
-      <select id="modelB" onchange="renderCompare()">
+      <select id="modelB" onchange="setVisibleModels()">
         <option value="">No second model</option>
       </select>
     </div>
@@ -390,16 +446,18 @@ body { padding-bottom: 36px; }
     <div class="control">
       <label for="conflictThreshold">Conflict threshold</label>
       <div class="range-control">
-        <input id="conflictThreshold" type="range" min="0" max="1" step="0.05" oninput="setConflictThreshold(this.value)">
+        <input id="conflictThreshold" type="range" min="0" max="1" step="0.05"
+               oninput="previewConflictThreshold(this.value)"
+               onchange="setConflictThreshold(this.value)">
         <span id="conflictThresholdValue" class="range-value">40%</span>
       </div>
     </div>
     <div class="control">
       <label for="compareSearch">Search</label>
       <div class="search-control">
-        <input id="compareSearch" type="search" placeholder="Filename, keyword, species" oninput="renderCompare()">
-        <button id="compareSearchMatchCaseBtn" class="search-option-btn" type="button" aria-pressed="false" onclick="VireoTextSearch.toggle('compareSearch', 'match_case', renderCompare)" title="Match case">Aa</button>
-        <button id="compareSearchWholeWordBtn" class="search-option-btn" type="button" aria-pressed="false" onclick="VireoTextSearch.toggle('compareSearch', 'whole_word', renderCompare)" title="Match whole word">ab</button>
+        <input id="compareSearch" type="search" placeholder="Filename, keyword, species" oninput="scheduleSearch()">
+        <button id="compareSearchMatchCaseBtn" class="search-option-btn" type="button" aria-pressed="false" onclick="VireoTextSearch.toggle('compareSearch', 'match_case', reloadRows)" title="Match case">Aa</button>
+        <button id="compareSearchWholeWordBtn" class="search-option-btn" type="button" aria-pressed="false" onclick="VireoTextSearch.toggle('compareSearch', 'whole_word', reloadRows)" title="Match whole word">ab</button>
       </div>
     </div>
   </div>
@@ -408,13 +466,30 @@ body { padding-bottom: 36px; }
   <div id="taxonomyNote" class="taxonomy-note">Taxonomy data is unavailable. This page can confirm exact keyword matches, but broader/refinement/conflict labels are limited.</div>
   <div id="sortRow" class="sort-row" style="display:none;"></div>
   <div id="excludeRow" class="exclude-row" style="display:none;"></div>
-  <div id="filterRow" class="filter-row" style="display:none;"></div>
-  <div id="batchRow" class="batch-row" style="display:none;">
-    <span id="batchCount" class="batch-count">0 selected</span>
-    <button class="batch-btn" id="batchAccept" onclick="batchAction('accept')">Add prediction keyword</button>
-    <button class="batch-btn" id="batchReplace" onclick="batchAction('replace')">Replace species keyword</button>
-    <button class="batch-btn" id="batchReject" onclick="batchAction('reject')">Reject prediction</button>
-    <button class="batch-btn" id="batchReviewed" onclick="batchAction('reviewed')">Mark reviewed</button>
+
+  <div id="stickyControls" class="sticky-controls">
+    <div id="filterRow" class="filter-row" style="display:none;"></div>
+    <div id="pagerRow" class="pager-row" style="display:none;">
+      <span id="pagerSummary" class="pager-summary"></span>
+      <button class="pager-btn" id="pagerPrev" onclick="goToPage(comparePage - 1)">Previous</button>
+      <button class="pager-btn" id="pagerNext" onclick="goToPage(comparePage + 1)">Next</button>
+      <label class="pager-size" for="pagerPerPage">Rows</label>
+      <select id="pagerPerPage" onchange="setPerPage(this.value)"
+              data-view-preference="vireo.compare.perPage">
+        <option value="30">30</option>
+        <option value="60">60</option>
+        <option value="120">120</option>
+        <option value="200">200</option>
+      </select>
+      <span id="loadingNote" class="pager-note" hidden>Loading...</span>
+    </div>
+    <div id="batchRow" class="batch-row" style="display:none;">
+      <span id="batchCount" class="batch-count">0 selected</span>
+      <button class="batch-btn" id="batchAccept" onclick="batchAction('accept')">Add prediction keyword</button>
+      <button class="batch-btn" id="batchReplace" onclick="batchAction('replace')">Replace species keyword</button>
+      <button class="batch-btn" id="batchReject" onclick="batchAction('reject')">Reject prediction</button>
+      <button class="batch-btn" id="batchReviewed" onclick="batchAction('reviewed')">Mark reviewed</button>
+    </div>
   </div>
 
   <div id="compareContent">
@@ -423,101 +498,41 @@ body { padding-bottom: 36px; }
 </div>
 
 <script>
+// The comparison itself is derived on the server (see vireo/id_conflicts.py):
+// working out what a row means costs a pass over every prediction in the
+// collection and the taxonomy behind it, and a catalog-sized collection
+// produces tens of thousands of rows. This page asks for one page of rows
+// plus the counts, and renders what it is told.
 var compareData = null;
+var compareRows = [];
+var compareToken = null;
+var comparePage = 1;
+var comparePerPage = 60;
+var compareTotal = 0;
+var compareModels = [];
+var compareFilterDefs = [];
+var compareSortDefs = [];
+var compareExcludeDefs = [];
 var activeFilter = 'needs_review';
 var activeSort = 'review_priority';
-var excludeState = {
-  rejected: false,
-  picks: false,
-  unflagged: false,
-  not_wildlife: false,
-  misses: false,
-};
+var excludeState = {};
 var selectedRows = new Set();
+// Bumped by full collection loads only. Scoped decision refreshes read it to
+// tell whether the comparison they were queued against is still on screen.
 var loadingSeq = 0;
+// Bumped by every row request, so a slower response can never paint over a
+// newer one — a filter click and a queued decision refresh race constantly.
+var requestSeq = 0;
 var decisionRefreshQueue = Promise.resolve();
-var signalCache = new Map();
+var searchTimer = null;
 var CONFLICT_THRESHOLD_KEY = 'vireo.compare.conflictThreshold';
+var PER_PAGE_KEY = 'vireo.compare.perPage';
 var conflictMinConfidence = loadConflictThreshold();
 
-var FILTERS = [
-  { id: 'model_disagreement', label: 'Models disagree' },
-  { id: 'strong_model_disagreement', label: 'Strong model disagreement' },
-  { id: 'keyword_model_conflict', label: 'Keyword vs models' },
-  { id: 'strong_keyword_model_conflict', label: 'Strong keyword conflict' },
-  { id: 'consensus_conflict', label: 'Model consensus conflicts' },
-  { id: 'all_models_agree', label: 'Shown models agree' },
-  { id: 'missing_visible_model', label: 'Missing shown model' },
-  { id: 'two_models', label: 'Two+ model predictions' },
-  { id: 'needs_review', label: 'Needs review' },
-  { id: 'additional', label: 'Additional species' },
-  { id: 'conflict', label: 'Conflicts' },
-  { id: 'refinement', label: 'Refinements' },
-  { id: 'broader', label: 'Broader' },
-  { id: 'new', label: 'No species keyword' },
-  { id: 'missing_prediction', label: 'Missing predictions' },
-  { id: 'match', label: 'Matches' },
-  { id: 'reviewed', label: 'Reviewed' },
-  { id: 'all', label: 'All' },
-];
-
-var SORTS = [
-  { id: 'review_priority', label: 'Review priority' },
-  { id: 'model_disagreement', label: 'Model disagreement' },
-  { id: 'keyword_disagreement', label: 'Keyword disagreement' },
-  { id: 'consensus_conflict', label: 'Consensus conflict' },
-  { id: 'top_confidence', label: 'Top confidence' },
-  { id: 'low_confidence', label: 'Low confidence' },
-  { id: 'filename', label: 'Filename' },
-  { id: 'newest', label: 'Newest' },
-  { id: 'oldest', label: 'Oldest' },
-];
 var savedSort = VireoViewPreferences.read('vireo.compare.sort');
-if (SORTS.some(function(sort) { return sort.id === savedSort; })) {
-  activeSort = savedSort;
-}
-
-var EXCLUDES = [
-  { id: 'rejected', label: 'Hide rejects' },
-  { id: 'picks', label: 'Hide picks' },
-  { id: 'unflagged', label: 'Hide unflagged' },
-  { id: 'not_wildlife', label: 'Hide not wildlife' },
-  { id: 'misses', label: 'Hide marked misses' },
-];
-
-var CATEGORY_ORDER = {
-  models_disagree: 8,
-  conflict: 7,
-  additional: 6,
-  refinement: 5,
-  broader: 4,
-  new: 3,
-  missing_prediction: 2,
-  // ``unclassified`` marks a detected subject with no predictions at all
-  // (see photoSubjectAssessment). It needs the missing-prediction
-  // priority so that photoReviewStatus() surfaces the unclassified
-  // subject on multi-subject photos where another subject already
-  // matched — otherwise the matched subject (priority 1) would outrank
-  // the unclassified one and the row would render/sort as a Match,
-  // burying the subject that still needs classification unless the user
-  // manually selects the Missing predictions filter.
-  unclassified: 2,
-  match: 1,
-  low_conflict: 0,
-};
-
-var CATEGORY_LABELS = {
-  models_disagree: 'Models disagree about subject',
-  conflict: 'Conflict',
-  additional: 'Additional species suggested',
-  refinement: 'Refinement',
-  broader: 'Broader',
-  new: 'No species keyword',
-  missing_prediction: 'Missing prediction',
-  match: 'Match',
-  low_conflict: 'Below threshold',
-  unclassified: 'Unclassified subject',
-};
+if (savedSort) activeSort = savedSort;
+var savedPerPage = parseInt(VireoViewPreferences.read(PER_PAGE_KEY), 10);
+if (savedPerPage > 0) comparePerPage = savedPerPage;
 
 function clampConfidence(value) {
   var parsed = parseFloat(value);
@@ -540,23 +555,25 @@ function updateConflictThresholdControl() {
   if (value) value.textContent = Math.round(conflictMinConfidence * 100) + '%';
 }
 
+// The slider's label follows the drag, but the comparison is only re-derived
+// when the drag ends: the threshold changes what every row *means*, so it
+// rebuilds the whole assessment rather than re-filtering a list.
+function previewConflictThreshold(value) {
+  var label = document.getElementById('conflictThresholdValue');
+  if (label) label.textContent = Math.round(clampConfidence(value) * 100) + '%';
+}
+
 function setConflictThreshold(value) {
-  conflictMinConfidence = clampConfidence(value);
+  var next = clampConfidence(value);
+  if (next === conflictMinConfidence) return;
+  conflictMinConfidence = next;
   try {
     if (window.localStorage) {
       window.localStorage.setItem(CONFLICT_THRESHOLD_KEY, String(conflictMinConfidence));
     }
   } catch (_e) {}
   updateConflictThresholdControl();
-  renderCompare();
-}
-
-function isBelowConflictThreshold(pred) {
-  return pred && pred.category === 'conflict' && (pred.confidence || 0) < conflictMinConfidence;
-}
-
-function effectivePredictionCategory(pred) {
-  return isBelowConflictThreshold(pred) ? 'low_conflict' : (pred.category || 'missing_prediction');
+  reloadRows();
 }
 
 async function jsonFetch(url, options) {
@@ -620,48 +637,238 @@ async function loadCollections() {
   }
 }
 
+function visibleModels() {
+  var a = document.getElementById('modelA').value;
+  var b = document.getElementById('modelB').value;
+  if (!a || a === 'all') return compareModels.slice();
+  var models = [a];
+  if (b && b !== a) models.push(b);
+  return models;
+}
+
+// Sent to the server as the models to compare. "All models" sends nothing at
+// all, so a model that appears while the page is open is included instead of
+// being pinned out by a stale list.
+function requestedModelParams() {
+  var a = document.getElementById('modelA').value;
+  if (!a || a === 'all') return [];
+  return visibleModels();
+}
+
+function setVisibleModels() {
+  reloadRows();
+}
+
+function showLoading(active) {
+  var note = document.getElementById('loadingNote');
+  if (note) note.hidden = !active;
+  var content = document.getElementById('compareContent');
+  if (content) content.classList.toggle('loading', !!active);
+}
+
+function buildRowsUrl(options) {
+  var collId = document.getElementById('collectionPicker').value;
+  var params = new URLSearchParams();
+  params.set('collection_id', collId);
+  if (compareToken) params.set('token', compareToken);
+  requestedModelParams().forEach(function(model) { params.append('model', model); });
+  params.set('min_confidence', String(conflictMinConfidence));
+  params.set('filter', activeFilter);
+  params.set('sort', activeSort);
+  Object.keys(excludeState).forEach(function(id) {
+    if (excludeState[id]) params.append('exclude', id);
+  });
+  var search = document.getElementById('compareSearch');
+  var q = search ? search.value.trim() : '';
+  if (q) params.set('q', q);
+  VireoTextSearch.appendParams(params, VireoTextSearch.readOptions('compareSearch'));
+  params.set('page', String(options.page || comparePage));
+  params.set('per_page', String(comparePerPage));
+  (options.refreshPhotoIds || []).forEach(function(id) {
+    params.append('refresh_photo_id', String(id));
+  });
+  return '/api/predictions/compare?' + params.toString();
+}
+
+// One request answers everything on screen: the rows for this page, the
+// counts on every chip and tile, and the total the pager reports.
+async function fetchRows(options) {
+  options = options || {};
+  var collId = document.getElementById('collectionPicker').value;
+  if (!collId) return;
+  var fullLoadSeq = loadingSeq;
+  showLoading(true);
+  // A control the user just touched — filter, sort, search, threshold, pager
+  // — must not overtake a decision refresh that is still in flight. The
+  // server rebuilds the changed photos inside the stored comparison while
+  // that refresh runs, and a query that reads the comparison first would take
+  // the newer sequence number and then discard the refresh's answer, leaving
+  // the counts and the decided row exactly as they were before the decision.
+  // Waiting for the queue lets the decision land first, so this query reads
+  // the comparison the decision produced. Only user controls wait: the
+  // refresh's own queries run inside the queue and would deadlock on it.
+  if (options.control) {
+    await decisionRefreshQueue;
+  }
+  // Claimed after the wait, so the query the user asked for most recently is
+  // the one that wins rather than the one that stopped waiting last.
+  var seq = ++requestSeq;
+  var data;
+  try {
+    data = await jsonFetch(buildRowsUrl(options));
+  } catch (e) {
+    if (seq !== requestSeq) return;
+    showLoading(false);
+    document.getElementById('compareContent').innerHTML =
+      '<div class="compare-empty">Error loading comparison: ' + escapeHtml(e.message) + '</div>';
+    throw e;
+  }
+  // A newer request — or a collection load — has taken over. Its response is
+  // the current one; painting this stale body over it would show rows that
+  // do not belong to the comparison on screen.
+  if (seq !== requestSeq || fullLoadSeq !== loadingSeq) return;
+  showLoading(false);
+  var modelSelectionReset = applyRowsResponse(data, options);
+  // The queue the page opens on is Needs review. When it is empty there is
+  // nothing to review, so show the collection rather than an empty table —
+  // but only when the page chose the filter, never when the user did. An
+  // empty queue proves nothing when the model selection was just reset: this
+  // response was assessed under a model the collection does not carry, and
+  // the corrected re-query already carries the decision on the real counts.
+  if (
+    !modelSelectionReset
+    && !options.filterResolved
+    && (options.initial || options.afterDecision)
+    && activeFilter === 'needs_review'
+    && (data.summary || {}).needs_review === 0
+  ) {
+    activeFilter = 'all';
+    comparePage = 1;
+    await fetchRows({filterResolved: true, page: 1});
+  }
+}
+
+// Returns true when the response was assessed under a model the collection
+// does not carry, so a corrected re-query is already on its way and the caller
+// must not read anything into these counts.
+function applyRowsResponse(data, options) {
+  compareData = data;
+  compareRows = data.photos || [];
+  compareToken = data.token || compareToken;
+  compareTotal = data.total || 0;
+  comparePage = data.page || 1;
+  comparePerPage = data.per_page || comparePerPage;
+  compareModels = data.models || [];
+  compareFilterDefs = data.filters || compareFilterDefs;
+  compareSortDefs = data.sorts || compareSortDefs;
+  compareExcludeDefs = data.excludes || compareExcludeDefs;
+  compareExcludeDefs.forEach(function(item) {
+    if (!(item.id in excludeState)) excludeState[item.id] = false;
+  });
+  var modelSelectionReset = populateModelSelects(compareModels, data.visible_models || []);
+  populateSortSelect();
+  // A row that left the page — decided, filtered out, or simply on another
+  // page — must not stay in a selection whose batch buttons still claim it.
+  var visible = new Set(compareRows.map(function(photo) { return photo.photo_id; }));
+  Array.from(selectedRows).forEach(function(id) {
+    if (!visible.has(id)) selectedRows.delete(id);
+  });
+  renderCompare();
+  // The response was assessed with a specific model the new collection
+  // does not carry; the model controls just reset to what is actually
+  // available. Re-query so the counts, statuses and sort match the columns
+  // the user now sees rather than the model that was silently dropped. The
+  // re-query inherits this load's intent, so the default-filter decision the
+  // caller would have made is made once, on the corrected counts.
+  if (modelSelectionReset) {
+    reloadRows({
+      initial: options.initial,
+      afterDecision: options.afterDecision,
+      internal: true,
+    });
+  }
+  return modelSelectionReset;
+}
+
+// A full load of the current collection: everything else on this page is a
+// re-query of the same comparison.
 async function loadComparison() {
   var collId = document.getElementById('collectionPicker').value;
   var content = document.getElementById('compareContent');
   selectedRows.clear();
+  compareToken = null;
+  comparePage = 1;
+  loadingSeq++;
   updateBatchControls();
 
   if (!collId) {
     compareData = null;
-    document.getElementById('summaryGrid').style.display = 'none';
-    document.getElementById('sortRow').style.display = 'none';
-    document.getElementById('excludeRow').style.display = 'none';
-    document.getElementById('filterRow').style.display = 'none';
-    document.getElementById('batchRow').style.display = 'none';
+    compareRows = [];
+    ['summaryGrid', 'sortRow', 'excludeRow', 'filterRow', 'pagerRow', 'batchRow']
+      .forEach(function(id) { document.getElementById(id).style.display = 'none'; });
     content.innerHTML = '<div class="compare-empty">Select a collection to compare keywords and predictions.</div>';
     return;
   }
 
-  var seq = ++loadingSeq;
   content.innerHTML = '<div class="compare-empty">Loading keyword comparison...</div>';
   try {
-    var data = await jsonFetch('/api/predictions/compare?collection_id=' + encodeURIComponent(collId));
-    if (seq !== loadingSeq) return;
-    compareData = data;
-    populateModelSelects(data.models || []);
-    populateSortSelect();
-    // Drop cached subject/photo signals before computing the summary that
-    // picks activeFilter. renderCompare() clears the cache too, but that
-    // fires AFTER effectiveSummary() reads through it — so without this
-    // reset, a reload following predictionAction() can reuse the pre-action
-    // assessment and keep activeFilter='needs_review' while the freshly
-    // rendered rows have nothing pending, showing an empty Needs review
-    // table.
-    signalCache = new Map();
-    activeFilter = effectiveSummary().needs_review > 0 ? 'needs_review' : 'all';
-    renderCompare();
-  } catch(e) {
-    if (seq !== loadingSeq) return;
-    content.innerHTML = '<div class="compare-empty">Error loading comparison: ' + escapeHtml(e.message) + '</div>';
+    await fetchRows({initial: true, page: 1});
+  } catch (_e) {
+    // fetchRows already rendered the failure.
   }
 }
 
-function populateModelSelects(models) {
+// Re-query the comparison with the current controls, back at the first page.
+// A caller that is re-querying on behalf of a load still owed a default-filter
+// decision passes that intent through so the decision survives the detour.
+// Only those three flags are carried: this also runs as a plain change
+// handler, and handlers are called with arguments of their own.
+function reloadRows(carry) {
+  comparePage = 1;
+  selectedRows.clear();
+  var options = {page: 1};
+  if (carry && carry.initial) options.initial = true;
+  if (carry && carry.afterDecision) options.afterDecision = true;
+  // A change handler fired by a control the user touched has to queue behind
+  // any decision refresh still running. The one caller that re-queries from
+  // inside the page's own machinery says so, because it can already be
+  // running inside that queue.
+  if (!(carry && carry.internal)) options.control = true;
+  return fetchRows(options).catch(function() {});
+}
+
+function scheduleSearch() {
+  if (searchTimer) clearTimeout(searchTimer);
+  searchTimer = setTimeout(function() {
+    searchTimer = null;
+    reloadRows();
+  }, 250);
+}
+
+function goToPage(page) {
+  var pages = totalPages();
+  if (page < 1 || page > pages || page === comparePage) return;
+  comparePage = page;
+  selectedRows.clear();
+  fetchRows({page: page, control: true}).catch(function() {});
+}
+
+function setPerPage(value) {
+  var next = parseInt(value, 10);
+  if (!(next > 0) || next === comparePerPage) return;
+  comparePerPage = next;
+  VireoViewPreferences.write(PER_PAGE_KEY, String(next));
+  reloadRows();
+}
+
+function totalPages() {
+  return Math.max(1, Math.ceil(compareTotal / Math.max(1, comparePerPage)));
+}
+
+// Returns true when a previously-selected specific model was dropped because
+// the new collection does not carry it: the caller needs to re-fetch so the
+// response's counts, statuses and sort match the columns the user now sees.
+function populateModelSelects(models, visible) {
   var a = document.getElementById('modelA');
   var b = document.getElementById('modelB');
   var oldA = a.value || 'all';
@@ -672,54 +879,48 @@ function populateModelSelects(models) {
     a.innerHTML += '<option value="' + escapeAttr(m) + '">' + escapeHtml(m) + '</option>';
     b.innerHTML += '<option value="' + escapeAttr(m) + '">' + escapeHtml(m) + '</option>';
   });
-  a.value = models.indexOf(oldA) >= 0 ? oldA : 'all';
-  b.value = models.indexOf(oldB) >= 0 ? oldB : '';
+  var newA = models.indexOf(oldA) >= 0 ? oldA : 'all';
+  var newB = models.indexOf(oldB) >= 0 ? oldB : '';
+  a.value = newA;
+  b.value = newB;
+  var droppedA = oldA !== 'all' && newA !== oldA;
+  var droppedB = oldB !== '' && newB !== oldB;
+  return droppedA || droppedB;
 }
 
 function populateSortSelect() {
   var sel = document.getElementById('sortMode');
-  if (!sel) return;
-  sel.innerHTML = SORTS.map(function(s) {
+  if (!sel || !compareSortDefs.length) return;
+  sel.innerHTML = compareSortDefs.map(function(s) {
     return '<option value="' + escapeAttr(s.id) + '">' + escapeHtml(s.label) + '</option>';
   }).join('');
   sel.value = activeSort;
 }
 
-function visibleModels() {
-  if (!compareData) return [];
-  var a = document.getElementById('modelA').value;
-  var b = document.getElementById('modelB').value;
-  if (a === 'all') return compareData.models || [];
-  var models = [a];
-  if (b && b !== a) models.push(b);
-  return models;
-}
-
 function renderCompare() {
   if (!compareData) return;
-  signalCache = new Map();
   renderSummary();
   renderSorts();
   renderExcludes();
   renderFilters();
+  renderPager();
   renderTaxonomyNote();
-  var rows = filteredRows();
-  selectedRows.forEach(function(id) {
-    if (!rows.some(function(p) { return p.photo_id === id; })) selectedRows.delete(id);
-  });
-  renderTable(rows);
+  renderTable(compareRows);
   updateBatchControls();
+}
+
+function effectiveSummary() {
+  return (compareData && compareData.summary) || {};
 }
 
 function renderSummary() {
   var s = effectiveSummary();
-  var signals = signalSummary();
   var items = [
     ['photos', 'Photos'],
     ['models', 'Models'],
     ['needs_review', 'Needs review'],
-    ['model_disagreements', 'Models disagree', signals.model_disagreements],
-    ['keyword_model_conflicts', 'Keyword vs models', signals.keyword_model_conflicts],
+    ['model_disagreements', 'Models disagree'],
+    ['keyword_model_conflicts', 'Keyword vs models'],
     ['additional', 'Additional species'],
     ['conflicts', 'Conflicts'],
     ['refinements', 'Refinements'],
@@ -729,9 +930,8 @@ function renderSummary() {
   ];
   document.getElementById('summaryGrid').style.display = '';
   document.getElementById('summaryGrid').innerHTML = items.map(function(item) {
-    var value = item.length > 2 ? item[2] : (s[item[0]] || 0);
     return '<div class="summary-item"><span class="summary-value">' +
-      escapeHtml(value) + '</span><span class="summary-label">' +
+      escapeHtml(s[item[0]] || 0) + '</span><span class="summary-label">' +
       escapeHtml(item[1]) + '</span></div>';
   }).join('');
 }
@@ -743,17 +943,10 @@ function renderTaxonomyNote() {
   );
 }
 
-function filterCount(filter) {
-  return (compareData.photos || []).filter(function(photo) {
-    if (!photoMatchesExclusions(photo)) return false;
-    return photoMatchesFilter(photo, filter.id);
-  }).length;
-}
-
 function renderSorts() {
   var row = document.getElementById('sortRow');
   row.style.display = '';
-  row.innerHTML = '<span class="row-label">Sort by</span>' + SORTS.map(function(s) {
+  row.innerHTML = '<span class="row-label">Sort by</span>' + compareSortDefs.map(function(s) {
     var cls = s.id === activeSort ? 'sort-btn active' : 'sort-btn';
     return '<button class="' + cls + '" onclick="setSort(\'' + s.id + '\')">' +
       escapeHtml(s.label) + '</button>';
@@ -763,189 +956,74 @@ function renderSorts() {
 }
 
 function renderExcludes() {
+  var counts = (compareData && compareData.exclusion_counts) || {};
   var row = document.getElementById('excludeRow');
   row.style.display = '';
-  row.innerHTML = '<span class="row-label">Exclude</span>' + EXCLUDES.map(function(f) {
+  row.innerHTML = '<span class="row-label">Exclude</span>' + compareExcludeDefs.map(function(f) {
     var cls = excludeState[f.id] ? 'exclude-btn active' : 'exclude-btn';
     return '<button class="' + cls + '" onclick="toggleExclude(\'' + f.id + '\')">' +
-      escapeHtml(f.label) + ' <span>' + exclusionCount(f.id) + '</span></button>';
+      escapeHtml(f.label) + ' <span>' + escapeHtml(counts[f.id] || 0) + '</span></button>';
   }).join('');
 }
 
 function renderFilters() {
+  var counts = (compareData && compareData.filter_counts) || {};
   var row = document.getElementById('filterRow');
   row.style.display = '';
-  row.innerHTML = '<span class="row-label">Filter</span>' + FILTERS.map(function(f) {
+  row.innerHTML = '<span class="row-label">Filter</span>' + compareFilterDefs.map(function(f) {
     var cls = f.id === activeFilter ? 'filter-btn active' : 'filter-btn';
     return '<button class="' + cls + '" onclick="setFilter(\'' + f.id + '\')">' +
-      escapeHtml(f.label) + ' <span>' + filterCount(f) + '</span></button>';
+      escapeHtml(f.label) + ' <span>' + escapeHtml(counts[f.id] || 0) + '</span></button>';
   }).join('');
+}
+
+function renderPager() {
+  var row = document.getElementById('pagerRow');
+  row.style.display = '';
+  var pages = totalPages();
+  var first = compareTotal ? (comparePage - 1) * comparePerPage + 1 : 0;
+  var last = Math.min(compareTotal, comparePage * comparePerPage);
+  document.getElementById('pagerSummary').textContent = compareTotal
+    ? first + '–' + last + ' of ' + compareTotal + ' (page ' + comparePage + ' of ' + pages + ')'
+    : 'No rows match';
+  document.getElementById('pagerPrev').disabled = comparePage <= 1;
+  document.getElementById('pagerNext').disabled = comparePage >= pages;
+  var perPage = document.getElementById('pagerPerPage');
+  if (perPage) perPage.value = String(comparePerPage);
 }
 
 function toggleExclude(id) {
   excludeState[id] = !excludeState[id];
-  renderCompare();
+  reloadRows();
 }
 
 function setSort(sort) {
   activeSort = sort;
   VireoViewPreferences.write('vireo.compare.sort', sort);
-  renderCompare();
+  reloadRows();
 }
 
 function setFilter(filter) {
   activeFilter = filter;
-  renderCompare();
+  reloadRows();
 }
-
-function hasReviewedPrediction(photo) {
-  return Object.keys(photo.predictions || {}).some(function(model) {
-    return (photo.predictions[model] || []).some(function(p) {
-      return p.status === 'reviewed';
-    });
-  });
-}
-
-function photoMatchesFilter(photo, filter) {
-  var signal = photoSignal(photo);
-  var status = photoReviewStatus(photo);
-  if (filter === 'all') return true;
-  if (filter === 'model_disagreement') return signal.model_disagreement_score > 0;
-  if (filter === 'strong_model_disagreement') return signal.model_disagreement_score >= 70;
-  if (filter === 'keyword_model_conflict') return signal.keyword_conflict_count > 0;
-  if (filter === 'strong_keyword_model_conflict') return signal.keyword_conflict_score >= 100 || signal.max_keyword_conflict_confidence >= 0.75;
-  if (filter === 'consensus_conflict') return signal.consensus_count >= 2 && signal.keyword_conflict_count > 0;
-  if (filter === 'all_models_agree') return signal.top_prediction_count >= 2 && signal.unique_top_species_count === 1 && signal.missing_visible_model_count === 0;
-  if (filter === 'missing_visible_model') return signal.missing_visible_model_count > 0;
-  if (filter === 'two_models') return signal.top_prediction_count >= 2;
-  if (filter === 'needs_review') return !!status.needs_review;
-  if (filter === 'additional') return signal.additional_subject_count > 0;
-  if (filter === 'reviewed') return hasReviewedPrediction(photo);
-  if (filter === 'missing_prediction') {
-    // Detected subjects with no predictions surface as ``unclassified``
-    // statuses. Photos with no compare subjects at all (no qualifying
-    // detection and no full-image prediction) have an empty statuses
-    // array, so ``photoReviewStatus()`` falls back to
-    // ``missing_prediction``; fall back to that too or those photos
-    // disappear from the Missing predictions filter.
-    var assessment = photoSubjectAssessment(photo);
-    if (assessment.statuses.some(function(item) { return item.category === 'unclassified'; })) return true;
-    return status.category === 'missing_prediction';
-  }
-  return status.category === filter;
-}
-
-function matchesExclusion(photo, id) {
-  var flag = photo.flag || 'none';
-  if (id === 'rejected') return flag === 'rejected';
-  if (id === 'picks') return flag === 'flagged';
-  if (id === 'unflagged') return !flag || flag === 'none';
-  if (id === 'not_wildlife') return !!photo.wildlife_excluded;
-  if (id === 'misses') return !!(photo.miss_no_subject || photo.miss_clipped || photo.miss_oof);
-  return false;
-}
-
-function photoMatchesExclusions(photo) {
-  for (var i = 0; i < EXCLUDES.length; i += 1) {
-    var id = EXCLUDES[i].id;
-    if (excludeState[id] && matchesExclusion(photo, id)) return false;
-  }
-  return true;
-}
-
-function exclusionCount(id) {
-  return (compareData.photos || []).filter(function(photo) {
-    return matchesExclusion(photo, id);
-  }).length;
-}
-
-function searchableFields(photo) {
-  var status = photoReviewStatus(photo);
-  var parts = [photo.filename, status.label];
-  var signal = photoSignal(photo);
-  parts.push(signal.model_disagreement_label, signal.keyword_disagreement_label, signal.consensus_species);
-  (photo.keywords || []).forEach(function(k) { parts.push(k.name, k.type); });
-  Object.keys(photo.predictions || {}).forEach(function(model) {
-    parts.push(model);
-    (photo.predictions[model] || []).forEach(function(p) {
-      parts.push(p.species, p.category_label, p.matched_keyword, p.status);
-    });
-  });
-  return parts;
-}
-
-function filteredRows() {
-  var q = document.getElementById('compareSearch').value.trim();
-  var searchOptions = VireoTextSearch.readOptions('compareSearch');
-  var rows = (compareData.photos || []).filter(function(photo) {
-    if (!photoMatchesExclusions(photo)) return false;
-    if (!photoMatchesFilter(photo, activeFilter)) return false;
-    if (q && !VireoTextSearch.matchesFields(searchableFields(photo), q, searchOptions)) return false;
-    return true;
-  });
-  return sortRows(rows);
-}
-
-function sortRows(rows) {
-  return rows.slice().sort(function(a, b) {
-    var sa = photoSignal(a);
-    var sb = photoSignal(b);
-    var statusA = photoReviewStatus(a);
-    var statusB = photoReviewStatus(b);
-    if (activeSort === 'model_disagreement') {
-      return desc(sa.model_disagreement_score, sb.model_disagreement_score)
-        || desc(sa.top_prediction_count, sb.top_prediction_count)
-        || desc(sa.max_confidence, sb.max_confidence)
-        || textAsc(a.filename, b.filename);
-    }
-    if (activeSort === 'keyword_disagreement') {
-      return desc(sa.keyword_conflict_score, sb.keyword_conflict_score)
-        || desc(sa.max_keyword_conflict_confidence, sb.max_keyword_conflict_confidence)
-        || desc(CATEGORY_ORDER[statusA.category] || 0, CATEGORY_ORDER[statusB.category] || 0)
-        || textAsc(a.filename, b.filename);
-    }
-    if (activeSort === 'consensus_conflict') {
-      return desc(sa.consensus_count >= 2 && sa.keyword_conflict_count > 0 ? 1 : 0, sb.consensus_count >= 2 && sb.keyword_conflict_count > 0 ? 1 : 0)
-        || desc(sa.consensus_count, sb.consensus_count)
-        || desc(sa.keyword_conflict_score, sb.keyword_conflict_score)
-        || textAsc(a.filename, b.filename);
-    }
-    if (activeSort === 'top_confidence') {
-      return desc(sa.max_confidence, sb.max_confidence) || textAsc(a.filename, b.filename);
-    }
-    if (activeSort === 'low_confidence') {
-      return asc(sa.min_confidence || 999, sb.min_confidence || 999) || textAsc(a.filename, b.filename);
-    }
-    if (activeSort === 'filename') return textAsc(a.filename, b.filename);
-    if (activeSort === 'newest') return textDesc(a.timestamp || '', b.timestamp || '') || textAsc(a.filename, b.filename);
-    if (activeSort === 'oldest') return textAsc(a.timestamp || '', b.timestamp || '') || textAsc(a.filename, b.filename);
-    return desc(statusA.needs_review ? 1 : 0, statusB.needs_review ? 1 : 0)
-      || desc(CATEGORY_ORDER[statusA.category] || 0, CATEGORY_ORDER[statusB.category] || 0)
-      || desc(sa.keyword_conflict_score, sb.keyword_conflict_score)
-      || desc(sa.model_disagreement_score, sb.model_disagreement_score)
-      || textAsc(a.filename, b.filename);
-  });
-}
-
-function desc(a, b) { return (b || 0) - (a || 0); }
-function asc(a, b) { return (a || 0) - (b || 0); }
-function textAsc(a, b) { return String(a || '').localeCompare(String(b || '')); }
-function textDesc(a, b) { return String(b || '').localeCompare(String(a || '')); }
 
 function renderTable(rows) {
   var content = document.getElementById('compareContent');
   var models = visibleModels();
-  if (!compareData.photos.length) {
-    content.innerHTML = '<div class="compare-empty">This collection has no photos.</div>';
+  if (!compareTotal && !rows.length) {
+    content.innerHTML = (effectiveSummary().photos || 0)
+      ? '<div class="compare-empty">No photos match the current filter.</div>'
+      : '<div class="compare-empty">This collection has no photos.</div>';
     return;
   }
   if (!rows.length) {
-    content.innerHTML = '<div class="compare-empty">No photos match the current filter.</div>';
+    content.innerHTML = '<div class="compare-empty">No rows on this page.</div>';
     return;
   }
 
   var html = '<div class="table-wrap"><table class="compare-table"><thead><tr>' +
-    '<th class="select-col"><input type="checkbox" onchange="toggleAllRows(this.checked)"></th>' +
+    '<th class="select-col"><input type="checkbox" title="Select every row on this page" onchange="toggleAllRows(this.checked)"></th>' +
     '<th class="photo-col">Photo</th>' +
     '<th>Status</th>' +
     '<th class="signal-col">Signals</th>' +
@@ -956,8 +1034,8 @@ function renderTable(rows) {
   html += '</tr></thead><tbody>';
 
   rows.forEach(function(photo) {
-    var status = photoReviewStatus(photo);
-    var multiSubject = photoSubjects(photo).length > 1;
+    var status = photo.status || {};
+    var multiSubject = (photo.subjects || []).length > 1;
     html += '<tr data-photo-id="' + photo.photo_id + '">' +
       '<td><input type="checkbox" ' + (selectedRows.has(photo.photo_id) ? 'checked' : '') +
       (multiSubject ? ' disabled title="Use the subject-specific actions for multi-subject photos"' :
@@ -976,420 +1054,13 @@ function renderTable(rows) {
   content.innerHTML = html;
 }
 
-function normalizedSpecies(value) {
-  return String(value || '').trim().toLowerCase();
-}
-
-function predictionIdentity(pred) {
-  // The server resolves each prediction to a taxonomy-backed key
-  // (canonical_species), so two models naming the same taxon differently —
-  // "Western Cattle-Egret" vs the outdated binomial "Bubulcus ibis" — group
-  // as agreement instead of a false model conflict. Fall back to normalized
-  // text for payloads without the field.
-  if (pred && pred.canonical_species) return pred.canonical_species;
-  return normalizedSpecies(pred && pred.species);
-}
-
-function usablePrediction(pred) {
-  return pred && pred.status !== 'rejected';
-}
-
-function photoSubjects(photo) {
-  if (photo && Array.isArray(photo.subjects)) return photo.subjects;
-  var byDetection = {};
-  Object.keys((photo && photo.predictions) || {}).forEach(function(model) {
-    (photo.predictions[model] || []).forEach(function(pred) {
-      var key = pred.detection_id == null ? 'photo' : String(pred.detection_id);
-      if (!byDetection[key]) {
-        byDetection[key] = {
-          detection_id: pred.detection_id,
-          kind: 'legacy',
-          box: {x: pred.box_x, y: pred.box_y, w: pred.box_w, h: pred.box_h},
-          predictions: {},
-        };
-      }
-      if (!byDetection[key].predictions[model]) byDetection[key].predictions[model] = [];
-      byDetection[key].predictions[model].push(pred);
-    });
-  });
-  return Object.keys(byDetection).map(function(key) { return byDetection[key]; });
-}
-
-function bestSubjectPredictionForModel(subject, model) {
-  var preds = ((subject.predictions || {})[model] || []).filter(usablePrediction);
-  if (!preds.length) return null;
-  return preds.slice().sort(function(a, b) {
-    return desc(a.confidence, b.confidence) || textAsc(a.species, b.species);
-  })[0];
-}
-
-function subjectSignal(subject, photoId, subjectIndex) {
-  // Legacy / full-image subjects can carry a null ``detection_id``. Keying
-  // the cache only on ``detection_id`` would collapse every such subject
-  // across the whole page into a single entry, so later photos would
-  // inherit an earlier photo's category, filter state, summary, and
-  // action type. Fall back to (photoId, subjectIndex) whenever the
-  // detection identity isn't stable so per-photo state stays per-photo.
-  var identity = subject.detection_id == null
-    ? 'photo|' + String(photoId) + '|subject|' + String(subjectIndex)
-    : 'detection|' + String(subject.detection_id);
-  var cacheKey = 'subject|' + identity + '|' + visibleModels().join('|');
-  if (signalCache.has(cacheKey)) return signalCache.get(cacheKey);
-  var models = visibleModels();
-  var topPreds = [];
-  var allPreds = [];
-  var missing = 0;
-  var keywordConflictScore = 0;
-  var keywordConflictCount = 0;
-  var maxKeywordConflictConfidence = 0;
-  var keywordSupportScore = 0;
-  var keywordSupportCount = 0;
-  var sawLowConflict = false;
-  var maxConfidence = 0;
-  var minConfidence = null;
-
-  models.forEach(function(model) {
-    var preds = ((subject.predictions || {})[model] || []).filter(usablePrediction);
-    if (!preds.length) {
-      missing += 1;
-      return;
-    }
-    preds.forEach(function(pred) {
-      allPreds.push(pred);
-      var confidence = pred.confidence || 0;
-      var category = effectivePredictionCategory(pred);
-      if (category === 'low_conflict') {
-        sawLowConflict = true;
-      } else if (category === 'conflict') {
-        keywordConflictCount += 1;
-        keywordConflictScore += confidence;
-        maxKeywordConflictConfidence = Math.max(maxKeywordConflictConfidence, confidence);
-      } else if (pred.category === 'match' || pred.category === 'refinement' || pred.category === 'broader') {
-        keywordSupportCount += 1;
-        keywordSupportScore += confidence;
-      }
-    });
-    var best = bestSubjectPredictionForModel(subject, model);
-    if (!best) return;
-    var conf = best.confidence || 0;
-    topPreds.push({
-      model: model,
-      species: best.species || '',
-      // Server-resolved display name: the taxonomy's preferred common
-      // (or current scientific) name for this prediction's taxon. Falls
-      // back to the raw species when nothing resolves. Consensus groups
-      // key on this so the group's displayed name doesn't depend on
-      // which model was visited first — otherwise a persisted outdated
-      // binomial like "Bubulcus ibis" would leak into the summary even
-      // though a later model called it "Western Cattle-Egret".
-      display: best.canonical_display || best.species || '',
-      identity: predictionIdentity(best),
-      confidence: conf,
-      pred: best,
-    });
-    maxConfidence = Math.max(maxConfidence, conf);
-    minConfidence = minConfidence === null ? conf : Math.min(minConfidence, conf);
-  });
-
-  var speciesGroups = {};
-  topPreds.forEach(function(item) {
-    var key = item.identity;
-    if (!speciesGroups[key]) {
-      speciesGroups[key] = {species: item.display, count: 0, confidence: 0};
-    } else if (!speciesGroups[key].species && item.display) {
-      // First member had an empty display; adopt the first non-empty one.
-      speciesGroups[key].species = item.display;
-    }
-    speciesGroups[key].count += 1;
-    speciesGroups[key].confidence += item.confidence;
-  });
-  var groups = Object.keys(speciesGroups).map(function(key) { return speciesGroups[key]; });
-  groups.sort(function(a, b) {
-    return desc(a.count, b.count) || desc(a.confidence, b.confidence) || textAsc(a.species, b.species);
-  });
-
-  var disagreementPair = null;
-  var disagreementScore = 0;
-  for (var i = 0; i < topPreds.length; i++) {
-    for (var j = i + 1; j < topPreds.length; j++) {
-      if (topPreds[i].identity === topPreds[j].identity) continue;
-      var pairScore = Math.min(topPreds[i].confidence || 0, topPreds[j].confidence || 0) * 100;
-      if (!disagreementPair || pairScore > disagreementScore) {
-        disagreementPair = [topPreds[i], topPreds[j]];
-        disagreementScore = pairScore;
-      }
-    }
-  }
-
-  var signal = {
-    all_predictions: allPreds,
-    top_predictions: topPreds,
-    top_prediction_count: topPreds.length,
-    unique_top_species_count: groups.length,
-    missing_visible_model_count: missing,
-    model_disagreement_score: disagreementScore,
-    model_disagreement_pair: disagreementPair,
-    keyword_conflict_count: keywordConflictCount,
-    keyword_conflict_score: keywordConflictScore * 100,
-    max_keyword_conflict_confidence: maxKeywordConflictConfidence,
-    keyword_support_count: keywordSupportCount,
-    keyword_support_score: keywordSupportScore * 100,
-    consensus_species: groups.length ? groups[0].species : '',
-    consensus_count: groups.length ? groups[0].count : 0,
-    max_confidence: maxConfidence,
-    min_confidence: minConfidence,
-    saw_low_conflict: sawLowConflict,
-  };
-  signalCache.set(cacheKey, signal);
-  return signal;
-}
-
-function photoSubjectAssessment(photo) {
-  var cacheKey = 'assessment|' + photo.photo_id + '|' + visibleModels().join('|');
-  if (signalCache.has(cacheKey)) return signalCache.get(cacheKey);
-  var subjects = photoSubjects(photo);
-  var signals = subjects.map(function(subject, index) {
-    return subjectSignal(subject, photo.photo_id, index);
-  });
-  var detectedCount = subjects.filter(function(subject) { return subject.kind !== 'full_image'; }).length;
-  var supporting = signals.map(function(signal) { return signal.keyword_support_count > 0; });
-  var statuses = subjects.map(function(subject, index) {
-    var signal = signals[index];
-    var hasPending = signal.all_predictions.some(function(pred) { return pred.status === 'pending'; });
-    var category = null;
-    var label = null;
-
-    if (!signal.all_predictions.length) {
-      category = 'unclassified';
-    } else if (signal.model_disagreement_score > 0) {
-      category = 'models_disagree';
-    } else if (signal.keyword_support_count > 0) {
-      var supported = signal.all_predictions.filter(function(pred) {
-        return pred.category === 'match' || pred.category === 'refinement' || pred.category === 'broader';
-      }).sort(function(a, b) {
-        return desc(CATEGORY_ORDER[a.category] || 0, CATEGORY_ORDER[b.category] || 0);
-      });
-      category = supported.length ? supported[0].category : 'match';
-    } else {
-      var anotherSubjectAccountsForKeyword = supporting.some(function(value, otherIndex) {
-        return otherIndex !== index && value;
-      });
-      if (
-        detectedCount > 1
-        && anotherSubjectAccountsForKeyword
-        && signal.keyword_conflict_count > 0
-        && signal.consensus_species
-      ) {
-        category = 'additional';
-        label = signal.consensus_count >= 2
-          ? 'Additional species suggested'
-          : 'Possible additional species';
-      } else if (signal.keyword_conflict_count > 0) {
-        category = 'conflict';
-      } else if (signal.saw_low_conflict) {
-        category = 'low_conflict';
-      } else {
-        var firstCategory = signal.all_predictions.length
-          ? effectivePredictionCategory(signal.all_predictions[0]) : null;
-        category = firstCategory || 'unclassified';
-      }
-    }
-    return {
-      category: category,
-      label: label || CATEGORY_LABELS[category] || category,
-      needs_review: hasPending,
-      has_prediction: signal.all_predictions.length > 0,
-      signal: signal,
-    };
-  });
-  var result = {subjects: subjects, signals: signals, statuses: statuses};
-  signalCache.set(cacheKey, result);
-  return result;
-}
-
-function photoReviewStatus(photo) {
-  var assessment = photoSubjectAssessment(photo);
-  // Keep ``unclassified`` statuses alongside pending ones: an ``unclassified``
-  // subject has no predictions at all, so ``needs_review`` (which tracks
-  // pending predictions) is false, but the subject still needs classification.
-  // Without this, a multi-subject photo with one pending match plus one
-  // unclassified subject would drop the unclassified one before sorting and
-  // the row would render/sort as the pending match instead of surfacing the
-  // higher-priority ``unclassified`` category (see CATEGORY_ORDER).
-  var candidates = assessment.statuses.filter(function(status) {
-    return status.needs_review || status.category === 'unclassified';
-  });
-  if (!candidates.length) candidates = assessment.statuses.slice();
-  candidates.sort(function(a, b) {
-    return desc(CATEGORY_ORDER[a.category] || 0, CATEGORY_ORDER[b.category] || 0);
-  });
-  if (!candidates.length) {
-    return {category: 'missing_prediction', label: CATEGORY_LABELS.missing_prediction, needs_review: false, has_prediction: false};
-  }
-  var chosen = candidates[0];
-  return {
-    category: chosen.category,
-    label: chosen.label,
-    needs_review: assessment.statuses.some(function(status) { return status.needs_review; }),
-    has_prediction: assessment.statuses.some(function(status) { return status.has_prediction; }),
-  };
-}
-
-function effectiveSummary() {
-  var s = {
-    photos: compareData ? (compareData.photos || []).length : 0,
-    models: visibleModels().length,
-    matches: 0,
-    refinements: 0,
-    broader: 0,
-    conflicts: 0,
-    additional: 0,
-    new: 0,
-    missing_predictions: 0,
-    needs_review: 0,
-  };
-  if (!compareData) return s;
-  (compareData.photos || []).forEach(function(photo) {
-    var status = photoReviewStatus(photo);
-    if (status.needs_review) s.needs_review += 1;
-    var assessment = photoSubjectAssessment(photo);
-    // Mirror the ``missing_prediction`` filter: unclassified subject rows
-    // count, and subjectless photos (empty statuses → status falls back
-    // to ``missing_prediction``) count too. Otherwise the filter and the
-    // pill counter disagree on how many photos need a prediction.
-    if (
-      assessment.statuses.some(function(item) { return item.category === 'unclassified'; })
-      || status.category === 'missing_prediction'
-    ) s.missing_predictions += 1;
-    assessment.statuses.forEach(function(item) {
-      if (item.category === 'match') s.matches += 1;
-      else if (item.category === 'refinement') s.refinements += 1;
-      else if (item.category === 'broader') s.broader += 1;
-      else if (item.category === 'conflict') s.conflicts += 1;
-      else if (item.category === 'additional') s.additional += 1;
-      else if (item.category === 'new') s.new += 1;
-    });
-  });
-  return s;
-}
-
-function photoSignal(photo) {
-  var cacheKey = 'photo|' + photo.photo_id + '|' + visibleModels().join('|');
-  if (signalCache.has(cacheKey)) return signalCache.get(cacheKey);
-  var assessment = photoSubjectAssessment(photo);
-  var missing = 0;
-  var keywordConflictScore = 0;
-  var keywordConflictCount = 0;
-  var maxKeywordConflictConfidence = 0;
-  var keywordSupportScore = 0;
-  var maxConfidence = 0;
-  var minConfidence = null;
-  var disagreementPair = null;
-  var disagreementSubject = null;
-  var modelDisagreementScore = 0;
-  var consensusSpecies = '';
-  var consensusCount = 0;
-  var consensusSubject = null;
-  var maxTopPredictionCount = 0;
-  var maxUniqueSpecies = 0;
-  var additionalCount = 0;
-
-  assessment.signals.forEach(function(subjectSignalValue, index) {
-    var status = assessment.statuses[index];
-    missing += subjectSignalValue.missing_visible_model_count;
-    keywordSupportScore += subjectSignalValue.keyword_support_score;
-    maxConfidence = Math.max(maxConfidence, subjectSignalValue.max_confidence || 0);
-    if (subjectSignalValue.min_confidence !== null) {
-      minConfidence = minConfidence === null
-        ? subjectSignalValue.min_confidence
-        : Math.min(minConfidence, subjectSignalValue.min_confidence);
-    }
-    maxTopPredictionCount = Math.max(maxTopPredictionCount, subjectSignalValue.top_prediction_count);
-    maxUniqueSpecies = Math.max(maxUniqueSpecies, subjectSignalValue.unique_top_species_count);
-    if (subjectSignalValue.consensus_count > consensusCount) {
-      consensusCount = subjectSignalValue.consensus_count;
-      consensusSpecies = subjectSignalValue.consensus_species;
-      consensusSubject = index;
-    }
-    if (subjectSignalValue.model_disagreement_score > modelDisagreementScore) {
-      modelDisagreementScore = subjectSignalValue.model_disagreement_score;
-      disagreementPair = subjectSignalValue.model_disagreement_pair;
-      disagreementSubject = index;
-    }
-    if (status.category === 'additional') additionalCount += 1;
-    if (status.category !== 'additional') {
-      keywordConflictCount += subjectSignalValue.keyword_conflict_count;
-      keywordConflictScore += subjectSignalValue.keyword_conflict_score;
-      maxKeywordConflictConfidence = Math.max(
-        maxKeywordConflictConfidence,
-        subjectSignalValue.max_keyword_conflict_confidence
-      );
-    }
-  });
-
-  var signal = {
-    top_prediction_count: maxTopPredictionCount,
-    unique_top_species_count: maxUniqueSpecies,
-    missing_visible_model_count: missing,
-    model_disagreement_score: modelDisagreementScore,
-    model_disagreement_pair: disagreementPair,
-    keyword_conflict_count: keywordConflictCount,
-    keyword_conflict_score: keywordConflictScore,
-    max_keyword_conflict_confidence: maxKeywordConflictConfidence,
-    keyword_support_score: keywordSupportScore,
-    consensus_species: consensusSpecies,
-    consensus_count: consensusCount,
-    consensus_subject: consensusSubject,
-    additional_subject_count: additionalCount,
-    max_confidence: maxConfidence,
-    min_confidence: minConfidence,
-  };
-  // Label rolled-up signals with the subject they came from: the strongest
-  // disagreement and the strongest consensus are often *different* subjects
-  // of the same photo, and an unlabeled "X vs Y · Consensus: Z" reads as a
-  // contradiction.
-  var multiSubject = assessment.subjects.length > 1;
-  var disagreementPrefix = multiSubject && disagreementSubject !== null
-    ? 'Subject ' + (disagreementSubject + 1) + ': ' : '';
-  signal.model_disagreement_label = disagreementPair
-    // Same rule as the consensus group: name the taxon, not the raw
-    // string one model persisted. "Bubulcus ibis vs Blue Jay" leaks the
-    // outdated binomial into the disagreement note and pill tooltip
-    // exactly as the consensus label used to.
-    ? disagreementPrefix + (disagreementPair[0].display || disagreementPair[0].species) +
-      ' vs ' + (disagreementPair[1].display || disagreementPair[1].species)
-    : '';
-  signal.consensus_label = consensusCount >= 2 && consensusSpecies
-    ? (multiSubject && consensusSubject !== null
-        ? 'Subject ' + (consensusSubject + 1) + ': ' : '')
-      + consensusCount + ' models agree on ' + consensusSpecies
-    : '';
-  signal.keyword_disagreement_label = keywordConflictCount
-    ? keywordConflictCount + ' model conflict' + (keywordConflictCount === 1 ? '' : 's')
-    : '';
-  signalCache.set(cacheKey, signal);
-  return signal;
-}
-
-function signalSummary() {
-  var result = {
-    model_disagreements: 0,
-    keyword_model_conflicts: 0,
-  };
-  (compareData.photos || []).forEach(function(photo) {
-    var signal = photoSignal(photo);
-    if (signal.model_disagreement_score > 0) result.model_disagreements += 1;
-    if (signal.keyword_conflict_count > 0) result.keyword_model_conflicts += 1;
-  });
-  return result;
-}
-
 function renderSignalCell(photo) {
-  var signal = photoSignal(photo);
-  var assessment = photoSubjectAssessment(photo);
+  var signal = photo.signal || {};
+  var statuses = photo.subject_statuses || [];
+  var subjects = photo.subjects || [];
   var pills = [];
-  if (assessment.subjects.length > 1) {
-    pills.push('<span class="signal-pill">' + assessment.subjects.length + ' subjects</span>');
+  if (subjects.length > 1) {
+    pills.push('<span class="signal-pill">' + subjects.length + ' subjects</span>');
   }
   if (signal.additional_subject_count > 0) {
     pills.push('<span class="signal-pill match">' + signal.additional_subject_count +
@@ -1424,9 +1095,10 @@ function renderSignalCell(photo) {
   }
   var detail = [];
   if (signal.model_disagreement_label) detail.push(signal.model_disagreement_label);
-  assessment.statuses.forEach(function(status, index) {
-    if (status.category === 'additional' && status.signal.consensus_species) {
-      detail.push('Subject ' + (index + 1) + ': ' + status.signal.consensus_species);
+  statuses.forEach(function(status, index) {
+    var species = (subjects[index] || {}).signal_consensus_species;
+    if (status.category === 'additional' && species) {
+      detail.push('Subject ' + (index + 1) + ': ' + species);
     }
   });
   if (signal.consensus_label) detail.push(signal.consensus_label);
@@ -1451,13 +1123,14 @@ function renderPhotoCell(photo) {
   if (photo.flag && photo.flag !== 'none') meta.push(photo.flag);
   if (photo.wildlife_excluded) meta.push('not wildlife');
   if (photo.miss_no_subject || photo.miss_clipped || photo.miss_oof) meta.push('marked miss');
-  var assessment = photoSubjectAssessment(photo);
+  var subjects = photo.subjects || [];
+  var statuses = photo.subject_statuses || [];
   var subjectSummary = '';
-  if (assessment.subjects.length > 1) {
-    subjectSummary = '<div class="subject-summary-list">' + assessment.subjects.map(function(subject, index) {
-      var status = assessment.statuses[index];
-      var signal = assessment.signals[index];
-      var species = signal.consensus_species ? ' · ' + escapeHtml(signal.consensus_species) : '';
+  if (subjects.length > 1) {
+    subjectSummary = '<div class="subject-summary-list">' + subjects.map(function(subject, index) {
+      var status = statuses[index] || {};
+      var species = subject.signal_consensus_species
+        ? ' · ' + escapeHtml(subject.signal_consensus_species) : '';
       var location = subjectBoxLabel(subject);
       return '<div class="subject-summary"><strong>Subject ' + (index + 1) + '</strong>' + species +
         ' · <span class="category-pill ' + escapeAttr(status.category) + '">' +
@@ -1477,7 +1150,7 @@ function renderPhotoCell(photo) {
 }
 
 function compareLightboxPhotoList() {
-  return filteredRows().map(function(photo) {
+  return compareRows.map(function(photo) {
     return {
       id: photo.photo_id,
       filename: photo.filename || '',
@@ -1491,15 +1164,7 @@ function openCompareLightbox(photoId) {
   var list = compareLightboxPhotoList();
   var current = list.find(function(photo) { return photo.id === photoId; });
   if (!current) {
-    var fallback = (compareData && compareData.photos || []).find(function(photo) {
-      return photo.photo_id === photoId;
-    });
-    current = {
-      id: photoId,
-      filename: fallback ? (fallback.filename || '') : '',
-      flag: fallback ? (fallback.flag || 'none') : 'none',
-      wildlife_excluded: !!(fallback && fallback.wildlife_excluded),
-    };
+    current = {id: photoId, filename: '', flag: 'none', wildlife_excluded: false};
     list = [current];
   }
   openLightbox(current.id, current.filename, list);
@@ -1535,12 +1200,13 @@ function renderKeywordCell(photo) {
 }
 
 function renderPredictionCell(photo, model) {
-  var assessment = photoSubjectAssessment(photo);
-  if (!assessment.subjects.length) return '<span class="empty-cell">No prediction</span>';
-  return assessment.subjects.map(function(subject, subjectIndex) {
+  var subjects = photo.subjects || [];
+  var statuses = photo.subject_statuses || [];
+  if (!subjects.length) return '<span class="empty-cell">No prediction</span>';
+  return subjects.map(function(subject, subjectIndex) {
     var preds = (subject.predictions || {})[model] || [];
-    var subjectStatus = assessment.statuses[subjectIndex];
-    var heading = assessment.subjects.length > 1
+    var subjectStatus = statuses[subjectIndex] || {};
+    var heading = subjects.length > 1
       ? '<div class="subject-heading"><span>Subject ' + (subjectIndex + 1) + '</span>' +
         '<span class="category-pill ' + escapeAttr(subjectStatus.category) + '">' +
         escapeHtml(subjectStatus.label) + '</span></div>'
@@ -1551,37 +1217,37 @@ function renderPredictionCell(photo, model) {
     }
     var predictionsHtml = preds.map(function(pred) {
       var status = pred.status || 'pending';
-    var disabled = status !== 'pending' ? ' disabled' : '';
-    var detail = pred.category_detail || '';
-    var belowThreshold = isBelowConflictThreshold(pred);
-    var displayedCategory = subjectStatus.category === 'additional' && pred.category === 'conflict'
-      ? 'additional' : pred.category;
-    var displayedLabel = displayedCategory === 'additional'
-      ? subjectStatus.label : pred.category_label;
-    if (pred.matched_keyword) detail += ' Keyword: ' + pred.matched_keyword + '.';
-    if (pred.shared_rank) detail += ' Shared ' + pred.shared_rank + '.';
-    if (belowThreshold) detail += ' Below conflict threshold.';
-    if (displayedCategory === 'additional') {
-      detail = 'A different detected subject accounts for the current species keyword. ' +
-        'This prediction may identify another species in the photo.';
-    }
-    var acceptLabel = displayedCategory === 'additional' ? 'Add additional species' : 'Add keyword';
-    var acceptAction = displayedCategory === 'additional' ? 'accept_subject' : 'accept';
-    var replaceButton = assessment.subjects.length === 1
-      ? '<button class="inline-btn primary" onclick="predictionAction(' + pred.id + ', \'replace\')"' + disabled + '>Replace keyword</button>'
-      : '';
-    return '<div class="pred' + (belowThreshold ? ' below-threshold' : '') + '">' +
-      '<div class="pred-main"><span class="pred-species">' + escapeHtml(pred.species) + '</span>' +
-      '<span class="pred-confidence">' + Math.round((pred.confidence || 0) * 100) + '%</span>' +
-      '<span class="category-pill ' + escapeAttr(displayedCategory) + '">' + escapeHtml(displayedLabel) + '</span>' +
-      '<span class="status-pill ' + escapeAttr(status) + '">' + escapeHtml(status) + '</span></div>' +
-      '<div class="pred-detail">' + escapeHtml(detail) + '</div>' +
-      '<div class="pred-actions">' +
-      '<button class="inline-btn primary" onclick="predictionAction(' + pred.id + ', \'' + acceptAction + '\')"' + disabled + '>' + acceptLabel + '</button>' +
-      replaceButton +
-      '<button class="inline-btn danger" onclick="predictionAction(' + pred.id + ', \'reject\')"' + disabled + '>Reject</button>' +
-      '<button class="inline-btn" onclick="predictionAction(' + pred.id + ', \'reviewed\')"' + disabled + '>Reviewed</button>' +
-      '</div></div>';
+      var disabled = status !== 'pending' ? ' disabled' : '';
+      var detail = pred.category_detail || '';
+      var belowThreshold = pred.effective_category === 'low_conflict';
+      var displayedCategory = subjectStatus.category === 'additional' && pred.category === 'conflict'
+        ? 'additional' : pred.category;
+      var displayedLabel = displayedCategory === 'additional'
+        ? subjectStatus.label : pred.category_label;
+      if (pred.matched_keyword) detail += ' Keyword: ' + pred.matched_keyword + '.';
+      if (pred.shared_rank) detail += ' Shared ' + pred.shared_rank + '.';
+      if (belowThreshold) detail += ' Below conflict threshold.';
+      if (displayedCategory === 'additional') {
+        detail = 'A different detected subject accounts for the current species keyword. ' +
+          'This prediction may identify another species in the photo.';
+      }
+      var acceptLabel = displayedCategory === 'additional' ? 'Add additional species' : 'Add keyword';
+      var acceptAction = displayedCategory === 'additional' ? 'accept_subject' : 'accept';
+      var replaceButton = subjects.length === 1
+        ? '<button class="inline-btn primary" onclick="predictionAction(' + pred.id + ', \'replace\')"' + disabled + '>Replace keyword</button>'
+        : '';
+      return '<div class="pred' + (belowThreshold ? ' below-threshold' : '') + '">' +
+        '<div class="pred-main"><span class="pred-species">' + escapeHtml(pred.species) + '</span>' +
+        '<span class="pred-confidence">' + Math.round((pred.confidence || 0) * 100) + '%</span>' +
+        '<span class="category-pill ' + escapeAttr(displayedCategory) + '">' + escapeHtml(displayedLabel) + '</span>' +
+        '<span class="status-pill ' + escapeAttr(status) + '">' + escapeHtml(status) + '</span></div>' +
+        '<div class="pred-detail">' + escapeHtml(detail) + '</div>' +
+        '<div class="pred-actions">' +
+        '<button class="inline-btn primary" onclick="predictionAction(' + pred.id + ', \'' + acceptAction + '\')"' + disabled + '>' + acceptLabel + '</button>' +
+        replaceButton +
+        '<button class="inline-btn danger" onclick="predictionAction(' + pred.id + ', \'reject\')"' + disabled + '>Reject</button>' +
+        '<button class="inline-btn" onclick="predictionAction(' + pred.id + ', \'reviewed\')"' + disabled + '>Reviewed</button>' +
+        '</div></div>';
     }).join('');
     return '<div class="subject-prediction-group">' + heading + predictionsHtml + '</div>';
   }).join('');
@@ -1593,9 +1259,12 @@ function toggleRow(photoId, checked) {
   updateBatchControls();
 }
 
+// Only this page's rows: a batch action sends one request per row, so
+// "select everything the filter matched" would fire tens of thousands of
+// writes from a single click.
 function toggleAllRows(checked) {
-  filteredRows().forEach(function(photo) {
-    if (photoSubjects(photo).length > 1) return;
+  compareRows.forEach(function(photo) {
+    if ((photo.subjects || []).length > 1) return;
     if (checked) selectedRows.add(photo.photo_id);
     else selectedRows.delete(photo.photo_id);
   });
@@ -1615,25 +1284,90 @@ function updateBatchControls() {
   });
 }
 
-function bestPrediction(photo) {
-  if (photoSubjects(photo).length > 1) return null;
-  var models = visibleModels();
-  var best = null;
-  models.forEach(function(model) {
-    ((photo.predictions || {})[model] || []).forEach(function(pred) {
-      if (pred.status && pred.status !== 'pending') return;
-      if (!best) {
-        best = pred;
-        return;
-      }
-      var predScore = CATEGORY_ORDER[effectivePredictionCategory(pred)] || 0;
-      var bestScore = CATEGORY_ORDER[effectivePredictionCategory(best)] || 0;
-      if (predScore > bestScore || (predScore === bestScore && pred.confidence > best.confidence)) {
-        best = pred;
-      }
+function loadedPhoto(photoId) {
+  return compareRows.find(function(photo) { return photo.photo_id === photoId; });
+}
+
+function comparePhotoIdsForPredictions(predictionIds) {
+  var wanted = new Set((predictionIds || []).map(function(id) { return Number(id); }));
+  var photoIds = [];
+  compareRows.forEach(function(photo) {
+    var found = (photo.subjects || []).some(function(subject) {
+      return Object.keys(subject.predictions || {}).some(function(model) {
+        return (subject.predictions[model] || []).some(function(pred) {
+          return wanted.has(Number(pred.id));
+        });
+      });
+    });
+    if (found) photoIds.push(photo.photo_id);
+  });
+  return photoIds;
+}
+
+function setComparePredictionStatus(predId, status) {
+  var changed = false;
+  compareRows.forEach(function(photo) {
+    (photo.subjects || []).forEach(function(subject) {
+      Object.keys(subject.predictions || {}).forEach(function(model) {
+        (subject.predictions[model] || []).forEach(function(pred) {
+          if (Number(pred.id) !== Number(predId)) return;
+          pred.status = status;
+          changed = true;
+        });
+      });
     });
   });
-  return best;
+  return changed;
+}
+
+function currentComparisonScope() {
+  return {
+    collectionId: document.getElementById('collectionPicker').value,
+    loadingSeq: loadingSeq,
+  };
+}
+
+function comparisonScopeIsCurrent(scope) {
+  return Boolean(compareData) && scope.loadingSeq === loadingSeq &&
+    document.getElementById('collectionPicker').value === scope.collectionId;
+}
+
+// A decision changed some photos. Rebuild exactly those inside the stored
+// comparison and re-query this page, so the row, the chip counts and the
+// filter membership all move together instead of drifting apart.
+async function refreshComparisonPhotos(photoIds, scope) {
+  if (!compareData) return;
+  var uniqueIds = Array.from(new Set((photoIds || []).map(Number).filter(function(id) {
+    return Number.isInteger(id) && id > 0;
+  })));
+  if (!uniqueIds.length) {
+    await loadComparison();
+    return;
+  }
+  var refreshScope = scope || currentComparisonScope();
+  if (!comparisonScopeIsCurrent(refreshScope)) return;
+  await fetchRows({refreshPhotoIds: uniqueIds, afterDecision: true});
+}
+
+function refreshDecisionPhotos(photoIds, scope) {
+  // Decision buttons on different rows can be used before an earlier scoped
+  // request finishes. Serialize the reads so an older server snapshot can
+  // never merge after a newer one and overwrite its state.
+  var queuedScope = scope || currentComparisonScope();
+  var refresh = decisionRefreshQueue.then(async function() {
+    // Capture scope when the decision is made, not when its queued refresh
+    // eventually starts. A collection load while it waits supersedes it.
+    if (!comparisonScopeIsCurrent(queuedScope)) return;
+    try {
+      await refreshComparisonPhotos(photoIds, queuedScope);
+    } catch (e) {
+      showToast('Could not refresh the changed photo — reloading the comparison.', 'error');
+      await loadComparison();
+    }
+  });
+  // A failed reload must not poison every later refresh in the queue.
+  decisionRefreshQueue = refresh.catch(function() {});
+  return refresh;
 }
 
 async function predictionAction(predId, action) {
@@ -1687,20 +1421,15 @@ async function predictionAction(predId, action) {
     return;
   }
 
-  // Reject and Reviewed only change this prediction's review status. Keep
-  // the already-loaded comparison in place and update both copies of the
-  // prediction (the model column and its subject) immediately. Keyword
-  // decisions need fresh taxonomy comparisons, so those use the small
-  // photo-scoped endpoint below instead of guessing at new categories here.
+  // Reject and Reviewed only change this prediction's review status. Show it
+  // on the row immediately, then re-query so the counts and this row's
+  // membership in the filter catch up.
   if (action === 'reject' || action === 'reviewed') {
     if (setComparePredictionStatus(
       predId, action === 'reject' ? 'rejected' : 'reviewed'
     )) {
       renderCompare();
     }
-    // Status can itself be part of a saved collection's rules. Re-query this
-    // photo so a row that no longer belongs is removed without reloading the
-    // rest of the comparison.
     await refreshDecisionPhotos(entryPhotoIds, decisionScope);
     return;
   }
@@ -1717,151 +1446,10 @@ function endpointForAction(action) {
   return 'reviewed';
 }
 
-function comparePhotoIdsForPredictions(predictionIds) {
-  var wanted = new Set((predictionIds || []).map(function(id) {
-    return Number(id);
-  }));
-  function hasWantedPrediction(predictions) {
-    return Object.keys(predictions || {}).some(function(model) {
-      return (predictions[model] || []).some(function(pred) {
-        return wanted.has(Number(pred.id));
-      });
-    });
-  }
-  var photoIds = [];
-  (compareData && compareData.photos || []).forEach(function(photo) {
-    var found = hasWantedPrediction(photo.predictions) ||
-      (photo.subjects || []).some(function(subject) {
-        return hasWantedPrediction(subject.predictions);
-      });
-    if (found) photoIds.push(photo.photo_id);
-  });
-  return photoIds;
-}
-
-function setComparePredictionStatus(predId, status) {
-  var changed = false;
-  function updatePredictions(predictions) {
-    Object.keys(predictions || {}).forEach(function(model) {
-      (predictions[model] || []).forEach(function(pred) {
-        if (Number(pred.id) !== Number(predId)) return;
-        pred.status = status;
-        changed = true;
-      });
-    });
-  }
-  (compareData && compareData.photos || []).forEach(function(photo) {
-    updatePredictions(photo.predictions);
-    (photo.subjects || []).forEach(function(subject) {
-      updatePredictions(subject.predictions);
-    });
-  });
-  return changed;
-}
-
-function currentComparisonScope() {
-  return {
-    collectionId: document.getElementById('collectionPicker').value,
-    loadingSeq: loadingSeq,
-  };
-}
-
-function comparisonScopeIsCurrent(scope) {
-  return Boolean(compareData) && scope.loadingSeq === loadingSeq &&
-    document.getElementById('collectionPicker').value === scope.collectionId;
-}
-
-async function refreshComparisonPhotos(photoIds, scope) {
-  if (!compareData) return;
-  var uniqueIds = Array.from(new Set((photoIds || []).map(Number).filter(function(id) {
-    return Number.isInteger(id) && id > 0;
-  })));
-  if (!uniqueIds.length) {
-    await loadComparison();
-    return;
-  }
-
-  var refreshScope = scope || currentComparisonScope();
-  if (!comparisonScopeIsCurrent(refreshScope)) return;
-  var collId = refreshScope.collectionId;
-  var refreshSeq = refreshScope.loadingSeq;
-  var refreshed = new Map();
-  // Keep each URL comfortably below browser/server limits for large burst
-  // groups while still issuing far less work than a whole-collection reload.
-  for (var start = 0; start < uniqueIds.length; start += 100) {
-    var params = new URLSearchParams({collection_id: collId});
-    uniqueIds.slice(start, start + 100).forEach(function(photoId) {
-      params.append('photo_id', String(photoId));
-    });
-    var data = await jsonFetch('/api/predictions/compare?' + params.toString());
-    // A full load, including a collection switch, supersedes this scoped
-    // response. Never merge rows fetched for the old collection into the new
-    // comparison after its request wins the race.
-    if (refreshSeq !== loadingSeq ||
-        document.getElementById('collectionPicker').value !== collId ||
-        !compareData) return;
-    (data.photos || []).forEach(function(photo) {
-      refreshed.set(Number(photo.photo_id), photo);
-    });
-  }
-
-  var requested = new Set(uniqueIds);
-  var untouched = (compareData.photos || []).filter(function(photo) {
-    return !requested.has(Number(photo.photo_id));
-  });
-  var mergedPhotos = untouched.concat(Array.from(refreshed.values()));
-  var mergedModels = new Set();
-  mergedPhotos.forEach(function(photo) {
-    Object.keys(photo.predictions || {}).forEach(function(model) {
-      mergedModels.add(model);
-    });
-    (photo.subjects || []).forEach(function(subject) {
-      Object.keys(subject.predictions || {}).forEach(function(model) {
-        mergedModels.add(model);
-      });
-    });
-  });
-  compareData.photos = mergedPhotos;
-  compareData.models = Array.from(mergedModels).sort();
-  populateModelSelects(compareData.models);
-  // Match the full-load behavior when the default queue is exhausted. Keep
-  // explicit user-selected filters intact, but do not strand them on an empty
-  // Needs review table after resolving the final pending row.
-  signalCache = new Map();
-  if (activeFilter === 'needs_review' &&
-      effectiveSummary().needs_review === 0) {
-    activeFilter = 'all';
-  }
-  renderCompare();
-}
-
-function refreshDecisionPhotos(photoIds, scope) {
-  // Decision buttons on different rows can be used before an earlier scoped
-  // request finishes. Serialize the reads so an older server snapshot can
-  // never merge after a newer one and overwrite its state.
-  var queuedScope = scope || currentComparisonScope();
-  var refresh = decisionRefreshQueue.then(async function() {
-    // Capture scope when the decision is made, not when its queued refresh
-    // eventually starts. A collection load while it waits supersedes it.
-    if (!comparisonScopeIsCurrent(queuedScope)) return;
-    try {
-      await refreshComparisonPhotos(photoIds, queuedScope);
-    } catch (e) {
-      showToast('Could not refresh the changed photo — reloading the comparison.', 'error');
-      await loadComparison();
-    }
-  });
-  // A failed reload must not poison every later refresh in the queue.
-  decisionRefreshQueue = refresh.catch(function() {});
-  return refresh;
-}
-
 async function batchAction(action) {
   var decisionScope = currentComparisonScope();
   var ids = Array.from(selectedRows);
-  var photos = (compareData.photos || []).filter(function(photo) {
-    return ids.indexOf(photo.photo_id) >= 0;
-  });
+  var photos = ids.map(loadedPhoto).filter(Boolean);
   var attempted = 0;
   var refused = [];
   var unconfirmed = 0;
@@ -1876,15 +1464,15 @@ async function batchAction(action) {
   // ride on the write rather than being read out of the 409's wording.
   var decidedByThisBatch = Vireo.predictions.groupedDecisionTracker();
   for (var i = 0; i < photos.length; i++) {
-    var pred = bestPrediction(photos[i]);
-    if (!pred) continue;
+    var predId = photos[i].best_prediction_id;
+    if (!predId) continue;
     attempted++;
     // Applied, not skipped: it counts in the denominator and against no
     // failure bucket, because the server told us it wrote this row.
-    if (decidedByThisBatch.alreadyDecided(pred.id)) continue;
+    if (decidedByThisBatch.alreadyDecided(predId)) continue;
     try {
       var decision = await jsonFetch(
-        '/api/predictions/' + pred.id + '/' + endpointForAction(action),
+        '/api/predictions/' + predId + '/' + endpointForAction(action),
         { method: 'POST' });
       decidedByThisBatch.record(decision);
       refreshPhotoIds = refreshPhotoIds.concat(decision.photo_ids || []);

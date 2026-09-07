@@ -4,6 +4,16 @@ All notable changes to Vireo are documented in this file.
 
 ## Unreleased
 
+### Changed
+- **ID Conflicts loads a page at a time.** The page used to fetch every photo
+  in the collection and render every matching row at once — on a large
+  catalog that meant a 159 MB response and tens of thousands of table rows,
+  which took minutes to appear. The comparison is now worked out on the
+  server and the page asks for one page of rows plus the counts, so it opens
+  in seconds and filtering, sorting, searching and paging are immediate. The
+  filter chips, pager and batch actions now stay pinned to the top of the
+  list instead of scrolling out of reach.
+
 ### Added
 - **Described color labels.** Right-click any photo color label to give that
   color a short, workspace-specific meaning such as “Reptiles.” The meaning

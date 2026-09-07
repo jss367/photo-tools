@@ -169,7 +169,8 @@ def _replace_temp_id_scope(conn, table_name, ids):
 
 
 def load_photo_features(db, collection_id=None, config=None,
-                        labels_fingerprint=None, photo_ids=None):
+                        labels_fingerprint=None, photo_ids=None, *,
+                        effective_config=None):
     """Load all pipeline-relevant features for workspace photos from the database.
 
     Returns a list of photo dicts ready for the pipeline stages, with:
@@ -189,6 +190,8 @@ def load_photo_features(db, collection_id=None, config=None,
             into the top-k.
         photo_ids: optional iterable of photo IDs to scope results. When used
             with collection_id, the returned rows are the intersection.
+        effective_config: optional already-resolved configuration. Offline
+            evaluation uses this to avoid reading mutable user configuration.
 
     Returns:
         list of photo dicts
@@ -252,8 +255,11 @@ def load_photo_features(db, collection_id=None, config=None,
     # Resolve the workspace-effective detector_confidence threshold once.
     # The detections table is global (no workspace_id); threshold filtering
     # happens at read time against the active workspace's effective config.
-    import config as cfg
-    effective_cfg = db.get_effective_config(cfg.load())
+    if effective_config is None:
+        import config as cfg
+        effective_cfg = db.get_effective_config(cfg.load())
+    else:
+        effective_cfg = effective_config
     min_conf = effective_cfg.get("detector_confidence", 0.2)
     pipeline_cfg = effective_cfg.get("pipeline", {})
     weak_rescue_enabled = pipeline_cfg.get(

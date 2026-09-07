@@ -104,6 +104,10 @@ structurally ambiguous, and test-harness changes also use the full-suite
 fallback because import-time dependencies cannot be narrowed safely from line
 coverage.
 
+For offline grouping experiments with cached predictions and current human labels,
+see the [encounter evaluation tool](tools/encounter-evaluation/README.md). It has a
+separate development environment and is excluded from the application bundle.
+
 ## Scripting & automation
 
 Vireo exposes a small stable HTTP API under `/api/v1` for scripts and agents. A running instance advertises its port and auth token via `~/.vireo/runtime.json`. See [docs/headless-api.md](docs/headless-api.md) for discovery, spawning a headless instance, authentication, and a worked `curl` example.

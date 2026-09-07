@@ -1,0 +1,264 @@
+import json
+import sqlite3
+from datetime import datetime, timedelta
+
+import pytest
+
+from encounter_eval.algorithms import run_algorithm
+from encounter_eval.common import Group, code_identity, digest, validate_groups, write_json
+from encounter_eval.library import FeatureReader, open_library, plan_sessions, prepare, read_bundle
+from encounter_eval.runner import evaluate, parameter_trials, tune
+from encounter_eval.scoring import score, summarize
+
+
+def photo(i, species="a", *, second=None, disagreement=False, missing=False):
+    def subject(did, taxon, x):
+        sources = [{"mode": "exclusive", "model": "m1", "predictions": [{"taxon": taxon, "score": .98}]}]
+        if disagreement:
+            sources.append({"mode": "exclusive", "model": "m2", "predictions": [{"taxon": "other", "score": .98}]})
+        return {"id": did, "detector_model": "megadetector-v6", "detector_confidence": .95,
+                "category": "animal", "box_x": x, "box_y": .1, "box_w": .2, "box_h": .2, "sources": sources}
+    subjects = [] if missing else [subject(i * 10, species, .1)]
+    if second:
+        subjects.append(subject(i * 10 + 1, second, .7))
+    return {"id": i, "folder_id": 1, "timestamp": (datetime(2026, 1, 1) + timedelta(seconds=i / 10)).isoformat(),
+            "filename": f"{i:03}.jpg", "evidence": subjects,
+            "species_top5": [] if missing else [(species, .98, "m1")], "species_keys": {species: species}}
+
+
+def test_species_switch_with_detector_miss_does_not_bridge_runs():
+    photos = [photo(i, "a" if i < 6 else "b", missing=i == 5) for i in range(12)]
+    groups = run_algorithm("sequence", photos)
+    assert groups[0].roster == ("a",)
+    assert groups[-1].roster == ("b",)
+    assert len(groups) == 2
+
+
+def test_detector_miss_in_stable_run_is_repaired():
+    groups = run_algorithm("sequence", [photo(i, missing=i == 5) for i in range(12)])
+    assert len(groups) == 1
+    assert groups[0].roster == ("a",)
+
+
+def test_one_frame_second_species_survives_smoothing():
+    groups = run_algorithm("sequence", [photo(i, second="b" if i == 5 else None) for i in range(12)])
+    assert [g.roster for g in groups] == [("a",), ("a", "b"), ("a",)]
+    assert groups[1].photo_ids == (5,)
+
+
+def test_source_disagreement_and_unclassified_box_stay_unresolved():
+    photos = [photo(i) for i in range(12)]
+    photos[5] = photo(5, disagreement=True)
+    groups = run_algorithm("sequence", photos)
+    assert next(g for g in groups if 5 in g.photo_ids).roster is None
+    photos[5] = photo(5, second="b")
+    photos[5]["evidence"][1]["sources"] = []
+    assert next(g for g in run_algorithm("sequence", photos) if 5 in g.photo_ids).roster is None
+
+
+def test_two_same_species_subjects_do_not_force_a_boundary():
+    groups = run_algorithm("sequence", [photo(i, second="a" if i == 5 else None) for i in range(12)])
+    assert len(groups) == 1
+
+
+def test_missing_context_does_not_manufacture_empty_or_infinite_continuity():
+    photos = [photo(i, missing=1 <= i <= 20) for i in range(22)]
+    groups = run_algorithm("sequence", photos, {"context_frames": 2})
+    assert next(g for g in groups if 10 in g.photo_ids).roster is None
+    assert all(g.roster != () for g in groups)
+
+
+def test_pure_but_wrong_roster_fails_and_partial_tags_do_not_assert_absence():
+    photos = [photo(1)]
+    answer = {"1": {"taxa": ["a"], "complete": True, "sources": ["manual"]}}
+    wrong = summarize(score(photos, answer, [Group((1,), ("b",), "test")]))
+    assert wrong["exact_roster_accuracy"] == 0
+    assert wrong["counts"]["incorrect_additions"] == 1
+    answer["1"]["complete"] = False
+    partial = summarize(score(photos, answer, [Group((1,), ("a", "b"), "test")]))
+    assert partial["exact_roster_accuracy"] is None
+    assert partial["incorrect_additions_per_1000"] is None
+    assert partial["counts"]["unverified_additions"] == 1
+
+
+def test_abstention_and_fragmentation_are_not_free():
+    photos = [photo(i) for i in range(10)]
+    answers = {str(i): {"taxa": ["a"], "complete": True, "sources": ["manual"]} for i in range(10)}
+    good = summarize(score(photos, answers, [Group(tuple(range(10)), ("a",), "test")]))
+    fragmented = summarize(score(photos, answers, [Group((i,), ("a",), "test") for i in range(10)]))
+    unknown = summarize(score(photos, answers, [Group(tuple(range(10)), None, "test")]))
+    assert good["objective"] < fragmented["objective"] < unknown["objective"]
+    assert unknown["positive_recall"] == 0
+
+
+def test_order_and_membership_validation():
+    with pytest.raises(ValueError, match="exactly-once"):
+        validate_groups([photo(1), photo(2)], [Group((2, 1), ("a",), "test")])
+
+
+def test_reader_is_read_only_and_hides_labels_before_feature_preparation(library, tmp_path, monkeypatch):
+    import config
+    from pipeline import load_photo_features
+
+    monkeypatch.setattr(config, "load", lambda: pytest.fail("Mutable config must not be read"))
+    conn = open_library(library)
+    with pytest.raises(sqlite3.OperationalError, match="readonly"):
+        conn.execute("DELETE FROM photos")
+    features = load_photo_features(FeatureReader(conn, 1), photo_ids=list(range(1, 13)), effective_config={})
+    assert all(p["confirmed_species"] is None for p in features)
+    conn.close()
+    manifest = prepare(library, tmp_path / "run")
+    bundle = read_bundle(tmp_path / "run", manifest["sessions"][0])
+    assert len(bundle["photos"]) == 12
+    assert bundle["answers"]["1"]["taxa"] == ["inat:101"]
+    assert not bundle["answers"]["1"]["complete"]
+    assert "confirmed_species" not in bundle["photos"][0]
+    assert "flag" not in bundle["photos"][0]
+    assert "answers" not in bundle["photos"][0]
+    assert bundle["photos"][0]["evidence"][0]["sources"][0]["predictions"][0]["taxon"] == "inat:101"
+
+
+def test_new_run_picks_up_label_change_but_retained_inputs_remain_consistent(library, tmp_path):
+    first = prepare(library, tmp_path / "first")
+    bundle = read_bundle(tmp_path / "first", first["sessions"][0])
+    conn = sqlite3.connect(library)
+    conn.execute("UPDATE photo_keywords SET keyword_id=2 WHERE photo_id=1")
+    conn.commit()
+    conn.close()
+    second = prepare(library, tmp_path / "second")
+    newer = read_bundle(tmp_path / "second", second["sessions"][0])
+    assert first["data_digest"] != second["data_digest"]
+    assert bundle["photos"] == newer["photos"]
+    assert bundle["answers"] != newer["answers"]
+    assert read_bundle(tmp_path / "first", first["sessions"][0]) == bundle
+
+
+def test_source_taxon_ids_preserve_distinct_species_with_the_same_name(library, tmp_path):
+    conn = sqlite3.connect(library)
+    conn.execute("ALTER TABLE predictions ADD COLUMN source_taxon_id INTEGER")
+    conn.execute("ALTER TABLE keywords ADD COLUMN source_taxon_id INTEGER")
+    conn.execute("UPDATE keywords SET name='Shared name', source_taxon_id=100+id")
+    conn.execute("UPDATE predictions SET species='Shared name',source_taxon_id=100+id WHERE id IN (1,2)")
+    conn.execute("UPDATE photo_keywords SET keyword_id=2 WHERE photo_id=2")
+    conn.commit()
+    conn.close()
+    output = tmp_path / "run"
+    manifest = prepare(library, output)
+    bundle = read_bundle(output, manifest["sessions"][0])
+    for photo, expected in zip(bundle["photos"][:2], ("inat:101", "inat:102"), strict=True):
+        assert bundle["answers"][str(photo["id"])]["taxa"] == [expected]
+        assert photo["species_keys"][photo["species_top5"][0][0]] == expected
+        assert photo["evidence"][0]["sources"][0]["predictions"][0]["taxon"] == expected
+
+
+def test_preserves_unlabeled_neighbors_and_multiple_subject_sources(library, tmp_path):
+    conn = sqlite3.connect(library)
+    conn.execute("DELETE FROM photo_keywords WHERE photo_id=6")
+    conn.execute("INSERT INTO predictions VALUES(100,1,'Glossy Ibis',NULL,.99,'model-b','labels-2','2026-01-03')")
+    conn.execute("INSERT INTO predictions VALUES(101,1,'Glossy Ibis',NULL,1,'model-a','stale','2025-01-01')")
+    conn.commit()
+    conn.close()
+    manifest = prepare(library, tmp_path / "run", complete_folders=[1])
+    bundle = read_bundle(tmp_path / "run", manifest["sessions"][0])
+    assert len(bundle["photos"]) == 12 and "6" not in bundle["answers"]
+    sources = bundle["photos"][0]["evidence"][0]["sources"]
+    assert {s["model"] for s in sources} == {"model-a", "model-b"}
+    assert "stale" not in {s["labels_fingerprint"] for s in sources}
+    assert bundle["answers"]["1"]["complete"]
+
+
+def test_day_and_duplicate_split_membership():
+    rows = [{"id": i, "folder_id": i, "folder_path": str(i), "timestamp": day + "T12:00:00",
+             "filename": "a.jpg", "file_hash": file_hash}
+            for i, day, file_hash in [(1, "2026-01-01", "abc"), (2, "2026-01-02", "abc"), (3, "2026-01-01", None)]]
+    sessions = plan_sessions(rows, 42)
+    assert len({s["partition"] for s in sessions}) == 1
+    assert len({s["partition_key"] for s in sessions}) == 1
+
+
+def test_split_registry_does_not_reshuffle_and_quarantines_cross_partition_duplicates(library, tmp_path):
+    registry = tmp_path / "splits.json"
+    write_json(registry, {"seed": 42, "days": {"2026-01-01": "train", "2026-01-02": "test"}})
+    conn = sqlite3.connect(library)
+    conn.execute("UPDATE photos SET file_hash='duplicate' WHERE id=1")
+    conn.execute("UPDATE photos SET file_hash='duplicate',timestamp='2026-01-02T12:00:00' WHERE id=12")
+    conn.commit()
+    conn.close()
+    manifest = prepare(library, tmp_path / "run", split_registry=registry)
+    assert manifest["inventory"]["quarantined_day_clusters"] == 1
+    assert manifest["sessions"] == []
+
+
+def test_search_is_deterministic_and_bounded():
+    space = {"a": [1, 2, 3], "b": [4, 5]}
+    assert parameter_trials(space, "random", 3, 42) == parameter_trials(space, "random", 3, 42)
+    assert len(parameter_trials(space, "grid", 100, 42)) == 6
+    assert len({digest(t) for t in parameter_trials(space, "random", 100, 42)}) == 6
+
+
+def test_production_adapter_uses_actual_loader_and_grouping(library, tmp_path):
+    from encounters import segment_encounters
+    from pipeline import load_photo_features
+
+    output = tmp_path / "run"
+    manifest = prepare(library, output)
+    bundle = read_bundle(output, manifest["sessions"][0])
+    conn = open_library(library)
+    raw = load_photo_features(FeatureReader(conn, 1), photo_ids=list(range(1, 13)),
+                              config=manifest["config"], effective_config=manifest["config"])
+    conn.close()
+    actual = segment_encounters(raw, manifest["grouping_config"])
+    adapted = run_algorithm("production", bundle["photos"], grouping_config=manifest["grouping_config"])
+    assert [g.photo_ids for g in adapted] == [tuple(p["id"] for p in g["photos"]) for g in actual]
+
+
+def test_trial_cache_and_tuning_never_score_test_partition(library, tmp_path, monkeypatch):
+    from conftest import REPO
+
+    output = tmp_path / "run"
+    manifest = prepare(library, output)
+    manifest["code"] = code_identity(REPO)
+    entry = manifest["sessions"][0]
+    manifest["sessions"] = [{**entry, "partition": "train"}, {**entry, "partition": "development"},
+                            {**entry, "partition": "test", "path": "must-not-read.json"}]
+    result, trials = tune(output, manifest, trials=2, seconds=60, min_coverage=0)
+    assert not result["test_partition_evaluated"]
+    assert all(r["partition"] != "test" for r in trials)
+    assert result["winner"]
+    previous = evaluate(output, manifest, "sequence", {}, "train")
+    monkeypatch.setattr("encounter_eval.runner.run_algorithm", lambda *args: pytest.fail("Cached trial reran"))
+    assert evaluate(output, manifest, "sequence", {}, "train") == previous
+
+
+def test_report_escapes_labels_and_filenames(library, tmp_path):
+    from conftest import REPO
+
+    from encounter_eval.report import write_report
+
+    conn = sqlite3.connect(library)
+    conn.execute("UPDATE photos SET filename='<script>alert(1)</script>.jpg' WHERE id=6")
+    conn.commit()
+    conn.close()
+    output = tmp_path / "run"
+    manifest = prepare(library, output)
+    manifest["code"] = code_identity(REPO)
+    baseline = evaluate(output, manifest, "production", {}, "all")
+    candidate = evaluate(output, manifest, "sequence", {}, "all")
+    write_report(output, manifest, [baseline, candidate], candidate=candidate)
+    report = (output / "report.html").read_text()
+    assert "<script>" not in report
+    assert "&lt;script&gt;" in report
+
+
+def test_cli_complete_comparison_and_resume(library, tmp_path, capsys):
+    from encounter_eval.cli import main
+
+    output = tmp_path / "run"
+    assert main(["compare", "--db", str(library), "--output", str(output), "--partition", "all"]) == 0
+    assert (output / "report.html").is_file()
+    assert main(["compare", "--resume", str(output), "--partition", "all"]) == 0
+    manifest = json.loads((output / "manifest.json").read_text())
+    manifest["code"]["source_digest"] = "modified"
+    write_json(output / "manifest.json", manifest)
+    assert main(["compare", "--resume", str(output), "--partition", "all"]) == 2
+    assert "Source/environment changed" in capsys.readouterr().err

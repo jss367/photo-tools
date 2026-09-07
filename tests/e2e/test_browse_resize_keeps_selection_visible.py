@@ -14,9 +14,10 @@ CARD_VISIBILITY = """
 }
 """
 
-# The reflow lands in the same frame as the resize, but Playwright's
-# set_viewport_size returns before the page has rendered it. Wait for the
-# narrower grid, then let a frame pass so the correction has been applied.
+# Playwright returns from clicks and viewport changes before the next paint.
+# Selecting a photo shows the batch bar, which resizes the grid too. Let its
+# observer finish before a deliberate scroll, or that pending resize can
+# undo the scroll using the visibility sampled before the click.
 SETTLE = "() => new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)))"
 
 # Scrolling the selection out of view is only established once the grid's own
@@ -117,6 +118,7 @@ def test_browse_resize_leaves_a_deliberately_scrolled_away_selection_alone(live_
     cards.first.wait_for(state="visible")
     cards.first.click()
 
+    page.evaluate(SETTLE)
     page.evaluate("() => { gridContainer.scrollTop = gridContainer.scrollHeight; }")
     page.wait_for_function(SCROLL_SAMPLED)
     scrolled_away = page.evaluate("() => gridContainer.scrollTop")
@@ -182,6 +184,7 @@ def test_browse_resize_keeps_a_right_clicked_photo_visible(live_server, page):
     cards.first.wait_for(state="visible")
     cards.first.click()
 
+    page.evaluate(SETTLE)
     # Scroll well away from the selection, then right-click a card that is on
     # screen down here. Not the last card: a reflow that shortens the grid
     # pins the scroll to the bottom, which would keep the final card visible
@@ -304,6 +307,7 @@ def test_browse_thumbnail_size_change_resamples_focus_visibility(live_server, pa
     page.evaluate(SETTLE)
     cards = page.locator(".grid-card")
     cards.last.click()
+    page.evaluate(SETTLE)
     page.evaluate("() => { gridContainer.scrollTop = 0; }")
     page.wait_for_function(SCROLL_SAMPLED)
     assert page.evaluate(CARD_VISIBILITY)["fullyVisible"] is False

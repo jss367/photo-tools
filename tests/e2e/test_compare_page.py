@@ -661,11 +661,12 @@ def test_compare_pages_the_queue_instead_of_rendering_the_collection(
     db = live_server["db"]
     folder_id = live_server["data"]["folders"][0]
     thumb_dir = live_server["app"].config["THUMB_CACHE_DIR"]
-    for index in range(8):
+    extra_count = 60
+    for index in range(extra_count):
         pid = db.add_photo(
             folder_id=folder_id, filename=f"paged{index:02d}.jpg",
             extension=".jpg", file_size=1000, file_mtime=1.0,
-            timestamp=f"2024-04-{index + 1:02d}T09:00:00",
+            timestamp=f"2024-04-01T09:{index:02d}:00",
         )
         Image.new("RGB", (60, 60), color="green").save(f"{thumb_dir}/{pid}.jpg")
     db.conn.commit()
@@ -673,17 +674,17 @@ def test_compare_pages_the_queue_instead_of_rendering_the_collection(
     page.goto(f"{live_server['url']}/id-conflicts")
     page.wait_for_function("() => window.compareData !== null")
     page.locator("#filterRow button", has_text="All").click()
-    page.select_option("#pagerPerPage", "30")
-    page.select_option("#pagerPerPage", "60")
-
-    total = page.evaluate("() => compareTotal")
-    assert total >= 9
-    page.select_option("#pagerPerPage", "30")
-    expect(page.locator("#pagerSummary")).to_contain_text(f"of {total}")
-
-    # One page of rows, never the collection.
+    total = len(live_server["data"]["photos"]) + extra_count
+    # Controls fetch a new page asynchronously. Wait for the rendered result
+    # before touching the next control or reading its total. Use a collection
+    # larger than both page sizes so rendering everything cannot pass.
     rows = page.locator(".compare-table tbody tr")
-    expect(rows).to_have_count(min(30, total))
+    for per_page in (30, 60, 30):
+        page.select_option("#pagerPerPage", str(per_page))
+        expect(page.locator("#pagerSummary")).to_contain_text(
+            f"1–{per_page} of {total}"
+        )
+        expect(rows).to_have_count(per_page)
 
     first_page_ids = page.evaluate(
         "() => compareRows.map(function(p) { return p.photo_id; })"

@@ -102,6 +102,12 @@ def test_collection_click_preserves_selected_member_position(live_server, page):
     card.wait_for(state="visible")
     card.click()
 
+    # Selection shows the batch bar and shrinks the grid. The resize observer
+    # may reposition the card on the next frame; record the resulting anchor,
+    # rather than its transient position immediately after the click.
+    page.evaluate(
+        "() => new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)))"
+    )
     before_top = page.evaluate(
         """(photoId) => {
           const card = document.querySelector(`.grid-card[data-id="${photoId}"]`);

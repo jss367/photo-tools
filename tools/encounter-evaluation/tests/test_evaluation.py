@@ -292,3 +292,18 @@ def test_growing_random_budget_preserves_prior_trials(size, seed):
         assert len({digest(t) for t in trials}) == min(size, budget)
         previous = trials
 
+
+def test_detector_run_reads_follow_each_loaded_session(library):
+    from pipeline import load_photo_features
+
+    conn = open_library(library)
+    try:
+        reader = FeatureReader(conn, 1)
+        load_photo_features(reader, photo_ids=[1, 6], effective_config={})
+        # Includes a completed zero-box run, but excludes other sessions.
+        assert reader.get_detector_run_photo_ids("megadetector-v6") == {1, 6}
+        load_photo_features(reader, photo_ids=[7, 12], effective_config={})
+        assert reader.get_detector_run_photo_ids("megadetector-v6") == {7, 12}
+        assert reader.get_detector_run_photo_ids("another-detector") == set()
+    finally:
+        conn.close()

@@ -83,8 +83,11 @@ class FeatureReader:
         return result
 
     def get_detector_run_photo_ids(self, detector_model):
+        # Evaluation always loads explicit session IDs. The production loader
+        # stages this scope before requesting detector completion evidence.
         rows = self.conn.execute(
             """SELECT dr.photo_id FROM detector_runs dr WHERE dr.detector_model = ?
+            AND dr.photo_id IN (SELECT id FROM pipeline_scope_ids)
             AND (dr.box_count = 0 OR EXISTS (SELECT 1 FROM detections d
                 WHERE d.photo_id = dr.photo_id AND d.detector_model = dr.detector_model))""",
             (detector_model,),

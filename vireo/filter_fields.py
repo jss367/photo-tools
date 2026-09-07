@@ -67,7 +67,19 @@ FILTER_FIELDS = {
     # counts them (by taxon, collapsing a hierarchy leaf onto its root) —
     # ``Species count >= 2`` is the multi-species filter. ``keyword_count``
     # is not a substitute: location and subject keywords inflate it.
-    "species_count": _field("Species count", "Organization", "number", NUMBER_OPS),
+    #
+    # Op set matches what the saved-collection editor in ``browse.html`` can
+    # round-trip. The editor keeps its own hardcoded op maps for numeric
+    # fields (``is``/``is not``/``>=``/``<=``) and lacks the paired-value
+    # rendering ``between`` needs, so advertising the full ``NUMBER_OPS``
+    # would let a user save ``species_count between [2, 5]`` from the filter
+    # bar and see it silently rewritten to a single-scalar ``is`` rule on
+    # reopen (Codex review r3946102020 on PR #1614). The other numeric
+    # fields still list ``NUMBER_OPS`` and carry the same pre-existing
+    # residual; the editor learning the full registry is the intended
+    # follow-up, at which point this can go back to ``NUMBER_OPS`` too.
+    "species_count": _field("Species count", "Organization", "number",
+                            [">=", "<=", "is", "is not"]),
     # Camera & exposure
     "camera_make": _field("Camera make", "Camera & exposure", "text", TEXT_OPS,
                           suggest=True),

@@ -16916,9 +16916,17 @@ def test_browse_collection_editor_knows_species_count():
     editor_ops = re.findall(r"'([^']+)'", ops_line.split(":", 1)[1])
     assert ">=" in editor_ops, "the editor must offer the multi-species op"
     backend_ops = set(FILTER_FIELDS["species_count"]["ops"])
-    assert set(editor_ops) <= backend_ops, (
-        f"editor offers ops the rule engine rejects: "
-        f"{sorted(set(editor_ops) - backend_ops)}"
+    # Registry and editor must match — not just the editor being a subset —
+    # so a filter-bar rule saved as a collection round-trips faithfully.
+    # ``NUMBER_OPS`` includes ``>``, ``<``, and ``between``; the editor's
+    # numeric input can't render ``[low, high]`` and the field dropdown for
+    # this field would show a different op on reopen (Codex review
+    # r3946102020 on PR #1614). Widening one side of this equality without
+    # the other reintroduces the lying UI.
+    assert set(editor_ops) == backend_ops, (
+        f"editor ops and registry ops for species_count disagree — "
+        f"editor-only: {sorted(set(editor_ops) - backend_ops)}, "
+        f"registry-only: {sorted(backend_ops - set(editor_ops))}"
     )
 
     numeric_start = text.find("var NUMERIC_RULE_FIELDS = [")

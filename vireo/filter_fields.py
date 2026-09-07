@@ -63,6 +63,11 @@ FILTER_FIELDS = {
     "species": _field("Species", "Organization", "text",
                       ["contains", "not_contains", "is", "is not"], suggest=True),
     "keyword_count": _field("Keyword count", "Organization", "number", NUMBER_OPS),
+    # Distinct species on the photo, counted the way the rest of the app
+    # counts them (by taxon, collapsing a hierarchy leaf onto its root) —
+    # ``Species count >= 2`` is the multi-species filter. ``keyword_count``
+    # is not a substitute: location and subject keywords inflate it.
+    "species_count": _field("Species count", "Organization", "number", NUMBER_OPS),
     # Camera & exposure
     "camera_make": _field("Camera make", "Camera & exposure", "text", TEXT_OPS,
                           suggest=True),

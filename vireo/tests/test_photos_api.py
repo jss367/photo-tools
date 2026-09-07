@@ -12171,12 +12171,13 @@ def test_api_photos_query_validation(app_and_db, monkeypatch):
     # matched nothing. Covers all fields routed through _numeric_condition:
     # file_size/width/height/focal_length/aperture/shutter_speed/iso,
     # gps_lat/gps_lng, rating/quality_score/sharpness/subject_sharpness/
-    # noise_estimate, keyword_count, and prediction_confidence.
+    # noise_estimate, keyword_count, species_count, and
+    # prediction_confidence.
     for field in (
         "file_size", "width", "height", "focal_length", "aperture",
         "shutter_speed", "iso", "gps_lat", "gps_lng", "rating",
         "quality_score", "sharpness", "noise_estimate", "keyword_count",
-        "prediction_confidence",
+        "species_count", "prediction_confidence",
     ):
         assert client.post('/api/photos/query', json={
             "rules": [{"field": field, "op": "contains", "value": 1}],

@@ -1,6 +1,7 @@
 import contextlib
 import json
 import os
+import re
 from pathlib import Path
 
 import pytest
@@ -16881,6 +16882,94 @@ def test_browse_filter_by_collection_guards_degraded_rows():
     assert guard_end != -1 and fetch_start != -1 and guard_end < fetch_start, (
         "browse.html filterByCollection does not early-return before loading"
     )
+
+
+def _browse_editor_field_ops():
+    """Parse ``FIELD_OPS`` out of browse.html, resolving the NUMERIC_OPS alias.
+
+    The saved-collection editor keeps its own field maps rather than
+    reading the registry, so tests have to read them the way the browser
+    does to catch drift.
+    """
+    text = (Path(__file__).parent.parent / "templates" / "browse.html").read_text(
+        encoding="utf-8")
+    numeric_start = text.find("var NUMERIC_OPS = [")
+    numeric_ops = re.findall(
+        r"'([^']+)'", text[numeric_start:text.find("];", numeric_start)])
+    assert numeric_ops, "NUMERIC_OPS not found in browse.html"
+    ops_start = text.find("var FIELD_OPS = {")
+    block = text[ops_start:text.find("};", ops_start)]
+    field_ops = {}
+    for line in block.splitlines():
+        line = line.strip()
+        if ":" not in line or line.startswith("/*") or line.startswith("var"):
+            continue
+        key, _, rest = line.partition(":")
+        key = key.strip()
+        if not key.isidentifier():
+            continue
+        field_ops[key] = (
+            list(numeric_ops) if "NUMERIC_OPS" in rest
+            else re.findall(r"'([^']+)'", rest)
+        )
+    return text, field_ops
+
+
+def test_browse_collection_editor_round_trips_registry_numeric_rules():
+    """The saved-collection editor ("Edit Rules") has its own hardcoded
+    field maps, separate from the registry-driven filter bar. Any rule the
+    filter bar can save must reopen here as the same rule — a field the
+    editor doesn't know renders as the wrong field with an empty operator
+    dropdown, and an operator it doesn't know silently displays as a
+    different one.
+
+    ``between`` was worse than a display bug: its value is a [low, high]
+    pair, and the editor's single number input plus ``parseFloat`` reduced
+    it to one scalar on save, which then hit ``value[0]`` on an int in
+    ``_numeric_condition``.
+
+    Regression for Codex P2s on PR #1614.
+    """
+    from filter_fields import FILTER_FIELDS
+    text, field_ops = _browse_editor_field_ops()
+
+    labels_start = text.find("var FIELD_LABELS = {")
+    labels = text[labels_start:text.find("};", labels_start)]
+    assert "species_count: 'Species Count'" in labels, (
+        "browse.html FIELD_LABELS omits species_count — the editor's field "
+        "dropdown would show the wrong field for a saved rule"
+    )
+
+    numeric_start = text.find("var NUMERIC_RULE_FIELDS = [")
+    numeric_fields = re.findall(
+        r"'([^']+)'", text[numeric_start:text.find("];", numeric_start)])
+    assert "species_count" in numeric_fields, (
+        "species_count must get the number input, 0 default, and numeric "
+        "coercion the other count/score fields get"
+    )
+    # The three former copies of that list are what drifted; they must all
+    # read from the shared constant now.
+    assert text.count("NUMERIC_RULE_FIELDS.indexOf") == 3
+
+    # Every op the registry advertises for a numeric field must be offered
+    # by the editor, or that rule can't round-trip through "Edit Rules".
+    checked = 0
+    for field in numeric_fields:
+        spec = FILTER_FIELDS.get(field)
+        if spec is None:
+            continue  # editor-only field (e.g. crop_complete); no registry ops
+        missing = set(spec["ops"]) - set(field_ops.get(field, []))
+        assert not missing, (
+            f"browse.html editor can't represent {field} {sorted(missing)} — "
+            "a collection saved from the filter bar would reopen with a "
+            "different operator"
+        )
+        checked += 1
+    assert checked >= 5, "expected several numeric registry fields to check"
+
+    # `between` needs paired inputs and paired coercion, not one scalar.
+    assert "if (numeric && r.op === 'between')" in text
+    assert "var pair = Array.isArray(val) ? val : [val, val];" in text
 
 
 def test_browse_undo_confirmation_uses_success_toast():

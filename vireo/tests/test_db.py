@@ -25266,6 +25266,38 @@ def test_registry_ops_all_compile(tmp_path):
             assert isinstance(count, int), f"{key}/{op} failed"
 
 
+def test_browse_editor_numeric_ops_all_compile(tmp_path):
+    """The saved-collection editor advertises its own op list per field
+    (browse.html ``FIELD_OPS``), independent of the registry. Every numeric
+    op it offers must build SQL — the editor offering an op the engine
+    rejects turns a saved collection into a 400/500 instead of a filter.
+
+    Regression for Codex P2 on PR #1614: numeric ``between`` reached the
+    backend as a scalar and raised inside ``_numeric_condition``.
+    """
+    import re
+    from pathlib import Path
+    text = (Path(__file__).parent.parent / "templates" / "browse.html").read_text(
+        encoding="utf-8")
+
+    def _js_list(marker):
+        start = text.find(marker)
+        assert start != -1, f"{marker} not found in browse.html"
+        return re.findall(r"'([^']+)'", text[start:text.find("];", start)])
+
+    numeric_fields = _js_list("var NUMERIC_RULE_FIELDS = [")
+    numeric_ops = _js_list("var NUMERIC_OPS = [")
+    assert numeric_fields and numeric_ops
+
+    db, _ = _filter_db(tmp_path)
+    for field in numeric_fields:
+        for op in numeric_ops:
+            value = [0, 5] if op == "between" else 1
+            count = db.count_photos_for_rules(
+                [{"field": field, "op": op, "value": value}])
+            assert isinstance(count, int), f"{field}/{op} failed"
+
+
 def test_exif_backfill_migration_and_idempotence(tmp_path):
     import json as _json
 
@@ -26322,6 +26354,101 @@ def test_universal_filter_has_species_matches_taxonomy_type_keyword(tmp_path):
     assert count([{"field": "has_species", "op": "is", "value": 1}]) == 2
     assert count([{"field": "has_species", "op": "is", "value": 0}]) == 1
     _ = p_none  # keep the untagged photo alive for the negative branch.
+
+
+def test_universal_filter_species_count(tmp_path):
+    """``species_count`` counts distinct species the way the app presents
+    them, so "Species count >= 2" really means multi-species.
+
+    Three things it must get right: non-species keywords (locations,
+    general tags) don't inflate the count the way ``keyword_count`` does;
+    a photo carrying both a species root and a same-taxon hierarchy leaf
+    is one species, matching ``get_species_keywords_for_photos`` and the
+    card in Browse; and legacy ``type='taxonomy', is_species=0`` rows
+    count, same as ``has_species``.
+    """
+    import pytest
+    db, fid = _filter_db(tmp_path)
+    taxa = _seed_taxa(db, [
+        (2912, "Auriparus flaviceps", "Verdin"),
+        (4956, "Ardea herodias", "Great Blue Heron"),
+    ])
+
+    def _species_kw(name, taxon, parent_id=None):
+        kw = db.add_keyword(name, parent_id=parent_id)
+        db.conn.execute(
+            "UPDATE keywords SET type='taxonomy', is_species=0, taxon_id=? "
+            "WHERE id=?", (taxon, kw))
+        db.conn.commit()
+        return kw
+
+    verdin = _species_kw("Verdin", taxa["Verdin"])
+    heron = _species_kw("Great Blue Heron", taxa["Great Blue Heron"])
+    birds = db.add_keyword("Birds")
+    # Hierarchy leaf for the same taxon as the ``Verdin`` root above.
+    verdin_leaf = _species_kw("Verdin", taxa["Verdin"], parent_id=birds)
+    tucson = db.add_keyword("Tucson")
+
+    none_p = db.add_photo(folder_id=fid, filename='none.jpg', extension='.jpg',
+                          file_size=100, file_mtime=1.0)
+    one_p = db.add_photo(folder_id=fid, filename='one.jpg', extension='.jpg',
+                         file_size=100, file_mtime=1.0)
+    two_p = db.add_photo(folder_id=fid, filename='two.jpg', extension='.jpg',
+                         file_size=100, file_mtime=1.0)
+    dupe_p = db.add_photo(folder_id=fid, filename='dupe.jpg', extension='.jpg',
+                          file_size=100, file_mtime=1.0)
+
+    db.tag_photo(none_p, tucson)          # keyword, but no species
+    db.tag_photo(one_p, verdin)
+    db.tag_photo(one_p, tucson)           # must not count as a second species
+    db.tag_photo(two_p, verdin)
+    db.tag_photo(two_p, heron)
+    db.tag_photo(dupe_p, verdin)
+    db.tag_photo(dupe_p, verdin_leaf)     # same taxon, two keyword rows
+
+    count = db.count_photos_for_rules
+    def names(rules):
+        return sorted(r["filename"] for r in db.query_photos(rules, sort="name"))
+
+    # The multi-species collection.
+    assert names([{"field": "species_count", "op": ">=", "value": 2}]) == ['two.jpg']
+    assert names([{"field": "species_count", "op": "is", "value": 1}]) == \
+        ['dupe.jpg', 'one.jpg']
+    assert names([{"field": "species_count", "op": "is", "value": 0}]) == ['none.jpg']
+    assert count([{"field": "species_count", "op": "between", "value": [1, 2]}]) == 3
+    assert count([{"field": "species_count", "op": ">", "value": 0}]) == 3
+
+    # Agrees with the resolver the UI renders from.
+    resolved = db.get_species_keywords_for_photos([one_p, two_p, dupe_p])
+    assert len(resolved[dupe_p]) == 1
+    assert len(resolved[two_p]) == 2
+
+    # ``keyword_count`` is the near-miss this field exists to replace: it
+    # sees the location tag and the duplicate leaf row.
+    assert names([{"field": "keyword_count", "op": ">=", "value": 2}]) == \
+        ['dupe.jpg', 'one.jpg', 'two.jpg']
+
+    # Malformed op is a validation error (→ 400), not a silent empty match.
+    with pytest.raises(ValueError):
+        count([{"field": "species_count", "op": "contains", "value": 1}])
+
+
+def test_universal_filter_species_count_unlinked_keywords(tmp_path):
+    """Species with no taxon row fall back to the exact stored name, the
+    same identity ``get_species_keywords_for_photos`` uses — so two
+    differently-spelled offline species tags count as two, and the field
+    still works in a catalog with no taxonomy at all."""
+    db, fid = _filter_db(tmp_path)
+    robin = db.add_keyword("Robin", is_species=True)
+    wren = db.add_keyword("Wren", is_species=True)
+    pid = db.add_photo(folder_id=fid, filename='legacy.jpg', extension='.jpg',
+                       file_size=100, file_mtime=1.0)
+    db.tag_photo(pid, robin)
+    assert db.count_photos_for_rules(
+        [{"field": "species_count", "op": ">=", "value": 2}]) == 0
+    db.tag_photo(pid, wren)
+    assert db.count_photos_for_rules(
+        [{"field": "species_count", "op": ">=", "value": 2}]) == 1
 
 
 # ---------------------------------------------------------------------------

@@ -42,6 +42,14 @@ class Taxonomy:
                 return self.aliases[normalize(candidate)]
         return "name:" + normalize(scientific_name or name)
 
+    def prediction_key(self, name, identity):
+        """Translate a production-resolved identity into evaluation taxonomy keys."""
+        if identity and identity.startswith("taxon:"):
+            return "inat:" + identity.removeprefix("taxon:")
+        if identity and identity.startswith("scientific:"):
+            return self.key(identity.removeprefix("scientific:"))
+        return self.key(name)
+
 
 class FeatureReader:
     """Minimal read interface for the real pipeline loader; no app initialization.
@@ -176,7 +184,11 @@ def open_library(path):
     return conn
 
 
-def _raw_evidence(conn, taxonomy):
+def _raw_evidence(reader, taxonomy):
+    from species_identity import SpeciesResolver
+
+    conn = reader.conn
+    resolver = SpeciesResolver(db=reader)
     subjects = {}
     for row in conn.execute("SELECT d.* FROM detections d JOIN pipeline_scope_ids s ON s.id = d.photo_id ORDER BY d.id"):
         d = dict(row)
@@ -203,7 +215,8 @@ def _raw_evidence(conn, taxonomy):
             "mode": "exclusive", "mode_assumption": True, "predictions": [],
             "run": runs.get((r["detection_id"], r["classifier_model"], r["labels_fingerprint"])),
         })
-        taxon = f"inat:{r['source_taxon_id']}" if r.get("source_taxon_id") else taxonomy.key(r["species"], r["scientific_name"])
+        identity = resolver.prediction(r)
+        taxon = taxonomy.prediction_key(identity.display_name, identity.key)
         source["predictions"].append({"taxon": taxon,
                                       "name": r["species"], "score": r["confidence"]})
     by_photo = defaultdict(list)
@@ -304,7 +317,7 @@ def prepare(db_path, output, *, workspace=None, seed=42, max_sessions=None,
             photos = load_photo_features(reader, config=cfg, photo_ids=list(metadata), effective_config=cfg)
             order = {pid: index for index, pid in enumerate(metadata)}
             photos.sort(key=lambda p: order[p["id"]])
-            raw = _raw_evidence(conn, taxonomy)
+            raw = _raw_evidence(reader, taxonomy)
             answers, presentation = {}, {}
             for photo in photos:
                 pid = photo["id"]
@@ -326,12 +339,7 @@ def prepare(db_path, output, *, workspace=None, seed=42, max_sessions=None,
                 photo["species_keys"] = {}
                 for entry in photo["species_top5"]:
                     identity = entry[3] if len(entry) > 3 else None
-                    if identity and identity.startswith("taxon:"):
-                        key = "inat:" + identity.removeprefix("taxon:")
-                    elif identity and identity.startswith("scientific:"):
-                        key = taxonomy.key(identity.removeprefix("scientific:"))
-                    else:
-                        key = taxonomy.key(entry[0])
+                    key = taxonomy.prediction_key(entry[0], identity)
                     photo["species_keys"][identity or entry[0]] = key
                 meta = metadata[pid]
                 presentation[str(pid)] = {"filename": meta["filename"], "folder": meta["folder_path"],

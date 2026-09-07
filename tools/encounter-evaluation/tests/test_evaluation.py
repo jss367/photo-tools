@@ -307,3 +307,25 @@ def test_detector_run_reads_follow_each_loaded_session(library):
         assert reader.get_detector_run_photo_ids("another-detector") == set()
     finally:
         conn.close()
+
+
+@pytest.mark.parametrize(("model", "fingerprint", "source_id", "expected"), [
+    ("custom-model", "custom", None, "name:unknown custom label"),
+    ("custom-model", "tol", None, "inat:102"),
+    ("iNat21", "custom", None, "inat:102"),
+    ("custom-model", "custom", 101, "inat:101"),
+])
+def test_raw_predictions_share_production_identity_policy(library, tmp_path, model, fingerprint, source_id, expected):
+    conn = sqlite3.connect(library)
+    conn.execute("ALTER TABLE predictions ADD COLUMN source_taxon_id INTEGER")
+    conn.execute("""UPDATE predictions SET species='Unknown custom label',
+        scientific_name='Plegadis falcinellus', classifier_model=?, labels_fingerprint=?, source_taxon_id=?
+        WHERE id=1""", (model, fingerprint, source_id))
+    conn.commit()
+    conn.close()
+    output = tmp_path / "run"
+    manifest = prepare(library, output)
+    first = read_bundle(output, manifest["sessions"][0])["photos"][0]
+    assert first["evidence"][0]["sources"][0]["predictions"][0]["taxon"] == expected
+    entry = first["species_top5"][0]
+    assert first["species_keys"][entry[3]] == expected

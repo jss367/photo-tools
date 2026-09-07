@@ -2134,6 +2134,14 @@ def test_time_review_does_not_expand_an_expired_selection(live_server, page):
     expect(page.locator("#locationReviewEmptyTitle")).to_have_text("Choose a collection")
     expect(page.locator("#locationReviewCollection")).to_have_value("")
     expect(page.locator("#locationReviewGroupTitle")).not_to_be_visible()
+    page.locator("#locationReviewGap").select_option("15")
+    expect(page.locator("#locationReviewGap")).to_have_value("60")
+    page.locator("#locationReviewMode").select_option("coordinates")
+    expect(page.locator("#locationReviewMode")).to_have_value("time")
+    expect(page.locator("#locationReviewEmptyTitle")).to_have_text("Choose a collection")
+    assert parse_qs(urlparse(page.url).query) == {"mode": ["time"], "source": ["selection"]}
+    page.locator("#locationReviewCollection").select_option("all")
+    expect(page.locator("#locationReviewGroupTitle")).to_have_text("3 photos")
 
 
 def test_browse_opens_time_review_for_selected_photos(live_server, page):

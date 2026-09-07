@@ -783,6 +783,12 @@ body {
 
   function changeReviewSource(source) {
     if (state.isAssigning || hasPartialAssignmentProgress()) return;
+    if (!source) {
+      document.getElementById('locationReviewMode').value = state.mode;
+      document.getElementById('locationReviewGap').value = String(state.gapMinutes);
+      showToast('Choose a collection or All available photos before changing review options.', 'error');
+      return;
+    }
     var params = new URLSearchParams();
     if (source && source.collection_id != null) params.set('collection_id', source.collection_id);
     else if (source && source.photo_ids) params.set('source', 'selection');

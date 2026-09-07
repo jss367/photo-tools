@@ -107,7 +107,11 @@ class SpeciesResolver:
 
     def resolve(self, name, scientific_name=None, source=None):
         name = str(name or "").strip()
-        cache_key = (name, scientific_name, json.dumps(source, sort_keys=True))
+        # Most callers resolve a bare name. Serializing ``None`` for the cache
+        # key on every one of those costs more than the lookup it guards — a
+        # catalog-sized comparison resolves hundreds of thousands of names.
+        source_key = json.dumps(source, sort_keys=True) if source else None
+        cache_key = (name, scientific_name, source_key)
         if cache_key in self._cache:
             return self._cache[cache_key]
         fallback = SpeciesIdentity("name:" + keyword_match_key(name), name)

@@ -35,6 +35,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from urllib.parse import urlsplit
 
+import id_conflicts
 import places
 import remote_setup
 from artifact_flight import (
@@ -15796,11 +15797,46 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             }
         return jsonify(response)
 
+    _COMPARE_MAX_PER_PAGE = 200
+
+    def _compare_snapshots():
+        """Per-app store of ID Conflicts snapshots."""
+        store = app.config.get("ID_CONFLICTS_SNAPSHOTS")
+        if store is None:
+            store = id_conflicts.SnapshotStore()
+            app.config["ID_CONFLICTS_SNAPSHOTS"] = store
+        return store
+
+    def _compare_photo_ids(name="photo_id"):
+        """Parse repeated photo id args, or ``(None, None)`` when absent."""
+        values = request.args.getlist(name)
+        if not values:
+            return None, None
+        if len(values) > _MAX_SELECTION_PHOTOS:
+            return None, json_error(f"too many {name}s")
+        try:
+            photo_ids = [int(value) for value in values]
+        except (TypeError, ValueError):
+            return None, json_error(f"{name} must be an integer")
+        if any(photo_id <= 0 for photo_id in photo_ids):
+            return None, json_error(f"{name} must be a positive integer")
+        return photo_ids, None
+
     @app.route("/api/predictions/compare")
     def api_predictions_compare():
-        from compare import compare_prediction_to_keywords
-        from taxonomy import load_local_taxonomy
+        """One page of the ID Conflicts comparison, plus every count it shows.
 
+        Deriving what a row means — its status, whether the models disagree,
+        whether it still needs review — takes a full pass over the
+        collection's predictions and the taxonomy, so the result is kept as a
+        snapshot (see id_conflicts) and the browser is handed a token to come
+        back with. Filtering, sorting, searching and paging then run against
+        that snapshot instead of re-deriving anything, and the rows on screen
+        are rebuilt from the database so what the user acts on is current.
+
+        Passing ``photo_id`` instead returns just those rows, with no
+        snapshot: that is how a decision refreshes what it changed.
+        """
         db = _get_db()
         collection_id = request.args.get("collection_id", None, type=int)
         if not collection_id:
@@ -15809,372 +15845,89 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         if err is not None:
             return err
 
-        requested_photo_values = request.args.getlist("photo_id")
-        requested_photo_ids = None
-        if requested_photo_values:
-            if len(requested_photo_values) > _MAX_SELECTION_PHOTOS:
-                return json_error("too many photo_ids")
-            try:
-                requested_photo_ids = [
-                    int(value) for value in requested_photo_values
-                ]
-            except (TypeError, ValueError):
-                return json_error("photo_id must be an integer")
-            if any(photo_id <= 0 for photo_id in requested_photo_ids):
-                return json_error("photo_id must be a positive integer")
+        requested_photo_ids, err = _compare_photo_ids()
+        if err is not None:
+            return err
 
-        photos = db.get_collection_photos(
-            collection_id,
-            per_page=999999,
-            photo_ids=requested_photo_ids,
+        requested_models = request.args.getlist("model")
+        min_confidence = request.args.get("min_confidence", type=float)
+        if min_confidence is None:
+            min_confidence = id_conflicts.DEFAULT_MIN_CONFIDENCE
+        min_confidence = min(1.0, max(0.0, min_confidence))
+
+        if requested_photo_ids is not None:
+            built = id_conflicts.build_comparison(
+                db, collection_id, photo_ids=requested_photo_ids,
+            )
+            visible = id_conflicts.resolve_models(
+                built["models"], requested_models,
+            )
+            for photo in built["photos"]:
+                id_conflicts.attach_assessment(photo, visible, min_confidence)
+            return jsonify(built)
+
+        refresh_ids, err = _compare_photo_ids("refresh_photo_id")
+        if err is not None:
+            return err
+
+        workspace_id = db._ws_id()
+        store = _compare_snapshots()
+        snapshot = store.get(request.args.get("token"))
+        if snapshot is not None and not snapshot.matches(
+            collection_id, workspace_id,
+            id_conflicts.resolve_models(snapshot.all_models, requested_models),
+            min_confidence,
+        ):
+            # The page changed something the snapshot was derived under —
+            # collection, workspace, shown models or the conflict threshold —
+            # so it has to be derived again.
+            snapshot = None
+        if snapshot is None:
+            snapshot = store.put(id_conflicts.build_snapshot(
+                db, collection_id, workspace_id,
+                models=requested_models, min_confidence=min_confidence,
+            ))
+        elif refresh_ids:
+            snapshot.patch(db, refresh_ids)
+
+        per_page = request.args.get("per_page", 60, type=int) or 60
+        per_page = min(_COMPARE_MAX_PER_PAGE, max(1, per_page))
+        selection = id_conflicts.select(
+            snapshot.records,
+            snapshot.models,
+            filter_id=request.args.get("filter", "all"),
+            excludes=request.args.getlist("exclude"),
+            query=request.args.get("q", ""),
+            match_case=request.args.get("match_case") == "1",
+            whole_word=request.args.get("whole_word") == "1",
+            sort=request.args.get("sort", "review_priority"),
+            page=request.args.get("page", 1, type=int) or 1,
+            per_page=per_page,
         )
-        photo_ids = [p["id"] for p in photos]
-        if not photo_ids:
-            return jsonify({
-                "models": [],
-                "photos": [],
-                "summary": {
-                    "photos": 0,
-                    "models": 0,
-                    "matches": 0,
-                    "refinements": 0,
-                    "broader": 0,
-                    "conflicts": 0,
-                    "new": 0,
-                    "missing_predictions": 0,
-                    "needs_review": 0,
-                },
-                "taxonomy_available": False,
-            })
-
-        preds = db.get_predictions(photo_ids=photo_ids)
-        detections_by_photo = db.get_detections_for_photos(photo_ids)
-        keywords_by_photo = db.get_keywords_for_photos(photo_ids)
-        species_by_photo = db.get_species_keywords_for_photos(photo_ids)
-        edit_recipes_by_photo = db.get_photo_edit_recipes(photo_ids)
-        taxonomy = load_local_taxonomy()
-
-        resolved_name_cache = {}
-        from species_identity import SpeciesResolver
-        species_resolver = SpeciesResolver(taxonomy=taxonomy, db=db)
-
-        def resolved_names(raw_species):
-            """``(comparison_name, stored_name)`` for one raw model label.
-
-            ``resolve_species_display_name``'s last resort scans every
-            species keyword to detect the case convention, and a collection
-            can carry tens of thousands of predictions spread over a handful
-            of distinct labels — memoize per label so that scan happens once
-            each instead of once per prediction.
-
-            The first element is the default resolution the keyword
-            comparison needs: it must agree with the spelling
-            ``add_keyword`` would land on. The second skips the
-            case-convention invention, so it is only ever a spelling some
-            keyword row actually holds or the model's own label — the only
-            two things safe to show a user as a name.
-            """
-            key = raw_species or ""
-            cached = resolved_name_cache.get(key)
-            if cached is None:
-                cached = (
-                    db.resolve_species_display_name(raw_species),
-                    db.resolve_species_display_name(
-                        raw_species, apply_case_convention=False,
-                    ),
-                )
-                resolved_name_cache[key] = cached
-            return cached
-
-        def canonical_species_key(raw_species, db_species):
-            """One identity key per taxon, however a model spelled it.
-
-            Different models name the same taxon differently ("Western
-            Cattle-Egret" vs the outdated binomial "Bubulcus ibis"), and
-            the ID Conflicts page must not read that as a model
-            disagreement. Resolve each candidate name through the taxonomy
-            (synonym-aware) to a taxon id.
-
-            When nothing resolves — no local taxonomy, or neither
-            spelling indexed — fall back to normalized text, preferring
-            ``db_species``. That is ``resolve_species_display_name``'s
-            output, which collapses a hierarchy alias onto its root
-            keyword ("Desert Verdin" -> "Verdin"); the keyword comparison
-            right above already treats those as one species, so keying
-            off the raw spelling here would report a disagreement the
-            rest of the page contradicts. Casing is irrelevant to the
-            key, so the resolver's case-convention last resort cannot
-            leak through this path.
-            """
-            for candidate in (raw_species, db_species):
-                if candidate and taxonomy is not None:
-                    identity = species_resolver.resolve(candidate)
-                    if identity.taxon_id is not None:
-                        return identity.key
-            for candidate in (db_species, raw_species):
-                if candidate:
-                    return str(candidate).strip().lower()
-            return ""
-
-        def canonical_display_name(raw_species, db_species):
-            """Taxonomy-preferred display name that travels with each prediction.
-
-            The ID Conflicts page groups predictions by ``canonical_species``,
-            but the group's *displayed* name would otherwise be whichever raw
-            prediction the first (alphabetical) model happened to store — so
-            a persisted outdated binomial like "Bubulcus ibis" leaks into the
-            consensus and multi-subject summaries even though the server
-            resolved the taxon. Return the taxonomy's preferred common name
-            (falling back to the current scientific name) whenever any
-            candidate resolves.
-
-            When the taxonomy misses, the identity key above falls back to
-            the DB-canonical name, so two models can land in one group while
-            spelling the taxon differently ("Desert Verdin" and its root
-            "Verdin"). Prefer that same name here so the group's label is
-            the taxon the catalog agrees on rather than whichever model
-            sorted first alphabetically.
-
-            ``db_species`` must therefore be the
-            ``apply_case_convention=False`` resolution, which is only ever a
-            spelling some keyword row actually holds or else the caller's
-            own name. The default resolution would instead invent one by
-            applying the catalog's keyword-case convention to a name it has
-            never seen ("Bubulcus ibis" -> "Bubulcus Ibis") — right for
-            predicting where ``add_keyword`` lands, but a spelling neither
-            the model nor the catalog ever said, so it must not reach a
-            user-facing label. Taking the non-inventing resolution makes
-            that path unreachable from here structurally, rather than
-            leaving the display to detect the rewrite after the fact (which
-            cannot tell an invented re-casing from a stored row that differs
-            from the model's spelling only by case).
-            """
-            for candidate in (raw_species, db_species):
-                if candidate and taxonomy is not None:
-                    identity = species_resolver.resolve(candidate)
-                    if identity.taxon_id is not None:
-                        return identity.display_name
-            for candidate in (db_species, raw_species):
-                if candidate:
-                    return str(candidate).strip()
-            return ""
-
-        def summarize_photo(row):
-            row_keys = row.keys()
-            def row_bool(key):
-                return bool(row[key]) if key in row_keys else False
-
-            return {
-                "photo_id": row["id"],
-                "filename": row["filename"],
-                "timestamp": row["timestamp"],
-                "rating": row["rating"],
-                "flag": row["flag"],
-                "wildlife_excluded": row_bool("wildlife_excluded"),
-                "miss_no_subject": row_bool("miss_no_subject"),
-                "miss_clipped": row_bool("miss_clipped"),
-                "miss_oof": row_bool("miss_oof"),
-                "width": row["width"],
-                "height": row["height"],
-                "edit_recipe": edit_recipes_by_photo.get(row["id"]),
-                "keywords": keywords_by_photo.get(row["id"], []),
-                "species_keywords": species_by_photo.get(row["id"], []),
-                "predictions": {},
-                "subjects": [],
-                "row_category": "missing_prediction",
-                "row_label": "Missing prediction",
-            }
-
-        # Collect distinct models and build per-photo lookup
-        # With multi-detection, each photo may have multiple predictions per model
-        models = set()
-        by_photo = {p["id"]: summarize_photo(p) for p in photos}
-        subjects_by_detection = {}
-        for pid, detections in detections_by_photo.items():
-            photo = by_photo.get(pid)
-            if photo is None:
-                continue
-            for det in detections:
-                if (
-                    det.get("category") != "animal"
-                    or det.get("detector_model") == "full-image"
-                ):
-                    continue
-                subject = {
-                    "detection_id": det["id"],
-                    "kind": "detected",
-                    "box": {
-                        "x": det["x"],
-                        "y": det["y"],
-                        "w": det["w"],
-                        "h": det["h"],
-                    },
-                    "detector_confidence": det["confidence"],
-                    "predictions": {},
-                }
-                photo["subjects"].append(subject)
-                subjects_by_detection[det["id"]] = subject
-
-        for pr in preds:
-            d = dict(pr)
-            if d.get("status") == "alternative":
-                continue
-            pid = d["photo_id"]
-            model = d["model"]
-            if pid not in by_photo:
-                continue
-            subject = subjects_by_detection.get(d.get("detection_id"))
-            if subject is None:
-                if d.get("detector_model") != "full-image":
-                    # Predictions backed by a detection below the current
-                    # workspace threshold are intentionally dormant until the
-                    # user lowers that threshold. Do not let them create
-                    # invisible Compare conflicts.
-                    continue
-                subject = {
-                    "detection_id": d["detection_id"],
-                    "kind": "full_image",
-                    "box": {"x": 0, "y": 0, "w": 1, "h": 1},
-                    "detector_confidence": 0,
-                    "predictions": {},
-                }
-                by_photo[pid]["subjects"].append(subject)
-                subjects_by_detection[d["detection_id"]] = subject
-
-            models.add(model)
-            if model not in by_photo[pid]["predictions"]:
-                by_photo[pid]["predictions"][model] = []
-            # get_species_keywords_for_photos now canonicalizes hierarchy
-            # aliases through their linked taxon's root (e.g. an attached
-            # ``Desert Verdin`` leaf is reported as ``Verdin`` when a root
-            # ``Verdin`` row exists). If the raw prediction label is that
-            # alias and it is not present in the on-disk taxonomy JSON,
-            # ``compare_prediction_to_keywords`` would fall through to its
-            # exact-text fallback and flag a needless conflict because
-            # ``"Verdin" != "Desert Verdin"``. Route the prediction label
-            # through the same DB-side resolver so it agrees with the
-            # canonical species spellings we already returned.
-            comparison_prediction, stored_prediction = resolved_names(
-                d["species"]
-            )
-            native_identity = d.get("labels_fingerprint") == "tol" or model.startswith("iNat")
-            source_identity = species_resolver.prediction(d) if d.get("source_taxon_id") or native_identity else None
-            existing_species = species_by_photo.get(pid, [])
-            comparison_name = comparison_prediction
-            scientific_name = source_identity.scientific_name if source_identity else None
-            if scientific_name and taxonomy is not None and taxonomy.lookup(scientific_name):
-                # Use native identity when taxonomy can compare it, retaining
-                # the exact-text fallback for an unindexed confirmed label.
-                exact_unindexed = any(
-                    kw.lower() == comparison_prediction.lower() and taxonomy.lookup(kw) is None
-                    for kw in existing_species
-                )
-                if not exact_unindexed:
-                    comparison_name = scientific_name
-            comparison = compare_prediction_to_keywords(
-                comparison_name, existing_species, taxonomy,
-            )
-            prediction = {
-                "id": d["id"],
-                "detection_id": d["detection_id"],
-                "species": d["species"],
-                "canonical_species": source_identity.key if source_identity else canonical_species_key(
-                    d["species"], comparison_prediction,
-                ),
-                "canonical_display": source_identity.display_name if source_identity else canonical_display_name(
-                    d["species"], stored_prediction,
-                ),
-                "confidence": d["confidence"],
-                "status": d["status"],
-                "category": comparison["category"],
-                "category_label": comparison["label"],
-                "category_detail": comparison["detail"],
-                "matched_keyword": comparison["matched_keyword"],
-                "shared_rank": comparison["shared_rank"],
-                "box_x": d.get("box_x"),
-                "box_y": d.get("box_y"),
-                "box_w": d.get("box_w"),
-                "box_h": d.get("box_h"),
-            }
-            by_photo[pid]["predictions"][model].append(prediction)
-            subject["predictions"].setdefault(model, []).append(prediction)
-
-        priority = {
-            "conflict": 6,
-            "refinement": 5,
-            "broader": 4,
-            "new": 3,
-            "missing_prediction": 2,
-            "match": 1,
-        }
-        labels = {
-            "conflict": "Conflict",
-            "refinement": "Refinement",
-            "broader": "Broader",
-            "new": "No species keyword",
-            "missing_prediction": "Missing prediction",
-            "match": "Match",
-        }
-        summary = {
-            "photos": len(photos),
-            "models": 0,
-            "matches": 0,
-            "refinements": 0,
-            "broader": 0,
-            "conflicts": 0,
-            "new": 0,
-            "missing_predictions": 0,
-            "needs_review": 0,
-        }
-
-        for photo in by_photo.values():
-            highest_category = None
-            pending_category = None
-            for model_preds in photo["predictions"].values():
-                for pred in model_preds:
-                    cat = pred["category"]
-                    if cat == "match":
-                        summary["matches"] += 1
-                    elif cat == "refinement":
-                        summary["refinements"] += 1
-                    elif cat == "broader":
-                        summary["broader"] += 1
-                    elif cat == "conflict":
-                        summary["conflicts"] += 1
-                    elif cat == "new":
-                        summary["new"] += 1
-                    if (
-                        highest_category is None
-                        or priority[cat] > priority[highest_category]
-                    ):
-                        highest_category = cat
-                    if pred.get("status") == "pending" and (
-                        pending_category is None
-                        or priority[cat] > priority[pending_category]
-                    ):
-                        pending_category = cat
-            if not photo["predictions"]:
-                summary["missing_predictions"] += 1
-            row_category = pending_category or highest_category or "missing_prediction"
-            photo["row_category"] = row_category
-            photo["row_label"] = labels[row_category]
-            # Any pending prediction means the user hasn't decided yet, so
-            # the photo still needs review — including pending "match"
-            # predictions, which classify_job stores deliberately when a
-            # multi-species sidecar makes a photo-level match ambiguous
-            # (see _store_pending_detection_prediction / auto_accept=False).
-            photo["needs_review"] = pending_category is not None
-            if photo["needs_review"]:
-                summary["needs_review"] += 1
-
-        model_list = sorted(models)
-        summary["models"] = len(model_list)
-
         return jsonify({
-            "models": model_list,
-            "photos": list(by_photo.values()),
-            "summary": summary,
-            "taxonomy_available": taxonomy is not None,
+            "token": snapshot.token,
+            "models": snapshot.all_models,
+            "visible_models": snapshot.models,
+            "taxonomy_available": snapshot.taxonomy_available,
+            "photos": id_conflicts.page_rows(
+                db, collection_id, selection.photo_ids,
+                snapshot.models, snapshot.min_confidence,
+            ),
+            "page": request.args.get("page", 1, type=int) or 1,
+            "per_page": per_page,
+            "total": selection.total,
+            "summary": selection.summary,
+            "filter_counts": selection.filter_counts,
+            "exclusion_counts": selection.exclusion_counts,
+            "filters": [
+                {"id": fid, "label": label} for fid, label in id_conflicts.FILTERS
+            ],
+            "sorts": [
+                {"id": sid, "label": label} for sid, label in id_conflicts.SORTS
+            ],
+            "excludes": [
+                {"id": eid, "label": label} for eid, label in id_conflicts.EXCLUDES
+            ],
         })
 
     @app.route("/api/predictions/<int:pred_id>/reviewed", methods=["POST"])

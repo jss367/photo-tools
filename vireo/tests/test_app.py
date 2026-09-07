@@ -22088,13 +22088,13 @@ def _grouped_decision_module():
 
 
 _ID_CONFLICTS_BATCH_STUB = """
-var compareData = {photos: __input.photos};
+var compareData = {summary: {}};
+var compareRows = __input.photos;
 var selectedRows = new Set(__input.photos.map(function(p) { return p.photo_id; }));
 var loadingSeq = 0;
 var document = {
   getElementById: function() { return {value: '1'}; },
 };
-function bestPrediction(photo) { return photo.prediction; }
 var __fullReloads = 0;
 var __targetedRefreshes = 0;
 async function loadComparison() { __fullReloads++; }
@@ -22115,7 +22115,9 @@ batchAction('accept').then(function() {
 
 def _run_id_conflicts_batch(html, payload):
     """Run ID Conflicts' real ``batchAction`` against the stub server."""
-    start = html.find("function endpointForAction(")
+    # From the first of the helpers ``batchAction`` leans on, so the code
+    # under test is the shipped one rather than a paraphrase of it.
+    start = html.find("function loadedPhoto(")
     # ``rfind``: the threshold control is also *called* earlier in the page,
     # and only the last occurrence is the bootstrap line that follows
     # ``batchAction``.
@@ -22153,8 +22155,8 @@ def test_id_conflicts_batch_accept_reports_group_expanded_rows_as_applied(
     client = app.test_client()
     html = client.get("/id-conflicts").get_data(as_text=True)
     photos = [
-        {"photo_id": 1, "prediction": {"id": 11}},
-        {"photo_id": 2, "prediction": {"id": 12}},
+        {"photo_id": 1, "best_prediction_id": 11},
+        {"photo_id": 2, "best_prediction_id": 12},
     ]
 
     burst = _run_id_conflicts_batch(html, {
@@ -22190,8 +22192,8 @@ def test_id_conflicts_batch_unconfirmed_accept_fully_reloads(app_and_db):
     app, _ = app_and_db
     html = app.test_client().get("/id-conflicts").get_data(as_text=True)
     photos = [
-        {"photo_id": 1, "prediction": {"id": 11}},
-        {"photo_id": 2, "prediction": {"id": 12}},
+        {"photo_id": 1, "best_prediction_id": 11},
+        {"photo_id": 2, "best_prediction_id": 12},
     ]
 
     result = _run_id_conflicts_batch(html, {
@@ -22725,168 +22727,6 @@ def test_browse_reject_reporter_names_workspace_detach_skips(app_and_db):
     # cannot drift back apart on this one signal.
     accept_body = _browse_js_function_body(html, "function _reportSkippedAccepts(")
     assert "skipped_out_of_workspace" in accept_body
-
-
-_ID_CONFLICTS_SIGNAL_STUB = """
-var signalCache = new Map();
-var compareData = null;
-var __models = [];
-function visibleModels() { return __models; }
-function effectivePredictionCategory(pred) { return pred.category || 'match'; }
-"""
-
-_ID_CONFLICTS_SIGNAL_DRIVER = """
-var input = JSON.parse(process.argv[2]);
-__models = input.models;
-signalCache = new Map();
-var signal = photoSignal(input.photo);
-process.stdout.write(JSON.stringify({
-  consensus_species: signal.consensus_species,
-  consensus_count: signal.consensus_count,
-  consensus_label: signal.consensus_label,
-  model_disagreement_label: signal.model_disagreement_label,
-}));
-"""
-
-
-def _run_id_conflicts_photo_signal(html, payload):
-    """Run ID Conflicts' real ``photoSignal`` against a payload.
-
-    Slices the page's own signal code (``desc`` through ``photoSignal``)
-    so the user-visible label strings are produced by production JS, not
-    reimplemented here. ``CATEGORY_ORDER`` is sliced in from its
-    definition rather than stubbed, so category priority stays honest.
-    """
-    import json as _json
-
-    cat_start = html.find("var CATEGORY_ORDER = {")
-    cat_end = html.find("function ", cat_start)
-    start = html.find("function desc(a, b)")
-    end = html.find("function signalSummary(")
-    assert cat_start != -1 and start != -1 and end > start, (
-        "id_conflicts.html's signal code could not be located"
-    )
-    source = "\n".join([
-        _ID_CONFLICTS_SIGNAL_STUB, html[cat_start:cat_end], html[start:end],
-        _ID_CONFLICTS_SIGNAL_DRIVER,
-    ])
-    return _run_node(source, [_json.dumps(payload)])
-
-
-def _egret_prediction(species, confidence, display="Western Cattle-Egret"):
-    pred = {
-        "species": species, "canonical_species": "taxon:1",
-        "confidence": confidence, "status": "pending", "category": "match",
-    }
-    if display:
-        pred["canonical_display"] = display
-    return pred
-
-
-def _one_subject_photo(predictions):
-    return {
-        "photo_id": 1,
-        "subjects": [{
-            "detection_id": 7, "kind": "detected",
-            "box": {"x": 0.1, "y": 0.1, "w": 0.2, "h": 0.2},
-            "predictions": predictions,
-        }],
-    }
-
-
-def test_id_conflicts_consensus_label_uses_the_taxon_display_name(app_and_db):
-    """The consensus note names the taxon, not whichever model was first.
-
-    Codex P2 (id_conflicts.html:1083). ``canonical_species`` already
-    grouped an outdated binomial ("Bubulcus ibis") with a later model's
-    "Western Cattle-Egret" as agreement, but the group took its display
-    name from the first prediction it saw — so the note and the
-    multi-subject summary kept showing the scientific name, and model
-    ordering decided whether the leak appeared. Asserting the payload
-    field alone would not catch that; this drives the page's real
-    ``photoSignal`` and reads the string a user sees.
-    """
-    app, _ = app_and_db
-    html = app.test_client().get("/id-conflicts").get_data(as_text=True)
-
-    def photo(first, second):
-        return _one_subject_photo({
-            "model-a": [_egret_prediction(first, 0.9)],
-            "model-b": [_egret_prediction(second, 0.8)],
-        })
-
-    models = ["model-a", "model-b"]
-    binomial_first = _run_id_conflicts_photo_signal(html, {
-        "models": models,
-        "photo": photo("Bubulcus ibis", "Western Cattle-Egret"),
-    })
-    common_first = _run_id_conflicts_photo_signal(html, {
-        "models": models,
-        "photo": photo("Western Cattle-Egret", "Bubulcus ibis"),
-    })
-
-    assert binomial_first["consensus_count"] == 2
-    assert binomial_first["consensus_species"] == "Western Cattle-Egret", (
-        "the group label must come from the taxon, not from the "
-        "first-visited model's raw prediction"
-    )
-    assert binomial_first["consensus_label"] == (
-        "2 models agree on Western Cattle-Egret"
-    )
-    # And it cannot depend on which model happens to sort first.
-    assert common_first["consensus_label"] == binomial_first["consensus_label"]
-
-
-def test_id_conflicts_disagreement_label_uses_the_taxon_display_name(
-    app_and_db,
-):
-    """"Models disagree" names both taxa, not the raw stored strings.
-
-    Same leak as the consensus group, one line over: the disagreement
-    note and the pill tooltip render the pair directly, so a persisted
-    "Bubulcus ibis" shows there even though the server resolved it.
-    """
-    app, _ = app_and_db
-    html = app.test_client().get("/id-conflicts").get_data(as_text=True)
-
-    signal = _run_id_conflicts_photo_signal(html, {
-        "models": ["model-a", "model-b"],
-        "photo": _one_subject_photo({
-            "model-a": [_egret_prediction("Bubulcus ibis", 0.9)],
-            "model-b": [{
-                "species": "Blue Jay", "canonical_species": "taxon:2",
-                "canonical_display": "Blue Jay", "confidence": 0.8,
-                "status": "pending", "category": "match",
-            }],
-        }),
-    })
-    assert signal["model_disagreement_label"] == (
-        "Western Cattle-Egret vs Blue Jay"
-    )
-
-
-def test_id_conflicts_labels_fall_back_to_the_raw_prediction(app_and_db):
-    """Predictions without ``canonical_display`` (nothing resolved, or an
-    older cached response) still get a label — the raw prediction."""
-    app, _ = app_and_db
-    html = app.test_client().get("/id-conflicts").get_data(as_text=True)
-
-    signal = _run_id_conflicts_photo_signal(html, {
-        "models": ["model-a", "model-b"],
-        "photo": _one_subject_photo({
-            "model-a": [{
-                "species": "Mystery Beast",
-                "canonical_species": "mystery beast",
-                "confidence": 0.9, "status": "pending", "category": "new",
-            }],
-            "model-b": [{
-                "species": "Other Beast", "canonical_species": "other beast",
-                "confidence": 0.8, "status": "pending", "category": "new",
-            }],
-        }),
-    })
-    assert signal["consensus_species"] == "Mystery Beast"
-    assert signal["model_disagreement_label"] == "Mystery Beast vs Other Beast"
 
 
 def test_compare_canonical_key_collapses_hierarchy_aliases(app_and_db, tmp_path):

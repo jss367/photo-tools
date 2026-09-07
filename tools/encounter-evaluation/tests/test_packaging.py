@@ -33,8 +33,9 @@ def test_application_wheel_excludes_evaluation_package(tmp_path):
     shutil.copytree(REPO / "vireo", source / "vireo", ignore=shutil.ignore_patterns("__pycache__"))
     shutil.copytree(REPO / "tools" / "encounter-evaluation", source / "tools" / "encounter-evaluation",
                     ignore=shutil.ignore_patterns("__pycache__", "*.egg-info", ".pytest_cache"))
-    subprocess.run([sys.executable, "-m", "build", "--wheel", "--no-isolation",
-                    "--outdir", str(tmp_path), str(source)], check=True, capture_output=True, text=True)
+    result = subprocess.run([sys.executable, "-m", "build", "--wheel", "--no-isolation",
+                    "--outdir", str(tmp_path), str(source)], capture_output=True, text=True)
+    assert result.returncode == 0, result.stdout + result.stderr
     wheel = next(tmp_path.glob("*.whl"))
     with zipfile.ZipFile(wheel) as archive:
         assert not any("encounter_eval" in name or "encounter-evaluation" in name for name in archive.namelist())

@@ -5799,24 +5799,31 @@ var NUMERIC_RULE_FIELDS = ['rating', 'quality_score', 'sharpness',
   'subject_sharpness', 'noise_estimate', 'crop_complete',
   'prediction_confidence', 'species_count'];
 
+/* Ops every numeric field accepts. Must be a superset of what the
+   registry (vireo/filter_fields.py) advertises for number/rating fields,
+   or a rule saved from the filter bar reopens here showing a different
+   operator than the one it runs with — and `between`, whose value is a
+   [low, high] pair, used to be flattened to a single scalar on save. */
+var NUMERIC_OPS = ['is', 'is not', '>=', '<=', '>', '<', 'between'];
+
 /* Valid ops per field — must mirror vireo/db.py::_build_collection_query.
    The UI only shows ops the backend handles; non-matching combos used to
    silently produce zero matches. */
 var FIELD_OPS = {
   all:         ['equals'],
   keyword:     ['is', 'is not', 'contains', 'not_contains'],
-  species_count: ['is', 'is not', '>=', '<='],
-  rating:      ['is', 'is not', '>=', '<='],
+  species_count: NUMERIC_OPS,
+  rating:      NUMERIC_OPS,
   flag:        ['is', 'is not'],
   color_label: ['is', 'is not'],
   extension:   ['is', 'is not'],
   folder:      ['under', 'not_under'],
   timestamp:   ['between', 'recent_days'],
-  quality_score: ['is', 'is not', '>=', '<='],
-  sharpness: ['is', 'is not', '>=', '<='],
-  subject_sharpness: ['is', 'is not', '>=', '<='],
-  noise_estimate: ['is', 'is not', '>=', '<='],
-  crop_complete: ['is', 'is not', '>=', '<='],
+  quality_score: NUMERIC_OPS,
+  sharpness: NUMERIC_OPS,
+  subject_sharpness: NUMERIC_OPS,
+  noise_estimate: NUMERIC_OPS,
+  crop_complete: NUMERIC_OPS,
   has_mask: ['equals'],
   has_jpeg_companion: ['equals'],
   active_mask_variant: ['is', 'is not', 'contains'],
@@ -5826,7 +5833,7 @@ var FIELD_OPS = {
   location_keyword_missing: ['equals'],
   inat_submitted: ['equals'],
   is_duplicate: ['equals'],
-  prediction_confidence: ['is', 'is not', '>=', '<='],
+  prediction_confidence: NUMERIC_OPS,
   classifier_model: ['is', 'is not', 'contains'],
   prediction_status: ['is', 'is not'],
   needs_review: ['equals'],
@@ -5868,6 +5875,8 @@ var OP_LABELS = {
   'not_contains': 'does not contain',
   '>=':           '>=',
   '<=':           '<=',
+  '>':            '>',
+  '<':            '<',
   'under':        'under',
   'not_under':    'not under',
   'between':      'between',
@@ -5878,8 +5887,10 @@ function defaultValueForRule(field, op) {
   if (field === 'all') return 1;
   if (field === 'color_label') return 'red';
   if (field === 'flag') return 'flagged';
-  if (field === 'rating') return 0;
-  if (NUMERIC_RULE_FIELDS.indexOf(field) !== -1) return 0;
+  if (field === 'rating') return op === 'between' ? [0, 0] : 0;
+  if (NUMERIC_RULE_FIELDS.indexOf(field) !== -1) {
+    return op === 'between' ? [0, 0] : 0;
+  }
   if (field === 'extension') return collectionExtensions[0] || '';
   if (field === 'folder') return (collectionFolders[0] && collectionFolders[0].path) || '';
   if (field === 'timestamp') {
@@ -6049,23 +6060,30 @@ function updateRule(path, key, val) {
     return;
   }
   if (key === 'op') {
+    var wasPair = r.op === 'between';
     r.op = val;
-    // For timestamp, the value shape depends on the op. Reset on switch.
-    if (r.field === 'timestamp') {
+    // The value shape depends on the op: timestamp switches between a date
+    // pair and a day count, and every numeric field switches between a
+    // [low, high] pair and a scalar. Reset when the shape changes, or the
+    // stale shape reaches the backend (a scalar under `between` hit
+    // value[0] in _numeric_condition and 500'd).
+    if (r.field === 'timestamp' || wasPair !== (val === 'between')) {
       r.value = defaultValueForRule(r.field, val);
     }
     renderRules();
     return;
   }
-  if (key === 'value_from' && r.field === 'timestamp' && r.op === 'between') {
+  if (key === 'value_from' && r.op === 'between') {
+    // `|| ''` would rewrite a legitimate 0 bound to blank on a numeric
+    // pair, so keep the other end verbatim unless it's actually missing.
     if (!Array.isArray(r.value)) r.value = ['', ''];
-    r.value = [val, r.value[1] || ''];
+    r.value = [val, r.value[1] == null ? '' : r.value[1]];
     schedulePreviewUpdate();
     return;
   }
-  if (key === 'value_to' && r.field === 'timestamp' && r.op === 'between') {
+  if (key === 'value_to' && r.op === 'between') {
     if (!Array.isArray(r.value)) r.value = ['', ''];
-    r.value = [r.value[0] || '', val];
+    r.value = [r.value[0] == null ? '' : r.value[0], val];
     schedulePreviewUpdate();
     return;
   }
@@ -6223,6 +6241,17 @@ function renderRuleValueInput(r, i) {
     }
   }
   var numeric = NUMERIC_RULE_FIELDS.indexOf(r.field) !== -1;
+  if (numeric && r.op === 'between') {
+    // Two inputs, matching the [low, high] pair the backend expects. A
+    // single input here dropped the upper bound on save.
+    var lo = Array.isArray(r.value) ? (r.value[0] == null ? '' : r.value[0]) : '';
+    var hi = Array.isArray(r.value) ? (r.value[1] == null ? '' : r.value[1]) : '';
+    return '<div style="flex:1;display:flex;gap:6px;align-items:center;">' +
+        '<input type="number" step="any" value="' + escapeAttr(String(lo)) + '" onchange="updateRule(\'' + p + '\',\'value_from\',this.value)" onkeydown="commitRuleOnEnter(event)" style="flex:1;">' +
+        '<span style="color:var(--text-ghost);font-size:11px;">and</span>' +
+        '<input type="number" step="any" value="' + escapeAttr(String(hi)) + '" onchange="updateRule(\'' + p + '\',\'value_to\',this.value)" onkeydown="commitRuleOnEnter(event)" style="flex:1;">' +
+      '</div>';
+  }
   return '<input type="' + (numeric ? 'number' : 'text') + '" value="' +
     escapeAttr(String(r.value == null ? '' : r.value)) +
     '" onchange="updateRule(\'' + p + '\',\'value\',this.value)"' +
@@ -6285,6 +6314,10 @@ function renderRules() {
 }
 
 function coerceRuleForSave(node) {
+  function num(v) {
+    var n = parseFloat(v);
+    return isNaN(n) ? 0 : n;
+  }
   if (node.rules && !node.field) {
     return {
       mode: (['all', 'any', 'none'].indexOf(node.mode) !== -1) ? node.mode : 'all',
@@ -6293,8 +6326,12 @@ function coerceRuleForSave(node) {
   }
   var val = node.value;
   if (NUMERIC_RULE_FIELDS.indexOf(node.field) !== -1) {
-    val = parseFloat(val);
-    if (isNaN(val)) val = 0;
+    if (node.op === 'between') {
+      var pair = Array.isArray(val) ? val : [val, val];
+      val = [num(pair[0]), num(pair[1])];
+    } else {
+      val = num(val);
+    }
   } else if (['has_mask', 'has_jpeg_companion', 'has_gps', 'has_location_keyword',
               'location_keyword_missing', 'inat_submitted', 'is_duplicate',
               'needs_review', 'all'].indexOf(node.field) !== -1) {

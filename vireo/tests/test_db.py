@@ -25266,6 +25266,38 @@ def test_registry_ops_all_compile(tmp_path):
             assert isinstance(count, int), f"{key}/{op} failed"
 
 
+def test_browse_editor_numeric_ops_all_compile(tmp_path):
+    """The saved-collection editor advertises its own op list per field
+    (browse.html ``FIELD_OPS``), independent of the registry. Every numeric
+    op it offers must build SQL — the editor offering an op the engine
+    rejects turns a saved collection into a 400/500 instead of a filter.
+
+    Regression for Codex P2 on PR #1614: numeric ``between`` reached the
+    backend as a scalar and raised inside ``_numeric_condition``.
+    """
+    import re
+    from pathlib import Path
+    text = (Path(__file__).parent.parent / "templates" / "browse.html").read_text(
+        encoding="utf-8")
+
+    def _js_list(marker):
+        start = text.find(marker)
+        assert start != -1, f"{marker} not found in browse.html"
+        return re.findall(r"'([^']+)'", text[start:text.find("];", start)])
+
+    numeric_fields = _js_list("var NUMERIC_RULE_FIELDS = [")
+    numeric_ops = _js_list("var NUMERIC_OPS = [")
+    assert numeric_fields and numeric_ops
+
+    db, _ = _filter_db(tmp_path)
+    for field in numeric_fields:
+        for op in numeric_ops:
+            value = [0, 5] if op == "between" else 1
+            count = db.count_photos_for_rules(
+                [{"field": field, "op": op, "value": value}])
+            assert isinstance(count, int), f"{field}/{op} failed"
+
+
 def test_exif_backfill_migration_and_idempotence(tmp_path):
     import json as _json
 

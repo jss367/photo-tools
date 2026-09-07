@@ -63,6 +63,30 @@ _ABANDONED_NETWORK_PROBES = set()
 # a wedged share cannot stack processes or threads without bound.
 _FORGOTTEN_NETWORK_PROBES = set()
 _FORGOTTEN_GENERIC_PROBES = set()
+# Bumped by :func:`invalidate_caches`. Every probe records the epoch it began
+# under, so a probe that started before the user asked us to look again cannot
+# claim its root as unprobeable afterwards — the race that survives a one-shot
+# sweep is precisely a probe *transitioning* to wedged just after the sweep.
+# Roots registered without an epoch (test doubles) read as current, i.e. they
+# keep the historical fail-fast behaviour.
+_INVALIDATION_EPOCH = 0
+_INVALIDATION_EPOCH_LOCK = threading.Lock()
+# root -> epoch of the probe that abandoned it / that is running.
+_ABANDONED_PROBE_EPOCHS = {}
+_GENERIC_PROBE_EPOCHS = {}
+
+
+def current_invalidation_epoch():
+    """Epoch a probe should record when it starts (see ``_INVALIDATION_EPOCH``)."""
+    with _INVALIDATION_EPOCH_LOCK:
+        return _INVALIDATION_EPOCH
+
+
+def _bump_invalidation_epoch():
+    global _INVALIDATION_EPOCH
+    with _INVALIDATION_EPOCH_LOCK:
+        _INVALIDATION_EPOCH += 1
+        return _INVALIDATION_EPOCH
 
 # ``OSError`` errnos that mean the *volume* is gone, not that one file is
 # unreadable. ``ENOTCONN`` ("Socket is not connected") is what macOS raises
@@ -655,9 +679,17 @@ def _reserve_network_probe(root, wait_timeout=0):
         while root in _NETWORK_PROBES:
             # A timed-out process may stay in uninterruptible I/O while its
             # reaper waits. It already proved the root unhealthy, so retries
-            # fail immediately instead of waiting another timeout.
+            # fail immediately instead of waiting another timeout — unless it
+            # was started before the last invalidation, in which case what it
+            # proved is about the volume as it was *before* the user remounted
+            # it, and this caller is entitled to look for itself.
             if root in _ABANDONED_NETWORK_PROBES:
-                return False
+                if _ABANDONED_PROBE_EPOCHS.get(
+                    root, current_invalidation_epoch(),
+                ) >= current_invalidation_epoch():
+                    return False
+                _forget_network_probe_locked(root)
+                continue
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 return False
@@ -677,7 +709,21 @@ def _release_network_probe(root, owner):
         if _NETWORK_PROBES.get(root) is owner:
             _NETWORK_PROBES.pop(root, None)
             _ABANDONED_NETWORK_PROBES.discard(root)
+            _ABANDONED_PROBE_EPOCHS.pop(root, None)
             _NETWORK_PROBE_CONDITION.notify_all()
+
+
+def _forget_network_probe_locked(root):
+    """Drop ``root``'s registration, keeping a running process counted.
+
+    Callers must hold ``_NETWORK_PROBE_LOCK``.
+    """
+    process = _NETWORK_PROBES.pop(root, None)
+    _ABANDONED_NETWORK_PROBES.discard(root)
+    _ABANDONED_PROBE_EPOCHS.pop(root, None)
+    if process is not None and process is not _NETWORK_PROBE_RESERVED:
+        _FORGOTTEN_NETWORK_PROBES.add(process)
+    _NETWORK_PROBE_CONDITION.notify_all()
 
 
 def _reap_abandoned_network_probe(root, process):
@@ -690,11 +736,19 @@ def _reap_abandoned_network_probe(root, process):
         _release_network_probe(root, process)
 
 
-def _abandon_network_probe(root, process):
-    """Kill a timed-out probe without synchronously waiting for it."""
+def _abandon_network_probe(root, process, epoch=None):
+    """Kill a timed-out probe without synchronously waiting for it.
+
+    ``epoch`` is the invalidation epoch the probe started under; a later
+    reservation uses it to tell "this root was proved unprobeable just now"
+    from "…before the user asked us to look again".
+    """
+    if epoch is None:
+        epoch = current_invalidation_epoch()
     with _NETWORK_PROBE_CONDITION:
         if _NETWORK_PROBES.get(root) is process:
             _ABANDONED_NETWORK_PROBES.add(root)
+            _ABANDONED_PROBE_EPOCHS[root] = epoch
             _NETWORK_PROBE_CONDITION.notify_all()
     with contextlib.suppress(OSError):
         process.kill()
@@ -754,6 +808,7 @@ def _bounded_process_probe(argv, root, timeout, accept, run=None,
         root_key = os.path.normcase(os.path.normpath(os.fspath(root)))
     except (TypeError, ValueError):
         return False
+    epoch = current_invalidation_epoch()
     if not _reserve_network_probe(root_key, wait_timeout=timeout):
         return False
 
@@ -772,12 +827,12 @@ def _bounded_process_probe(argv, root, timeout, accept, run=None,
         stdout, _stderr = process.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
         abandoned = True
-        _abandon_network_probe(root_key, process)
+        _abandon_network_probe(root_key, process, epoch)
         return False
     except (OSError, subprocess.SubprocessError):
         if process is not None:
             abandoned = True
-            _abandon_network_probe(root_key, process)
+            _abandon_network_probe(root_key, process, epoch)
         else:
             _release_network_probe(root_key, _NETWORK_PROBE_RESERVED)
         return False
@@ -931,8 +986,19 @@ def _probe_root_generic(root, timeout):
         existing = _GENERIC_PROBES.get(root)
         if existing is not None:
             if existing.is_alive():
-                return False
-            del _GENERIC_PROBES[root]
+                if _GENERIC_PROBE_EPOCHS.get(
+                    root, current_invalidation_epoch(),
+                ) >= current_invalidation_epoch():
+                    return False
+                # Started before the last invalidation: its verdict is about
+                # the volume as it was then, so it must not stand in for a
+                # look at the volume now.
+                del _GENERIC_PROBES[root]
+                _GENERIC_PROBE_EPOCHS.pop(root, None)
+                _FORGOTTEN_GENERIC_PROBES.add(existing)
+            else:
+                del _GENERIC_PROBES[root]
+                _GENERIC_PROBE_EPOCHS.pop(root, None)
         if (
             len(_GENERIC_PROBES) + _live_forgotten_generic_probes()
             >= _MAX_GENERIC_PROBES
@@ -949,11 +1015,13 @@ def _probe_root_generic(root, timeout):
                 with _GENERIC_PROBE_LOCK:
                     if _GENERIC_PROBES.get(root) is thread:
                         del _GENERIC_PROBES[root]
+                        _GENERIC_PROBE_EPOCHS.pop(root, None)
 
         thread = threading.Thread(
             target=worker, name="vireo-volume-probe", daemon=True,
         )
         _GENERIC_PROBES[root] = thread
+        _GENERIC_PROBE_EPOCHS[root] = current_invalidation_epoch()
         thread.start()
     thread.join(timeout)
     if thread.is_alive():
@@ -991,17 +1059,18 @@ def _forget_wedged_probes():
     cannot free a slot twice, and the still-running probes move to the
     forgotten sets so they keep counting against the global caps.
     """
+    # Bump first: a probe that is running right now and crosses its timeout
+    # a moment after the sweep below registers itself with the *old* epoch,
+    # so the reservation path evicts it instead of failing closed on it.
+    _bump_invalidation_epoch()
     with _NETWORK_PROBE_CONDITION:
         for root in list(_ABANDONED_NETWORK_PROBES):
-            process = _NETWORK_PROBES.pop(root, None)
-            _ABANDONED_NETWORK_PROBES.discard(root)
-            if process is not None and process is not _NETWORK_PROBE_RESERVED:
-                _FORGOTTEN_NETWORK_PROBES.add(process)
-        _NETWORK_PROBE_CONDITION.notify_all()
+            _forget_network_probe_locked(root)
     with _GENERIC_PROBE_LOCK:
         for root, thread in list(_GENERIC_PROBES.items()):
             if thread.is_alive():
                 del _GENERIC_PROBES[root]
+                _GENERIC_PROBE_EPOCHS.pop(root, None)
                 _FORGOTTEN_GENERIC_PROBES.add(thread)
 
 

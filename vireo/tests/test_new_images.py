@@ -2006,3 +2006,46 @@ def test_walk_quotes_the_reachability_generation_it_started_under(
         reachability_generation=gate.current_generation(),
     ) is None
     assert gate.marked_generations == [7]
+
+
+def test_a_walk_that_stalls_during_the_recheck_does_not_block_it(
+    tmp_path, monkeypatch,
+):
+    """The window a one-shot sweep cannot close: a walk already hung when the
+    user clicks, whose watchdog fires just after ``forget_stalled_walks``. It
+    dates from before the remount, so the fresh walk must retire it rather
+    than report the root offline on its behalf."""
+    import threading
+
+    import new_images as new_images_module
+
+    root_path = str(tmp_path / "share")
+    os.makedirs(root_path)
+    gate = _FakeReachability()
+    monkeypatch.setattr(new_images_module, "_STALLED_WALKS", {})
+    monkeypatch.setattr(new_images_module, "_STALLED_WALK_PATHS", set())
+    monkeypatch.setattr(new_images_module, "_STALLED_WALK_EPOCHS", {})
+    monkeypatch.setattr(new_images_module, "_FORGOTTEN_STALLED_WALKS", set())
+
+    release = threading.Event()
+    wedged = threading.Thread(target=lambda: release.wait(10), daemon=True)
+    wedged.start()
+    epoch_at_walk_start = new_images_module._current_walk_epoch()
+
+    try:
+        # The recheck lands while the old walk is hung but not yet stalled...
+        new_images_module.forget_stalled_walks()
+        # ...and only then does its watchdog register the root.
+        new_images_module._STALLED_WALKS[root_path] = wedged
+        new_images_module._STALLED_WALK_PATHS.add(root_path)
+        new_images_module._STALLED_WALK_EPOCHS[root_path] = epoch_at_walk_start
+
+        assert new_images_module._walk_root_bounded(
+            {"id": 1, "path": root_path}, root_path, gate.mount_root,
+            set(), set(), gate, 0, 0, None, 250, 0, 2,
+        ) == ([], 0, 0)
+        assert gate.marked_offline == []
+        assert wedged in new_images_module._FORGOTTEN_STALLED_WALKS
+    finally:
+        release.set()
+        wedged.join(5)

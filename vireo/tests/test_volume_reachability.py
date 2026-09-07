@@ -1168,3 +1168,62 @@ def test_mark_offline_from_a_walk_that_predates_clear_is_dropped():
     gate.clear()
     gate.mark_offline("/Volumes/NAS")
     assert gate._verdicts["/Volumes/NAS"][0] is False
+
+
+def test_a_probe_that_times_out_during_invalidation_does_not_block_the_recheck(
+    monkeypatch,
+):
+    """The window a one-shot sweep cannot close: a probe still inside its
+    timeout when the recheck lands, abandoning itself immediately after. It
+    dates from before the remount, so it must not answer for the volume."""
+    root = "/Volumes/LateNAS"
+    process = _WedgedProcess()
+    monkeypatch.setattr(vr, "_system_mount_roots", lambda **kwargs: set())
+    epoch_at_probe_start = vr.current_invalidation_epoch()
+    try:
+        # The recheck runs while the probe is still in flight...
+        vr.invalidate_caches()
+        # ...and only then does the probe give up and register its root.
+        with vr._NETWORK_PROBE_CONDITION:
+            vr._NETWORK_PROBES[root] = process
+        vr._abandon_network_probe(root, process, epoch_at_probe_start)
+
+        assert vr._reserve_network_probe(root) is True
+        assert process in vr._FORGOTTEN_NETWORK_PROBES
+    finally:
+        vr._release_network_probe(root, vr._NETWORK_PROBE_RESERVED)
+        process.released.set()
+        with vr._NETWORK_PROBE_CONDITION:
+            vr._NETWORK_PROBES.pop(root, None)
+            vr._ABANDONED_NETWORK_PROBES.discard(root)
+            vr._ABANDONED_PROBE_EPOCHS.pop(root, None)
+            vr._FORGOTTEN_NETWORK_PROBES.discard(process)
+
+
+def test_a_generic_probe_started_before_the_recheck_does_not_block_it(monkeypatch):
+    """Same window on the thread probe: one that was already running when the
+    recheck landed cannot stand in for a look at the volume now."""
+    import threading
+
+    root = "/mnt/late"
+    release = threading.Event()
+    stuck = threading.Thread(target=lambda: release.wait(10), daemon=True)
+    stuck.start()
+    monkeypatch.setattr(vr, "_system_mount_roots", lambda **kwargs: set())
+    monkeypatch.setattr(vr, "_classify_generic_root", lambda r: True)
+    try:
+        with vr._GENERIC_PROBE_LOCK:
+            vr._GENERIC_PROBES[root] = stuck
+            vr._GENERIC_PROBE_EPOCHS[root] = vr.current_invalidation_epoch()
+        assert vr._probe_root_generic(root, 0.5) is False
+
+        vr.invalidate_caches()
+
+        assert vr._probe_root_generic(root, 2) is True
+    finally:
+        release.set()
+        stuck.join(5)
+        with vr._GENERIC_PROBE_LOCK:
+            vr._GENERIC_PROBES.pop(root, None)
+            vr._GENERIC_PROBE_EPOCHS.pop(root, None)
+            vr._FORGOTTEN_GENERIC_PROBES.discard(stuck)

@@ -83,10 +83,15 @@ def parameter_trials(space, method, budget, seed):
 
 def tune(output, manifest, *, algorithm="sequence", space=None, method="random", trials=12,
          seconds=300, min_coverage=0.5, max_encounters_per_1000=1000):
-    if algorithm == "production" and space is None:
-        space = {"species_hard_cut_confidence": [0.5, 0.65, 0.8], "species_hard_cut_margin": [0.2, 0.4, 0.6],
-                 "hard_cut_score": [0.35, 0.42, 0.5], "merge_score": [0.55, 0.62, 0.7]}
-    candidates = parameter_trials(space or SEARCH_SPACE, method, trials, manifest["seed"])
+    if space is None:
+        if algorithm == "production":
+            space = {"species_hard_cut_confidence": [0.5, 0.65, 0.8], "species_hard_cut_margin": [0.2, 0.4, 0.6],
+                     "hard_cut_score": [0.35, 0.42, 0.5], "merge_score": [0.55, 0.62, 0.7]}
+        elif algorithm == "independent":
+            space = {key: SEARCH_SPACE[key] for key in ("confidence", "margin")}
+        else:
+            space = SEARCH_SPACE
+    candidates = parameter_trials(space, method, trials, manifest["seed"])
     available = {s["partition"] for s in manifest["sessions"]}
     if not {"train", "development"} <= available:
         raise ValueError("Tuning needs labeled sessions in both train and development; include more sessions")
@@ -112,7 +117,7 @@ def tune(output, manifest, *, algorithm="sequence", space=None, method="random",
     valid = [r for r in finalists if r["metrics"]["review_coverage"] >= min_coverage
              and r["metrics"]["encounters_per_1000_photos"] <= max_encounters_per_1000]
     winner = min(valid, key=lambda r: (r["metrics"]["objective"], r["id"])) if valid else None
-    result = {"mode": "tune", "algorithm": algorithm, "search_space": space or SEARCH_SPACE,
+    result = {"mode": "tune", "algorithm": algorithm, "search_space": space,
               "method": method, "trial_budget": trials, "seconds_budget": seconds,
               "elapsed_seconds": time.monotonic() - started, "completed_trials": len(completed),
               "min_coverage": min_coverage, "max_encounters_per_1000": max_encounters_per_1000,

@@ -352,3 +352,16 @@ def test_keyword_alias_cannot_resolve_untrusted_prediction_name(library, tmp_pat
     for algorithm in ("production", "sequence"):
         result = evaluate(output, manifest, algorithm, {}, "all")
         assert result["metrics"]["positive_recall"] == 0
+
+
+def test_independent_tuning_only_searches_effective_default_parameters(library, tmp_path):
+    output = tmp_path / "run"
+    manifest = prepare(library, output)
+    entry = manifest["sessions"][0]
+    manifest["sessions"] = [{**entry, "partition": partition} for partition in ("train", "development")]
+    result, evaluations = tune(output, manifest, algorithm="independent", trials=50, seconds=60, min_coverage=0)
+    trained = [r for r in evaluations if r["algorithm"] == "independent" and r["partition"] == "train"]
+    assert result["completed_trials"] == len(trained) == 12
+    assert set(result["search_space"]) == {"confidence", "margin"}
+    assert all(set(r["params"]) == {"confidence", "margin"} for r in trained)
+    assert len({(r["params"]["confidence"], r["params"]["margin"]) for r in trained}) == 12

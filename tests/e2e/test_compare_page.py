@@ -574,6 +574,78 @@ def test_compare_full_load_lands_on_the_collection_when_nothing_needs_review(
     expect(page.locator("#filterRow .active")).to_contain_text("All")
 
 
+def test_compare_initial_filter_ignores_an_unavailable_model_assessment(
+    live_server, page
+):
+    """A collection switch that drops the selected model must not let the
+    dropped model's empty queue decide the filter. The response was assessed
+    under a model this collection does not carry, so its ``needs_review: 0``
+    says nothing about the collection; the corrected re-query the reset starts
+    is the one entitled to fall back to All.
+    """
+    page.goto(f"{live_server['url']}/compare")
+    page.wait_for_function("() => window.compareData !== null")
+
+    result = page.evaluate(
+        """async () => {
+          // Select a model the next response will not list, the way a
+          // collection switch leaves a stale specific model selected.
+          var modelA = document.getElementById('modelA');
+          modelA.innerHTML += '<option value="Ghost-Model">Ghost-Model</option>';
+          modelA.value = 'Ghost-Model';
+
+          var models = (compareData.models || []).filter(function(name) {
+            return name !== 'Ghost-Model';
+          });
+          var stale = JSON.parse(JSON.stringify(compareData));
+          stale.models = models;
+          stale.visible_models = ['Ghost-Model'];
+          stale.summary.needs_review = 0;
+          stale.photos = [];
+          stale.total = 0;
+          var corrected = JSON.parse(JSON.stringify(compareData));
+          corrected.models = models;
+          corrected.visible_models = models;
+          corrected.summary.needs_review = 3;
+
+          var originalFetch = jsonFetch;
+          var calls = [];
+          jsonFetch = async function(url) {
+            calls.push(url);
+            return calls.length === 1 ? stale : corrected;
+          };
+          activeFilter = 'needs_review';
+          try {
+            await fetchRows({initial: true, page: 1});
+            // The corrected re-query is started from the response handler and
+            // not awaited, so let it settle before reading the outcome.
+            for (var i = 0; i < 50 && calls.length < 2; i++) {
+              await new Promise(function(resolve) { setTimeout(resolve, 0); });
+            }
+            await new Promise(function(resolve) { setTimeout(resolve, 20); });
+            return {
+              filter: activeFilter,
+              calls: calls.length,
+              needsReview: (compareData.summary || {}).needs_review,
+              selectedModel: document.getElementById('modelA').value,
+            };
+          } finally {
+            jsonFetch = originalFetch;
+          }
+        }"""
+    )
+
+    # Two requests: the stale one and its correction. A third would mean the
+    # stale assessment had already switched the filter to All.
+    assert result == {
+        "filter": "needs_review",
+        "calls": 2,
+        "needsReview": 3,
+        "selectedModel": "all",
+    }
+    expect(page.locator("#filterRow .active")).to_contain_text("Needs review")
+
+
 def test_compare_pages_the_queue_instead_of_rendering_the_collection(
     live_server, page
 ):

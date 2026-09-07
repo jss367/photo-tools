@@ -15880,13 +15880,27 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             # collection, workspace, shown models or the conflict threshold —
             # so it has to be derived again.
             snapshot = None
+        # A grouped decision can pull in a sibling carrying a model nothing in
+        # the snapshot had. The rows, the columns and every count in there
+        # were derived without it, so the snapshot is spent: serving from it
+        # would put a column on the page whose numbers never considered the
+        # model naming it. Derive the comparison again now, on this request.
+        # That makes one decision click pay for a full rebuild, which on a
+        # catalog-sized collection is seconds — but it takes a sibling
+        # carrying a model no other photo in the collection has, and the
+        # alternative is answering with numbers we know are wrong.
+        if (
+            snapshot is not None
+            and refresh_ids
+            and snapshot.patch(db, refresh_ids)
+        ):
+            store.discard(snapshot.token)
+            snapshot = None
         if snapshot is None:
             snapshot = store.put(id_conflicts.build_snapshot(
                 db, collection_id, workspace_id,
                 models=requested_models, min_confidence=min_confidence,
             ))
-        elif refresh_ids:
-            snapshot.patch(db, refresh_ids)
 
         per_page = request.args.get("per_page", 60, type=int) or 60
         per_page = min(_COMPARE_MAX_PER_PAGE, max(1, per_page))

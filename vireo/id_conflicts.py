@@ -1240,6 +1240,11 @@ class Snapshot:
         them is appended, so a decision that pulls a grouped photo into
         the collection is reflected in the same request rather than waiting
         for a full reload.
+
+        Returns True when one of those siblings carried a model the snapshot
+        had never seen. Everything here was derived under the old inventory,
+        so that answer is the one thing a patch cannot repair in place: the
+        caller has to throw the snapshot away and derive a new one.
         """
         # Two decisions can land at once. Serialize the rebuilds so the
         # second reads the list the first produced rather than overwriting it
@@ -1249,7 +1254,7 @@ class Snapshot:
         with self._lock:
             wanted = list(dict.fromkeys(photo_ids))
             if not wanted:
-                return
+                return False
             built = build_comparison(db, self.collection_id, photo_ids=wanted)
             rebuilt = {}
             for photo in built["photos"]:
@@ -1275,16 +1280,14 @@ class Snapshot:
             self.by_id = {
                 record.photo_id: index for index, record in enumerate(records)
             }
-            # A sibling can also carry a model no photo in the snapshot had,
-            # and the columns, agreement and filter counts were all derived
-            # without it. Widening the known inventory is enough to correct
-            # that: a page comparing every model sends no model at all, so
-            # the next request resolves to this longer list, fails the
-            # snapshot's ``matches`` check and derives the comparison again
-            # under the full set. A page pinned to a specific model keeps
-            # sending that model and is rightly left alone.
-            if not set(built["models"]).issubset(self.all_models):
-                self.all_models = sorted(set(self.all_models) | set(built["models"]))
+            # A sibling can also carry a model no photo in the snapshot had.
+            # Every status, every agreement reading and every filter count in
+            # here was derived without that model, so the snapshot can no
+            # longer answer for the collection it now describes. Say so and
+            # let the caller replace it; quietly widening the inventory would
+            # only let the page draw a column whose numbers came from an
+            # assessment that never looked at it.
+            return not set(built["models"]).issubset(self.all_models)
 
 
 class SnapshotStore:

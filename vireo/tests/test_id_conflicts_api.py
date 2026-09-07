@@ -271,8 +271,10 @@ def test_unknown_filter_and_sort_fall_back_instead_of_failing(compare_collection
 def test_a_joining_sibling_that_carries_a_new_model_reassesses(app_and_db):
     """A sibling pulled into the collection by a grouped decision can carry a
     model no photo in the snapshot had. Its column, its agreement and its
-    filter counts were all derived without it, so the snapshot has to be
-    derived again rather than keep answering from a stale model inventory."""
+    filter counts were all derived without it, so the refresh that pulls the
+    sibling in has to derive the comparison again and answer from that —
+    advertising the model while serving counts that ignored it would put a
+    column on the page whose numbers are simply wrong."""
     app, db = app_and_db
     photo_ids = [
         row["id"] for row in
@@ -306,20 +308,72 @@ def test_a_joining_sibling_that_carries_a_new_model_reassesses(app_and_db):
         f"&token={first['token']}"
         f"&refresh_photo_id={photo_ids[2]}"
     ).get_json()
+    # The refresh itself carries the new derivation: a fresh token, the wider
+    # inventory, and every model in that inventory actually shown.
+    assert refreshed["token"] != first["token"]
     assert refreshed["models"] == ["model-a", "model-z"]
+    assert refreshed["visible_models"] == ["model-a", "model-z"]
 
-    # The page compares every model, so it sends no model at all. That now
-    # resolves to a longer list than the snapshot was derived under, which is
-    # what forces the fresh derivation.
-    corrected = _get(app, cid, filter="all", token=first["token"])
-    assert corrected["token"] != first["token"]
-    assert corrected["models"] == ["model-a", "model-z"]
-    assert corrected["visible_models"] == ["model-a", "model-z"]
+    # And the counts beside the rows were derived under that inventory: the
+    # two photos that only ever ran through model-a are now missing one of
+    # the shown models, which the pre-widening assessment could not see.
+    assert refreshed["filter_counts"]["missing_visible_model"] == 2
+    by_id = {photo["photo_id"]: photo for photo in refreshed["photos"]}
+    assert by_id[photo_ids[0]]["signal"]["missing_visible_model_count"] == 1
+    assert by_id[photo_ids[2]]["signal"]["missing_visible_model_count"] == 0
+
+    # The token the client was handed is the one it can come back with.
+    again = _get(app, cid, filter="all", token=refreshed["token"])
+    assert again["token"] == refreshed["token"]
+    assert again["models"] == ["model-a", "model-z"]
 
 
-def test_a_pinned_model_survives_a_sibling_that_widens_the_inventory(app_and_db):
-    """The page pinned to one model keeps asking for that model, so widening
-    the known inventory must not throw its snapshot away underneath it."""
+def test_a_widening_refresh_shows_every_model_it_advertises(app_and_db):
+    """The invariant behind the rebuild: whatever set of models a response
+    names, that is the set its rows and its counts were assessed under. A
+    response that lists a model the page will draw a column for, but whose
+    assessment never looked at it, is lying about every number on screen."""
+    app, db = app_and_db
+    photo_ids = [
+        row["id"] for row in
+        db.conn.execute("SELECT id FROM photos ORDER BY id").fetchall()
+    ]
+    bird = db.add_keyword("Bird", is_species=True)
+    db.tag_photo(photo_ids[0], bird)
+    for photo_id in photo_ids:
+        det_ids = db.save_detections(photo_id, [{
+            "box": {"x": 0.1, "y": 0.1, "w": 0.3, "h": 0.3},
+            "confidence": 0.9,
+            "category": "animal",
+        }], detector_model="MDV6")
+        db.add_prediction(det_ids[0], "Bird", 0.9, "model-a")
+        if photo_id == photo_ids[1]:
+            db.add_prediction(det_ids[0], "Sparrow", 0.7, "model-z")
+    cid = db.add_collection(
+        "Birds",
+        json.dumps([{"field": "keyword", "op": "equals", "value": "Bird"}]),
+    )
+
+    first = _get(app, cid, filter="all")
+    db.tag_photo(photo_ids[1], bird)
+    refreshed = app.test_client().get(
+        f"/api/predictions/compare?collection_id={cid}&filter=all"
+        f"&token={first['token']}&refresh_photo_id={photo_ids[1]}"
+    ).get_json()
+
+    # An all-models page draws a column per entry in ``models``, so that list
+    # and the list the rows were assessed under have to be the same list.
+    assert refreshed["visible_models"] == refreshed["models"]
+    for photo in refreshed["photos"]:
+        shown = set(refreshed["models"])
+        ran = set(photo.get("predictions") or {})
+        assert photo["signal"]["missing_visible_model_count"] == len(shown - ran)
+
+
+def test_a_pinned_model_page_is_rebuilt_but_stays_pinned(app_and_db):
+    """The page pinned to one model was assessed correctly either way, but it
+    still gets the fresh derivation: its model selector has to offer the model
+    that just appeared, and one code path is easier to trust than two."""
     app, db = app_and_db
     photo_ids = [
         row["id"] for row in
@@ -342,14 +396,22 @@ def test_a_pinned_model_survives_a_sibling_that_widens_the_inventory(app_and_db)
     )
 
     first = _get(app, cid, filter="all", model="model-a")
+    assert first["models"] == ["model-a"]
 
     db.tag_photo(photo_ids[1], bird)
-    app.test_client().get(
+    refreshed = app.test_client().get(
         f"/api/predictions/compare?collection_id={cid}&filter=all"
         f"&model=model-a&token={first['token']}"
         f"&refresh_photo_id={photo_ids[1]}"
-    )
+    ).get_json()
 
-    still = _get(app, cid, filter="all", model="model-a", token=first["token"])
-    assert still["token"] == first["token"]
+    # Rebuilt, so the selector can offer model-z — but still pinned, so the
+    # rows and counts are the ones the user asked to see.
+    assert refreshed["token"] != first["token"]
+    assert refreshed["models"] == ["model-a", "model-z"]
+    assert refreshed["visible_models"] == ["model-a"]
+
+    still = _get(app, cid, filter="all", model="model-a",
+                 token=refreshed["token"])
+    assert still["token"] == refreshed["token"]
     assert still["visible_models"] == ["model-a"]

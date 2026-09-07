@@ -152,14 +152,30 @@ def run_algorithm(name, photos, params=None, grouping_config=None):
     if name == "production":
         from encounters import DEFAULTS as PRODUCTION_DEFAULTS
         from encounters import segment_encounters
+        from species_identity import species_entry_key
         if set(params) - set(PRODUCTION_DEFAULTS):
             raise ValueError("Unknown production grouping parameter")
         groups = []
         for encounter in segment_encounters(photos, config={**(grouping_config or {}), **params}):
             species = encounter["species"][0]
-            keys = {p.get("species_keys", {}).get(species) for p in encounter["photos"]}
-            keys.discard(None)
-            key = sorted(keys)[0] if keys else "name:" + normalize(species)
+            # Recover the winning taxon by identity, not by display name: the
+            # confidence-weighted vote in encounter_species_label already picks
+            # a specific source identity, so collapsing here on a shared display
+            # name could score the encounter as the wrong taxon.
+            weights = defaultdict(float)
+            key_by_identity = {}
+            for encounter_photo in encounter["photos"]:
+                for entry in (encounter_photo.get("species_top5") or []):
+                    identity = species_entry_key(entry)
+                    weights[identity] += entry[1]
+                    lookup = encounter_photo.get("species_keys", {}).get(identity)
+                    if lookup is not None:
+                        key_by_identity[identity] = lookup
+            if species and weights:
+                winner = max(weights, key=weights.get)
+                key = key_by_identity.get(winner) or ("name:" + normalize(species))
+            else:
+                key = "name:" + normalize(species) if species else None
             groups.append(Group(tuple(p["id"] for p in encounter["photos"]),
                                 (key,) if species else None, "Current production grouping and species label"))
     elif name in {"independent", "sequence"}:

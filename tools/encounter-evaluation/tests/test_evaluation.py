@@ -147,7 +147,7 @@ def test_source_taxon_ids_preserve_distinct_species_with_the_same_name(library, 
     bundle = read_bundle(output, manifest["sessions"][0])
     for photo, expected in zip(bundle["photos"][:2], ("inat:101", "inat:102"), strict=True):
         assert bundle["answers"][str(photo["id"])]["taxa"] == [expected]
-        assert photo["species_keys"][photo["species_top5"][0][0]] == expected
+        assert photo["species_keys"][photo["species_top5"][0][3]] == expected
         assert photo["evidence"][0]["sources"][0]["predictions"][0]["taxon"] == expected
 
 
@@ -194,6 +194,17 @@ def test_search_is_deterministic_and_bounded():
     assert parameter_trials(space, "random", 3, 42) == parameter_trials(space, "random", 3, 42)
     assert len(parameter_trials(space, "grid", 100, 42)) == 6
     assert len({digest(t) for t in parameter_trials(space, "random", 100, 42)}) == 6
+
+
+def test_production_adapter_baseline_prefers_winning_identity_over_shared_display_name():
+    top5 = [("Shared", .9, "m1", "inat:200"), ("Shared", .2, "m1", "inat:201")]
+    photos = [{"id": i, "folder_id": 1, "filename": f"{i:03}.jpg",
+               "timestamp": (datetime(2026, 1, 1) + timedelta(seconds=i / 10)).isoformat(),
+               "evidence": [], "species_top5": top5,
+               "species_keys": {"inat:200": "inat:200", "inat:201": "inat:201"}}
+              for i in range(3)]
+    groups = run_algorithm("production", photos)
+    assert [g.roster for g in groups] == [("inat:200",)]
 
 
 def test_production_adapter_uses_actual_loader_and_grouping(library, tmp_path):

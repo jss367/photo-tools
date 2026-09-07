@@ -315,6 +315,9 @@ def prepare(db_path, output, *, workspace=None, seed=42, max_sessions=None,
                 photo["timestamp"] = timestamp(photo["timestamp"]).isoformat() if timestamp(photo["timestamp"]) else None
                 photo["evidence"] = raw.get(pid, [])
                 # A static taxonomy lookup is independent of per-photo answers.
+                # Key by the identity production distinguishes (source taxon id
+                # first, display name only when no identity is carried), so two
+                # source taxa that share a display name each keep their own key.
                 photo["species_keys"] = {}
                 for entry in photo["species_top5"]:
                     identity = entry[3] if len(entry) > 3 else None
@@ -324,7 +327,7 @@ def prepare(db_path, output, *, workspace=None, seed=42, max_sessions=None,
                         key = taxonomy.key(identity.removeprefix("scientific:"))
                     else:
                         key = taxonomy.key(entry[0])
-                    photo["species_keys"][entry[0]] = key
+                    photo["species_keys"][identity or entry[0]] = key
                 meta = metadata[pid]
                 presentation[str(pid)] = {"filename": meta["filename"], "folder": meta["folder_path"],
                                            "thumbnail": meta["thumb_path"], "file_hash": meta["file_hash"]}

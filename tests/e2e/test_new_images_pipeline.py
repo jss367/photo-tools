@@ -369,3 +369,53 @@ def test_offline_banner_offers_a_manual_recheck(fresh_server, page, monkeypatch)
     expect(msg).to_contain_text("1 new image", timeout=15000)
     expect(recheck).to_be_hidden()
     expect(page.locator("#newImagesCheckedAt")).to_have_text("")
+
+
+def test_check_again_is_not_swallowed_by_an_in_flight_poll(fresh_server, page, monkeypatch):
+    """Clicking "Check again" while the 60s poll is mid-request must still
+    produce a post-invalidation walk. The in-flight poll was issued before
+    the recheck cleared the caches, so its answer predates the click; without
+    a queued re-poll the banner would sit on the stale offline notice until
+    the next 60s tick."""
+    import volume_reachability
+
+    url = fresh_server["url"]
+    photo_dir = fresh_server["photo_dir"]
+    _write_jpeg(photo_dir / "IMG_0006.JPG")
+    gate = _RemountableGate(photo_dir)
+    monkeypatch.setattr(volume_reachability, "get_shared", lambda: gate)
+    _clear_new_images_cache()
+
+    page.goto(f"{url}/browse")
+    msg = page.locator("#newImagesMsg")
+    expect(msg).to_contain_text("Couldn't check for new images", timeout=5000)
+
+    # Hold the *response* of the next navbar poll: the request goes out (and
+    # is answered with the offline state) but the client does not see it
+    # until the test releases it.
+    page.evaluate("""() => {
+      const realFetch = window.fetch;
+      window.__hold = true;
+      window.__release = null;
+      window.fetch = (u, o) => {
+        const pending = realFetch(u, o);
+        if (window.__hold && String(u).includes('new-images')
+            && !String(u).includes('recheck')) {
+          return new Promise(resolve => {
+            window.__release = () => { window.__hold = false; resolve(pending); };
+          });
+        }
+        return pending;
+      };
+    }""")
+    page.evaluate("void checkNewImages()")
+    page.wait_for_function("() => window.__release !== null", timeout=5000)
+
+    gate.online = True
+    page.locator("#newImagesRecheck").click()
+    # The recheck landed while the poll above was still open, so the button
+    # stays busy rather than being released by the stale answer.
+    expect(page.locator("#newImagesRecheck")).to_be_disabled()
+
+    page.evaluate("window.__release()")
+    expect(msg).to_contain_text("1 new image", timeout=15000)

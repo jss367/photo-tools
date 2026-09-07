@@ -13426,9 +13426,18 @@ function _isNewImagesDismissed(wsId, newCount, offlineRoots) {
 // start-of-call clearTimeout only catches the most recent handle.
 let _newImagesPendingTimer = null;
 let _newImagesInFlight = false;
+// Set when a *forced* check — the manual recheck — is dropped by the
+// in-flight guard. That poll was issued before the recheck cleared the
+// caches, so its answer predates the request and the client would otherwise
+// render the pre-recheck state and wait out the full 60s interval before
+// walking again. Run one more check the moment it lands instead.
+let _newImagesForcedRerun = false;
 
-async function checkNewImages() {
-  if (_newImagesInFlight) return;
+async function checkNewImages(options) {
+  if (_newImagesInFlight) {
+    if (options && options.force) _newImagesForcedRerun = true;
+    return;
+  }
   if (_newImagesPendingTimer !== null) {
     clearTimeout(_newImagesPendingTimer);
     _newImagesPendingTimer = null;
@@ -13451,7 +13460,7 @@ async function checkNewImages() {
     if (data && data.error) {
       const banner = document.getElementById('newImagesBanner');
       if (banner) banner.style.display = 'none';
-      _setNewImagesRecheckBusy(false);
+      if (!_newImagesForcedRerun) _setNewImagesRecheckBusy(false);
       return;
     }
     const banner = document.getElementById('newImagesBanner');
@@ -13511,10 +13520,23 @@ async function checkNewImages() {
       banner.style.display = 'none';
     }
     // A payload we could render is a finished answer, so the manual
-    // "Check again" is done regardless of which branch above ran.
-    _setNewImagesRecheckBusy(false);
+    // "Check again" is done regardless of which branch above ran — unless a
+    // forced re-poll is queued behind this one, in which case this payload
+    // predates the recheck and the button is still working.
+    if (!_newImagesForcedRerun) _setNewImagesRecheckBusy(false);
   } catch (e) { /* ignore */ }
-  finally { _newImagesInFlight = false; }
+  finally {
+    _newImagesInFlight = false;
+    if (_newImagesForcedRerun) {
+      _newImagesForcedRerun = false;
+      // Supersedes any pending-retry timer this call just scheduled: the
+      // queued check is the one that observes post-invalidation state.
+      if (_newImagesPendingTimer !== null) clearTimeout(_newImagesPendingTimer);
+      _newImagesPendingTimer = setTimeout(
+        () => checkNewImages({force: true}), 0,
+      );
+    }
+  }
 }
 
 // Beyond this many folders the list is summarized; the full set is always
@@ -13603,7 +13625,7 @@ async function recheckNewImages() {
   try {
     await fetch('/api/workspaces/active/new-images/recheck', {method: 'POST'});
   } catch (e) { /* the poll below reports whatever the real state is */ }
-  await checkNewImages();
+  await checkNewImages({force: true});
 }
 
 function _offlineRootsKey(roots) {

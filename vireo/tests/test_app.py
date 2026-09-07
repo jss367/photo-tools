@@ -1,6 +1,7 @@
 import contextlib
 import json
 import os
+import re
 from pathlib import Path
 
 import pytest
@@ -16881,6 +16882,54 @@ def test_browse_filter_by_collection_guards_degraded_rows():
     assert guard_end != -1 and fetch_start != -1 and guard_end < fetch_start, (
         "browse.html filterByCollection does not early-return before loading"
     )
+
+
+def test_browse_collection_editor_knows_species_count():
+    """The saved-collection editor ("Edit Rules") has its own hardcoded
+    field maps, separate from the registry-driven filter bar. A field the
+    filter bar can save but the editor doesn't know renders as a wrong
+    field name with an empty operator dropdown — the user can't see or
+    change the rule they saved. ``species_count`` must appear in all three
+    maps (label, ops, numeric handling), and every op the editor offers
+    must be one the backend actually compiles.
+
+    Regression for Codex P2 on PR #1614.
+    """
+    from filter_fields import FILTER_FIELDS
+    text = (Path(__file__).parent.parent / "templates" / "browse.html").read_text(
+        encoding="utf-8")
+
+    labels_start = text.find("var FIELD_LABELS = {")
+    labels = text[labels_start:text.find("};", labels_start)]
+    assert "species_count: 'Species Count'" in labels, (
+        "browse.html FIELD_LABELS omits species_count — the editor's field "
+        "dropdown would show the wrong field for a saved rule"
+    )
+
+    ops_start = text.find("var FIELD_OPS = {")
+    ops_block = text[ops_start:text.find("};", ops_start)]
+    ops_line = next(
+        (ln for ln in ops_block.splitlines() if ln.strip().startswith("species_count:")),
+        None,
+    )
+    assert ops_line, "browse.html FIELD_OPS omits species_count"
+    editor_ops = re.findall(r"'([^']+)'", ops_line.split(":", 1)[1])
+    assert ">=" in editor_ops, "the editor must offer the multi-species op"
+    backend_ops = set(FILTER_FIELDS["species_count"]["ops"])
+    assert set(editor_ops) <= backend_ops, (
+        f"editor offers ops the rule engine rejects: "
+        f"{sorted(set(editor_ops) - backend_ops)}"
+    )
+
+    numeric_start = text.find("var NUMERIC_RULE_FIELDS = [")
+    numeric = text[numeric_start:text.find("];", numeric_start)]
+    assert "'species_count'" in numeric, (
+        "species_count must get the number input, 0 default, and parseFloat "
+        "coercion the other count/score fields get"
+    )
+    # The three former copies of that list are what drifted; they must all
+    # read from the shared constant now.
+    assert text.count("NUMERIC_RULE_FIELDS.indexOf") == 3
 
 
 def test_browse_undo_confirmation_uses_success_toast():

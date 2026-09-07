@@ -5791,12 +5791,21 @@ var collectionEditingId = null;
 var collectionExtensions = [];
 var collectionFolders = [];
 
+/* Fields whose rule value is a number: they get a number input, default to
+   0, and are parsed with parseFloat on save. One list rather than three
+   copies — the copies had already drifted, and a field missing from any of
+   them silently degrades to a text input or a NaN value on save. */
+var NUMERIC_RULE_FIELDS = ['rating', 'quality_score', 'sharpness',
+  'subject_sharpness', 'noise_estimate', 'crop_complete',
+  'prediction_confidence', 'species_count'];
+
 /* Valid ops per field — must mirror vireo/db.py::_build_collection_query.
    The UI only shows ops the backend handles; non-matching combos used to
    silently produce zero matches. */
 var FIELD_OPS = {
   all:         ['equals'],
   keyword:     ['is', 'is not', 'contains', 'not_contains'],
+  species_count: ['is', 'is not', '>=', '<='],
   rating:      ['is', 'is not', '>=', '<='],
   flag:        ['is', 'is not'],
   color_label: ['is', 'is not'],
@@ -5825,6 +5834,7 @@ var FIELD_OPS = {
 var FIELD_LABELS = {
   all: 'All Photos',
   keyword: 'Keyword',
+  species_count: 'Species Count',
   rating: 'Rating',
   flag: 'Flag',
   color_label: 'Color Label',
@@ -5869,8 +5879,7 @@ function defaultValueForRule(field, op) {
   if (field === 'color_label') return 'red';
   if (field === 'flag') return 'flagged';
   if (field === 'rating') return 0;
-  if (['quality_score', 'sharpness', 'subject_sharpness', 'noise_estimate',
-       'crop_complete', 'prediction_confidence'].indexOf(field) !== -1) return 0;
+  if (NUMERIC_RULE_FIELDS.indexOf(field) !== -1) return 0;
   if (field === 'extension') return collectionExtensions[0] || '';
   if (field === 'folder') return (collectionFolders[0] && collectionFolders[0].path) || '';
   if (field === 'timestamp') {
@@ -6213,8 +6222,7 @@ function renderRuleValueInput(r, i) {
         '</div>';
     }
   }
-  var numeric = ['rating', 'quality_score', 'sharpness', 'subject_sharpness',
-    'noise_estimate', 'crop_complete', 'prediction_confidence'].indexOf(r.field) !== -1;
+  var numeric = NUMERIC_RULE_FIELDS.indexOf(r.field) !== -1;
   return '<input type="' + (numeric ? 'number' : 'text') + '" value="' +
     escapeAttr(String(r.value == null ? '' : r.value)) +
     '" onchange="updateRule(\'' + p + '\',\'value\',this.value)"' +
@@ -6284,8 +6292,7 @@ function coerceRuleForSave(node) {
     };
   }
   var val = node.value;
-  if (['rating', 'quality_score', 'sharpness', 'subject_sharpness',
-       'noise_estimate', 'crop_complete', 'prediction_confidence'].indexOf(node.field) !== -1) {
+  if (NUMERIC_RULE_FIELDS.indexOf(node.field) !== -1) {
     val = parseFloat(val);
     if (isNaN(val)) val = 0;
   } else if (['has_mask', 'has_jpeg_companion', 'has_gps', 'has_location_keyword',

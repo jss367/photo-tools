@@ -115,7 +115,7 @@ def test_reader_is_read_only_and_hides_labels_before_feature_preparation(library
     assert "confirmed_species" not in bundle["photos"][0]
     assert "flag" not in bundle["photos"][0]
     assert "answers" not in bundle["photos"][0]
-    assert bundle["photos"][0]["evidence"][0]["sources"][0]["predictions"][0]["taxon"] == "inat:101"
+    assert bundle["photos"][0]["evidence"][0]["sources"][0]["predictions"][0]["taxon"] == "name:spotted redshank"
 
 
 def test_new_run_picks_up_label_change_but_retained_inputs_remain_consistent(library, tmp_path):
@@ -329,3 +329,26 @@ def test_raw_predictions_share_production_identity_policy(library, tmp_path, mod
     assert first["evidence"][0]["sources"][0]["predictions"][0]["taxon"] == expected
     entry = first["species_top5"][0]
     assert first["species_keys"][entry[3]] == expected
+
+
+@pytest.mark.parametrize("ambiguous", [False, True])
+def test_keyword_alias_cannot_resolve_untrusted_prediction_name(library, tmp_path, ambiguous):
+    from taxonomy import COMMON_NAME_IDENTITY_VERSION
+
+    if ambiguous:
+        conn = sqlite3.connect(library)
+        conn.execute("INSERT INTO db_meta VALUES('common_name_identity_version', ?)", (str(COMMON_NAME_IDENTITY_VERSION),))
+        conn.execute("INSERT INTO db_meta VALUES('ambiguous_common_names', ?)", (json.dumps(["spotted redshank", "glossy ibis"]),))
+        conn.commit()
+        conn.close()
+    output = tmp_path / "run"
+    manifest = prepare(library, output)
+    bundle = read_bundle(output, manifest["sessions"][0])
+    first = bundle["photos"][0]
+    assert bundle["answers"]["1"]["taxa"] == ["inat:101"]
+    assert first["evidence"][0]["sources"][0]["predictions"][0]["taxon"] == "name:spotted redshank"
+    entry = first["species_top5"][0]
+    assert first["species_keys"][entry[3]] == "name:spotted redshank"
+    for algorithm in ("production", "sequence"):
+        result = evaluate(output, manifest, algorithm, {}, "all")
+        assert result["metrics"]["positive_recall"] == 0

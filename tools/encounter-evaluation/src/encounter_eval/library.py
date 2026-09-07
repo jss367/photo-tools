@@ -48,7 +48,11 @@ class Taxonomy:
             return "inat:" + identity.removeprefix("taxon:")
         if identity and identity.startswith("scientific:"):
             return self.key(identity.removeprefix("scientific:"))
-        return self.key(name)
+        if identity:
+            # Keep unresolved names unresolved: keyword aliases cannot upgrade
+            # the production resolver's deliberately conservative decision.
+            return identity
+        return "name:" + normalize(name)
 
 
 class FeatureReader:

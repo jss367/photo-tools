@@ -10156,7 +10156,7 @@ async function confirmBatchCollection() {
   clearSelection();
 }
 
-function reviewLocationsForCollection(collectionId) {
+function reviewLocationsForCollection(collectionId, mode) {
   // Same guard as filterByCollection: degraded collections would just
   // re-hit the unresolvable rules while building the review queue.
   var collectionMeta = collectionsById[collectionId];
@@ -10172,10 +10172,10 @@ function reviewLocationsForCollection(collectionId) {
   }
   sessionStorage.setItem('vireoLocationReviewReturn', window.location.href);
   sessionStorage.setItem('vireoLocationReviewSource', JSON.stringify({collection_id: collectionId}));
-  window.location.href = '/locations/review?collection_id=' + encodeURIComponent(collectionId);
+  window.location.href = '/locations/review?collection_id=' + encodeURIComponent(collectionId) + (mode === 'time' ? '&mode=time' : '');
 }
 
-function reviewLocationsForSelection() {
+function reviewLocationsForSelection(mode) {
   var ids = getActiveSelection();
   if (!ids.length) return;
   var payload;
@@ -10206,7 +10206,7 @@ function reviewLocationsForSelection() {
     return;
   }
   sessionStorage.setItem('vireoLocationReviewReturn', window.location.href);
-  window.location.href = '/locations/review?source=selection';
+  window.location.href = '/locations/review?source=selection' + (mode === 'time' ? '&mode=time' : '');
 }
 
 var captureTimePreviewSeq = 0;
@@ -12410,6 +12410,8 @@ function buildPhotoContextMenu(photoIds, contextPhotoId) {
       onClick: function() { viewPhotoOnMap(photoIds[0]); } },
     { label: 'Review on Map',
       onClick: function() { reviewLocationsForSelection(); } },
+    { label: 'Add Locations by Capture Time',
+      onClick: function() { reviewLocationsForSelection('time'); } },
     { label: 'Compare', disabled: photoIds.length < 2, disabledHint: 'Select at least two photos',
       onClick: function() { openBrowseCompare(); } },
     { label: 'Best Batch',
@@ -12904,6 +12906,10 @@ document.addEventListener('contextmenu', function(e) {
   if (!isUnavailable) {
     items.push({ label: 'Filter by this Collection',
       onClick: function() { filterByCollection(cid); } });
+    if (!(collectionsById[cid] || {}).has_visual) {
+      items.push({ label: 'Add Locations by Capture Time',
+        onClick: function() { reviewLocationsForCollection(cid, 'time'); } });
+    }
     if (name === 'GPS Without Location Keyword') {
       items.push({
         label: 'Review Photo Locations',

@@ -2007,3 +2007,153 @@ def test_location_review_actions_stay_visible_below_top_banner(live_server, page
     assert positions["reviewTop"] >= positions["bannerBottom"]
     assert positions["actionsBottom"] <= positions["bottomBarTop"]
     expect(page.locator("#locationReviewAssign")).to_be_in_viewport()
+
+
+def test_time_review_assigns_outings_without_inventing_gps(live_server, page):
+    photo_ids = live_server["data"]["photos"]
+    errors = []
+    page.on("pageerror", lambda error: errors.append(str(error)))
+    page.goto(f"{live_server['url']}/locations/review?mode=time")
+    expect(page.locator("#locationReviewCollection")).to_have_value("all")
+    expect(page.locator("#locationReviewGroupTitle")).to_have_text("3 photos")
+    expect(page.locator("#locationReviewThumbnails [data-photo-id]")).to_have_count(3)
+    expect(page.locator("#locationReviewCaptured")).to_contain_text("2024")
+    page.locator("#locationReviewSearch").fill("Morning at the park")
+    page.locator("#locationReviewCustom").click()
+    with page.expect_response("**/api/batch/location/text") as saved:
+        page.locator("#locationReviewAssign").click()
+    assert saved.value.ok
+    expect(page.locator("#locationReviewGroupTitle")).to_have_text("2 photos")
+    expect(page.locator(".location-review-candidate", has_text="Morning at the park")).to_be_visible()
+    db = live_server["db"]
+    rows = db.conn.execute(
+        "SELECT pk.photo_id FROM photo_keywords pk JOIN keywords k ON k.id = pk.keyword_id "
+        "WHERE k.name = 'Morning at the park'"
+    ).fetchall()
+    assert {row[0] for row in rows} == set(photo_ids[:3])
+    assert all(row[0] is None and row[1] is None for row in db.conn.execute(
+        "SELECT latitude, longitude FROM photos"
+    ))
+    page.reload()
+    expect(page.locator("#locationReviewGroupTitle")).to_have_text("2 photos")
+    assert errors == []
+
+
+def test_time_review_splits_and_reviews_individual_photos(live_server, page):
+    photo_ids = live_server["data"]["photos"]
+    page.goto(f"{live_server['url']}/locations/review?mode=time")
+    page.locator("#locationReviewShowAll").click()
+    page.locator(f'[data-split-before="{photo_ids[2]}"]').click()
+    expect(page.locator("#locationReviewGroupTitle")).to_have_text("2 photos")
+    expect(page.locator("#locationReviewRemaining")).to_have_text("3 in queue")
+    page.locator(f'[data-review-separately="{photo_ids[1]}"]').click()
+    expect(page.locator("#locationReviewGroupTitle")).to_have_text("1 photo")
+    expect(page.locator("#locationReviewRemaining")).to_have_text("4 in queue")
+    page.locator("#locationReviewSearch").fill("Just this photo")
+    page.locator("#locationReviewCustom").click()
+    with page.expect_response("**/api/batch/location/text") as saved:
+        page.locator("#locationReviewAssign").click()
+    assert saved.value.request.post_data_json["photo_ids"] == [photo_ids[0]]
+    expect(page.locator(f'[data-photo-id="{photo_ids[2]}"]')).to_be_visible()
+    page.locator("#locationReviewNext").click()
+    expect(page.locator("#locationReviewGroupTitle")).to_have_text("2 photos")
+    page.locator("#locationReviewNext").click()
+    expect(page.locator(f'[data-photo-id="{photo_ids[1]}"]')).to_be_visible()
+
+
+def test_time_review_reuses_saved_location_and_preserves_scope(live_server, page):
+    db = live_server["db"]
+    photo_ids = live_server["data"]["photos"]
+    location_id = db.get_or_create_text_location("Lakeside Park")
+    db.conn.execute("UPDATE keywords SET latitude = 42, longitude = -71 WHERE id = ?", (location_id,))
+    db.set_photo_location(photo_ids[3], location_id)
+    collection_id = db.add_collection("Morning outing", json.dumps([
+        {"field": "photo_ids", "value": photo_ids[:3]},
+    ]))
+    page.goto(f"{live_server['url']}/locations/review?collection_id={collection_id}")
+    page.locator("#locationReviewMode").select_option("time")
+    expect(page.locator("#locationReviewGroupTitle")).to_have_text("3 photos")
+    assert parse_qs(urlparse(page.url).query)["collection_id"] == [str(collection_id)]
+    page.locator("#locationReviewSearch").fill("Lakeside")
+    page.locator(".location-review-candidate", has_text="Lakeside Park").click()
+    with page.expect_response("**/api/batch/location") as saved:
+        page.locator("#locationReviewAssign").click()
+    assert saved.value.ok
+    assert saved.value.request.post_data_json == {"photo_ids": photo_ids[:3], "keyword_id": location_id}
+    expect(page.locator("#locationReviewEmptyTitle")).to_have_text("All locations reviewed")
+    assert db.conn.execute("SELECT COUNT(*) FROM photo_keywords WHERE keyword_id = ?", (location_id,)).fetchone()[0] == 4
+
+
+def test_time_review_samples_whole_group_and_locks_edits_during_retry(live_server, page):
+    photos = [{"id": index, "filename": f"photo-{index}.jpg", "companion_path": None,
+               "timestamp": "2026-08-01T10:00:00", "latitude": None, "longitude": None}
+              for index in range(1, 1002)]
+    preview = {"total": 1001, "reviewable": 1001, "skipped": [], "unresolved": [], "groups": [{
+        "id": "time-1", "grouping": "time", "count": 1001,
+        "photo_ids": [photo["id"] for photo in photos], "photos": photos,
+        "center": None, "bounds": None, "spread_m": None,
+        "captured_from": photos[0]["timestamp"], "captured_to": photos[-1]["timestamp"],
+    }]}
+    page.route("**/api/location-review/preview", lambda route: route.fulfill(json=preview))
+    requests = []
+
+    def assign(route):
+        requests.append(route.request.post_data_json)
+        if len(requests) == 2:
+            route.fulfill(status=500, json={"error": "Interrupted assignment"})
+        else:
+            route.fulfill(json={"ok": True})
+
+    page.route("**/api/batch/location/text", assign)
+    page.goto(f"{live_server['url']}/locations/review?mode=time")
+    expect(page.locator("#locationReviewThumbnails [data-photo-id]")).to_have_count(6)
+    expect(page.locator('[data-photo-id="1"]')).to_be_visible()
+    expect(page.locator('[data-photo-id="1001"]')).to_be_visible()
+    page.locator("#locationReviewShowAll").click()
+    expect(page.locator("#locationReviewThumbnails [data-photo-id]")).to_have_count(36)
+    page.locator("#locationReviewPageNext").click()
+    expect(page.locator('[data-photo-id="37"]')).to_be_visible()
+    page.locator("#locationReviewSearch").fill("Large outing")
+    page.locator("#locationReviewCustom").click()
+    page.locator("#locationReviewAssign").click()
+    expect(page.locator("#locationReviewAssign")).to_have_text("Retry 1 remaining")
+    for selector in ["#locationReviewMode", "#locationReviewGap", "#locationReviewCollection",
+                     "#locationReviewSkip", "#locationReviewShowAll", "#locationReviewPagePrevious"]:
+        expect(page.locator(selector)).to_be_disabled()
+    expect(page.locator('[data-split-before="37"]')).to_be_disabled()
+    expect(page.locator('[data-review-separately="37"]')).to_be_disabled()
+    page.locator("#locationReviewAssign").click()
+    expect(page.locator("#locationReviewEmptyTitle")).to_have_text("All locations reviewed")
+    assert [len(request["photo_ids"]) for request in requests] == [1000, 1, 1]
+    assert requests[-1]["photo_ids"] == [1001]
+    assert all("latitude" not in request and "longitude" not in request for request in requests)
+
+
+def test_time_review_does_not_expand_an_expired_selection(live_server, page):
+    page.goto(f"{live_server['url']}/locations/review?mode=time&source=selection")
+    expect(page.locator("#locationReviewEmptyTitle")).to_have_text("Choose a collection")
+    expect(page.locator("#locationReviewCollection")).to_have_value("")
+    expect(page.locator("#locationReviewGroupTitle")).not_to_be_visible()
+    page.locator("#locationReviewGap").select_option("15")
+    expect(page.locator("#locationReviewGap")).to_have_value("60")
+    page.locator("#locationReviewMode").select_option("coordinates")
+    expect(page.locator("#locationReviewMode")).to_have_value("time")
+    expect(page.locator("#locationReviewEmptyTitle")).to_have_text("Choose a collection")
+    assert parse_qs(urlparse(page.url).query) == {"mode": ["time"], "source": ["selection"]}
+    page.locator("#locationReviewCollection").select_option("all")
+    expect(page.locator("#locationReviewGroupTitle")).to_have_text("3 photos")
+
+
+def test_browse_opens_time_review_for_selected_photos(live_server, page):
+    photo_ids = live_server["data"]["photos"][:2]
+    page.goto(f"{live_server['url']}/browse")
+    page.locator(f'.grid-card[data-id="{photo_ids[0]}"]').click()
+    page.locator(f'.grid-card[data-id="{photo_ids[1]}"]').click(modifiers=["Meta"])
+    page.locator(f'.grid-card[data-id="{photo_ids[1]}"]').click(button="right")
+    page.get_by_text("Add Locations by Capture Time", exact=True).click()
+    expect(page.locator("#locationReviewGroupTitle")).to_have_text("2 photos")
+    expect(page.locator("#locationReviewCollection")).to_have_value("__selection__")
+    assert parse_qs(urlparse(page.url).query) == {"source": ["selection"], "mode": ["time"]}
+    page.locator("#locationReviewGap").select_option("15")
+    expect(page.locator("#locationReviewGroupTitle")).to_have_text("2 photos")
+    expect(page.locator("#locationReviewCollection")).to_have_value("__selection__")

@@ -9,7 +9,7 @@ from collections import Counter, defaultdict
 from datetime import UTC, datetime
 from pathlib import Path
 
-from .common import digest, encode, write_json
+from .common import code_identity, configure_repo, digest, encode, write_json
 
 
 def normalize(name):
@@ -211,8 +211,10 @@ def _raw_evidence(conn, taxonomy):
 
 
 def prepare(db_path, output, *, workspace=None, seed=42, max_sessions=None,
-            complete_folders=(), label_source="all", config=None, split_registry=None):
+            complete_folders=(), label_source="all", config=None, split_registry=None, repo=None):
     """Materialize a consistent comparison, then close the live DB before trials."""
+    source_identity = code_identity(configure_repo(repo))
+
     from config import DEFAULTS
     from encounters import DEFAULTS as GROUP_DEFAULTS
     from pipeline import load_photo_features
@@ -352,7 +354,7 @@ def prepare(db_path, output, *, workspace=None, seed=42, max_sessions=None,
                             "digest": digest(bundle), "photo_count": len(photos), "label_count": len(answers)})
             if (i + 1) % 10 == 0:
                 print(f"Prepared {i + 1}/{len(selected)} sessions", flush=True)
-        manifest = {"format_version": 1, "created_at": datetime.now(UTC).isoformat(),
+        manifest = {"format_version": 1, "created_at": datetime.now(UTC).isoformat(), "code": source_identity,
                     "workspace": workspace, "seed": seed, "config": cfg, "grouping_config": grouping,
                     "label_source": label_source, "complete_folders": sorted(complete_folders),
                     "inventory": {**inventory, **dict(counts)}, "sessions": entries,

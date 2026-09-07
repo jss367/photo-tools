@@ -65,7 +65,6 @@ def main(argv=None):
         p.error("tune uses train/development only; --partition and --candidate-file are for compare")
     try:
         repo = configure_repo(args.repo)
-        identity = code_identity(repo)
         if args.command == "inventory":
             conn = open_library(args.db)
             try:
@@ -79,6 +78,7 @@ def main(argv=None):
                 conn.close()
             return 0
         if args.resume:
+            identity = code_identity(repo)
             output = args.resume.expanduser().resolve()
             manifest = json.loads((output / "manifest.json").read_text())
             if any(manifest["code"][k] != identity[k] for k in ("source_digest", "python", "numpy")):
@@ -92,9 +92,7 @@ def main(argv=None):
             print(f"Preparing current library evidence in {output}", flush=True)
             manifest = prepare(args.db, output, workspace=args.workspace, seed=args.seed,
                                max_sessions=args.max_sessions, complete_folders=args.complete_folder,
-                               label_source=args.label_source, config=cfg, split_registry=args.split_registry)
-            manifest["code"] = identity
-            write_json(output / "manifest.json", manifest)
+                               label_source=args.label_source, config=cfg, split_registry=args.split_registry, repo=repo)
         if not manifest["sessions"]:
             raise ValueError("No labeled sessions selected; inspect workspace and label-source coverage")
         if args.command == "compare":

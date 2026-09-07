@@ -5,7 +5,7 @@ from datetime import datetime, timedelta
 import pytest
 
 from encounter_eval.algorithms import run_algorithm
-from encounter_eval.common import Group, code_identity, digest, validate_groups, write_json
+from encounter_eval.common import Group, digest, validate_groups, write_json
 from encounter_eval.library import FeatureReader, open_library, plan_sessions, prepare, read_bundle
 from encounter_eval.runner import evaluate, parameter_trials, tune
 from encounter_eval.scoring import score, summarize
@@ -224,11 +224,8 @@ def test_production_adapter_uses_actual_loader_and_grouping(library, tmp_path):
 
 
 def test_trial_cache_and_tuning_never_score_test_partition(library, tmp_path, monkeypatch):
-    from conftest import REPO
-
     output = tmp_path / "run"
     manifest = prepare(library, output)
-    manifest["code"] = code_identity(REPO)
     entry = manifest["sessions"][0]
     manifest["sessions"] = [{**entry, "partition": "train"}, {**entry, "partition": "development"},
                             {**entry, "partition": "test", "path": "must-not-read.json"}]
@@ -242,8 +239,6 @@ def test_trial_cache_and_tuning_never_score_test_partition(library, tmp_path, mo
 
 
 def test_report_escapes_labels_and_filenames(library, tmp_path):
-    from conftest import REPO
-
     from encounter_eval.report import write_report
 
     conn = sqlite3.connect(library)
@@ -252,7 +247,6 @@ def test_report_escapes_labels_and_filenames(library, tmp_path):
     conn.close()
     output = tmp_path / "run"
     manifest = prepare(library, output)
-    manifest["code"] = code_identity(REPO)
     baseline = evaluate(output, manifest, "production", {}, "all")
     candidate = evaluate(output, manifest, "sequence", {}, "all")
     write_report(output, manifest, [baseline, candidate], candidate=candidate)
@@ -273,3 +267,15 @@ def test_cli_complete_comparison_and_resume(library, tmp_path, capsys):
     write_json(output / "manifest.json", manifest)
     assert main(["compare", "--resume", str(output), "--partition", "all"]) == 2
     assert "Source/environment changed" in capsys.readouterr().err
+
+
+def test_prepared_manifest_can_resume_before_cli_postprocessing(library, tmp_path):
+    from encounter_eval.cli import main
+
+    output = tmp_path / "run"
+    prepared = prepare(library, output)
+    saved = json.loads((output / "manifest.json").read_text())
+    assert saved == prepared
+    assert saved["code"]["source_digest"]
+    assert main(["compare", "--resume", str(output), "--partition", "all"]) == 0
+    assert (output / "report.html").is_file()

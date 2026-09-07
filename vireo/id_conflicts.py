@@ -1229,7 +1229,10 @@ class Snapshot:
 
         A photo whose keywords no longer satisfy the collection's rules is
         dropped, which is how a row leaves the list once it has been dealt
-        with.
+        with. A previously-unindexed sibling whose keywords now do satisfy
+        them is appended, so a decision that pulls a grouped photo into
+        the collection is reflected in the same request rather than waiting
+        for a full reload.
         """
         # Two decisions can land at once. Serialize the rebuilds so the
         # second reads the list the first produced rather than overwriting it
@@ -1237,7 +1240,7 @@ class Snapshot:
         # swap below is a single rebind, so a request either counts the whole
         # old list or the whole new one.
         with self._lock:
-            wanted = [pid for pid in dict.fromkeys(photo_ids) if pid in self.by_id]
+            wanted = list(dict.fromkeys(photo_ids))
             if not wanted:
                 return
             built = build_comparison(db, self.collection_id, photo_ids=wanted)
@@ -1245,11 +1248,22 @@ class Snapshot:
             for photo in built["photos"]:
                 assessment = assess_photo(photo, self.models, self.min_confidence)
                 rebuilt[photo["photo_id"]] = index_record(photo, assessment)
+            wanted_set = set(wanted)
+            previously_indexed = set(self.by_id)
             records = [
                 rebuilt.get(record.photo_id, record)
                 for record in self.records
-                if record.photo_id not in wanted or record.photo_id in rebuilt
+                if record.photo_id not in wanted_set or record.photo_id in rebuilt
             ]
+            # A sibling outside the snapshot can now satisfy a keyword-based
+            # collection rule after a grouped decision. Append the ones the
+            # build returned so the counts, filters and pager pick them up.
+            for pid in wanted:
+                if pid in previously_indexed:
+                    continue
+                record = rebuilt.get(pid)
+                if record is not None:
+                    records.append(record)
             self.records = records
             self.by_id = {
                 record.photo_id: index for index, record in enumerate(records)

@@ -158,6 +158,52 @@ def test_a_decision_updates_the_counts_through_refresh_photo_id(compare_collecti
     ]
 
 
+def test_refresh_photo_id_picks_up_a_sibling_that_just_joined(app_and_db):
+    """A grouped decision can hand ``refresh_photo_id`` a sibling that was
+    outside the snapshot but now satisfies a keyword-based collection rule.
+    The snapshot must rebuild the sibling and append it to the records — it
+    cannot silently discard IDs it did not already index."""
+    app, db = app_and_db
+    photo_ids = [
+        row["id"] for row in
+        db.conn.execute("SELECT id FROM photos ORDER BY id").fetchall()
+    ]
+    bird = db.add_keyword("Bird", is_species=True)
+    db.tag_photo(photo_ids[0], bird)
+    db.tag_photo(photo_ids[1], bird)
+    # Only photos with the "Bird" species keyword satisfy the rule, so the
+    # third photo starts outside the collection until it is tagged too.
+    for photo_id in photo_ids:
+        det_ids = db.save_detections(photo_id, [{
+            "box": {"x": 0.1, "y": 0.1, "w": 0.3, "h": 0.3},
+            "confidence": 0.9,
+            "category": "animal",
+        }], detector_model="MDV6")
+        db.add_prediction(det_ids[0], "Bird", 0.9, "model-a")
+    cid = db.add_collection(
+        "Birds",
+        json.dumps([{"field": "keyword", "op": "equals", "value": "Bird"}]),
+    )
+
+    first = _get(app, cid, filter="all")
+    assert first["total"] == 2
+
+    db.tag_photo(photo_ids[2], bird)
+
+    refresh_url = (
+        f"/api/predictions/compare?collection_id={cid}&filter=all"
+        f"&token={first['token']}"
+        f"&refresh_photo_id={photo_ids[0]}"
+        f"&refresh_photo_id={photo_ids[1]}"
+        f"&refresh_photo_id={photo_ids[2]}"
+    )
+    refreshed = app.test_client().get(refresh_url).get_json()
+
+    assert refreshed["token"] == first["token"]
+    assert refreshed["total"] == 3
+    assert set(photo["photo_id"] for photo in refreshed["photos"]) == set(photo_ids)
+
+
 def test_targeted_photo_ids_still_return_full_rows(compare_collection):
     """The decision path asks for named photos and gets the same row shape,
     assessment included."""

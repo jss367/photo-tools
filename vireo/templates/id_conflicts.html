@@ -744,7 +744,7 @@ function applyRowsResponse(data, options) {
   compareExcludeDefs.forEach(function(item) {
     if (!(item.id in excludeState)) excludeState[item.id] = false;
   });
-  populateModelSelects(compareModels, data.visible_models || []);
+  var modelSelectionReset = populateModelSelects(compareModels, data.visible_models || []);
   populateSortSelect();
   // A row that left the page — decided, filtered out, or simply on another
   // page — must not stay in a selection whose batch buttons still claim it.
@@ -753,6 +753,13 @@ function applyRowsResponse(data, options) {
     if (!visible.has(id)) selectedRows.delete(id);
   });
   renderCompare();
+  // The response was assessed with a specific model the new collection
+  // does not carry; the model controls just reset to what is actually
+  // available. Re-query so the counts, statuses and sort match the columns
+  // the user now sees rather than the model that was silently dropped.
+  if (modelSelectionReset) {
+    reloadRows();
+  }
 }
 
 // A full load of the current collection: everything else on this page is a
@@ -818,6 +825,9 @@ function totalPages() {
   return Math.max(1, Math.ceil(compareTotal / Math.max(1, comparePerPage)));
 }
 
+// Returns true when a previously-selected specific model was dropped because
+// the new collection does not carry it: the caller needs to re-fetch so the
+// response's counts, statuses and sort match the columns the user now sees.
 function populateModelSelects(models, visible) {
   var a = document.getElementById('modelA');
   var b = document.getElementById('modelB');
@@ -829,8 +839,13 @@ function populateModelSelects(models, visible) {
     a.innerHTML += '<option value="' + escapeAttr(m) + '">' + escapeHtml(m) + '</option>';
     b.innerHTML += '<option value="' + escapeAttr(m) + '">' + escapeHtml(m) + '</option>';
   });
-  a.value = models.indexOf(oldA) >= 0 ? oldA : 'all';
-  b.value = models.indexOf(oldB) >= 0 ? oldB : '';
+  var newA = models.indexOf(oldA) >= 0 ? oldA : 'all';
+  var newB = models.indexOf(oldB) >= 0 ? oldB : '';
+  a.value = newA;
+  b.value = newB;
+  var droppedA = oldA !== 'all' && newA !== oldA;
+  var droppedB = oldB !== '' && newB !== oldB;
+  return droppedA || droppedB;
 }
 
 function populateSortSelect() {

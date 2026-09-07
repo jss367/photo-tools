@@ -22,6 +22,7 @@ Vireo helps wildlife photographers triage thousands of photos using machine lear
 - **Browse, review, and cull** — Filter, search, rate, keyword, and flag photos in a responsive web UI
 - **Non-destructive photo editing** — Adjust geometry, tone, white balance, detail, five-point curves, individual color ranges, and shadow/midtone/highlight grading with reusable presets
 - **Map view** — Geographic visualization of geotagged photos
+- **Photo location review** — In Review Photo Locations, choose **Missing GPS · group by time** to review suggested outings across all available photos or a collection. Preview examples, inspect and split groups, and assign a saved place or custom name in batches. Also available from Browse’s **Add Locations by Capture Time** menu action.
 - **Workspaces** — Isolated projects with independent predictions, collections, and settings
 - **Lightroom migration** — Import keyword hierarchies from `.lrcat` catalogs via XMP sidecars
 - **Transparent by design** — Live log panel, job progress streaming, pipeline inspector, and full audit system

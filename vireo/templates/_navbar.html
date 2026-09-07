@@ -13432,17 +13432,31 @@ let _newImagesInFlight = false;
 // render the pre-recheck state and wait out the full 60s interval before
 // walking again. Run one more check the moment it lands instead.
 let _newImagesForcedRerun = false;
-// True from the moment a manual recheck invalidates the caches until a final
-// answer renders or the attempt fails. Any path that leaves the user without
-// a fresh answer has to release the button, or it sits on "Checking..." until
-// some later 60s tick happens to return a final payload.
-let _newImagesRecheckActive = false;
+// Non-zero while a manual recheck is outstanding. The click takes a token and
+// the token is recorded in _newImagesInvalidatedToken once the POST that
+// clears the caches returns. A poll that was already in flight at either
+// moment is answering a question from before the invalidation: it must not
+// release the button or present its payload as the recheck's answer, or the
+// button reads "Check again" while the recheck is still running and a second
+// click can fire a duplicate invalidation.
+let _newImagesRecheckToken = 0;
+let _newImagesRecheckSeq = 0;
+let _newImagesInvalidatedToken = 0;
+
+// Whether a call that started with ``startInvalidated`` is entitled to
+// conclude the outstanding recheck. Evaluated at render time, because the
+// token can change while a call is in flight.
+function _newImagesAnswersRecheck(startInvalidated) {
+  return _newImagesRecheckToken === 0
+    || startInvalidated === _newImagesRecheckToken;
+}
 
 async function checkNewImages(options) {
   if (_newImagesInFlight) {
     if (options && options.force) _newImagesForcedRerun = true;
     return;
   }
+  const startInvalidated = _newImagesInvalidatedToken;
   if (_newImagesPendingTimer !== null) {
     clearTimeout(_newImagesPendingTimer);
     _newImagesPendingTimer = null;
@@ -13451,7 +13465,7 @@ async function checkNewImages(options) {
   try {
     const resp = await fetch('/api/workspaces/active/new-images');
     if (!resp.ok) {
-      _failNewImagesRecheck();
+      _failNewImagesRecheck(_newImagesAnswersRecheck(startInvalidated));
       return;
     }
     const data = await resp.json();
@@ -13468,8 +13482,9 @@ async function checkNewImages(options) {
     if (data && data.error) {
       const banner = document.getElementById('newImagesBanner');
       if (banner) banner.style.display = 'none';
-      if (!_newImagesForcedRerun) {
-        _newImagesRecheckActive = false;
+      if (!_newImagesForcedRerun
+          && _newImagesAnswersRecheck(startInvalidated)) {
+        _newImagesRecheckToken = 0;
         _setNewImagesRecheckBusy(false);
       }
       return;
@@ -13534,14 +13549,14 @@ async function checkNewImages(options) {
     // "Check again" is done regardless of which branch above ran — unless a
     // forced re-poll is queued behind this one, in which case this payload
     // predates the recheck and the button is still working.
-    if (!_newImagesForcedRerun) {
-      _newImagesRecheckActive = false;
+    if (!_newImagesForcedRerun && _newImagesAnswersRecheck(startInvalidated)) {
+      _newImagesRecheckToken = 0;
       _setNewImagesRecheckBusy(false);
     }
   } catch (e) {
     // Network error or malformed payload: the recheck produced no answer,
     // so hand the button back rather than leaving it disabled.
-    _failNewImagesRecheck();
+    _failNewImagesRecheck(_newImagesAnswersRecheck(startInvalidated));
   }
   finally {
     _newImagesInFlight = false;
@@ -13626,11 +13641,11 @@ function _formatCheckedAt(checkedAt) {
 // A recheck that produced no answer — rejected request, network error,
 // unreadable payload — says so and hands the button back, instead of holding
 // "Checking..." until some later poll happens to land.
-function _failNewImagesRecheck() {
-  if (!_newImagesRecheckActive) return;
+function _failNewImagesRecheck(answersRecheck) {
+  if (!answersRecheck || _newImagesRecheckToken === 0) return;
   const stamp = document.getElementById('newImagesCheckedAt');
   if (stamp) stamp.textContent = 'recheck failed \u2014 try again';
-  _newImagesRecheckActive = false;
+  _newImagesRecheckToken = 0;
   _newImagesForcedRerun = false;
   _setNewImagesRecheckBusy(false);
 }
@@ -13651,6 +13666,11 @@ function _setNewImagesRecheckBusy(busy) {
 async function recheckNewImages() {
   const btn = document.getElementById('newImagesRecheck');
   if (btn && btn.disabled) return;
+  // Claim the recheck before awaiting anything: a poll that lands while the
+  // POST is still open (the endpoint re-reads the mount table, which is
+  // bounded but not instant) must not decide the button is idle.
+  const token = ++_newImagesRecheckSeq;
+  _newImagesRecheckToken = token;
   _setNewImagesRecheckBusy(true);
   let invalidated = false;
   try {
@@ -13659,15 +13679,17 @@ async function recheckNewImages() {
     );
     invalidated = resp.ok;
   } catch (e) { invalidated = false; }
+  if (_newImagesRecheckToken !== token) return;
   if (!invalidated) {
     // Nothing was cleared, so polling now would redraw the same cached
     // answer and read as "checked again, still offline". Say the request
     // failed and hand the button back so the click can be retried.
-    _newImagesRecheckActive = true;
-    _failNewImagesRecheck();
+    _failNewImagesRecheck(true);
     return;
   }
-  _newImagesRecheckActive = true;
+  // From here a poll observes post-invalidation state, so it may conclude
+  // the recheck.
+  _newImagesInvalidatedToken = token;
   await checkNewImages({force: true});
 }
 

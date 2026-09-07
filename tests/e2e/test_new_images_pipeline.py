@@ -489,3 +489,62 @@ def test_check_again_releases_the_button_when_the_follow_up_poll_fails(
         "recheck failed", timeout=5000,
     )
     expect(page.locator("#newImagesRecheck")).to_be_enabled()
+
+
+def test_a_poll_landing_mid_recheck_does_not_release_the_button(
+    fresh_server, page, monkeypatch,
+):
+    """A 60s poll that was already in flight when "Check again" was clicked
+    answers a question from before the invalidation. Rendering it must not
+    re-enable the button — the recheck is still running, and an enabled
+    button invites a duplicate invalidation."""
+    import volume_reachability
+
+    url = fresh_server["url"]
+    photo_dir = fresh_server["photo_dir"]
+    _write_jpeg(photo_dir / "IMG_0009.JPG")
+    gate = _RemountableGate(photo_dir)
+    monkeypatch.setattr(volume_reachability, "get_shared", lambda: gate)
+    _clear_new_images_cache()
+
+    page.goto(f"{url}/browse")
+    msg = page.locator("#newImagesMsg")
+    expect(msg).to_contain_text("Couldn't check for new images", timeout=5000)
+
+    # Hold both the next poll's response and the recheck POST, so the stale
+    # poll can be made to land first — while the POST is still open.
+    page.evaluate("""() => {
+      const realFetch = window.fetch;
+      window.__releaseGet = null;
+      window.__releasePost = null;
+      window.fetch = (u, o) => {
+        const pending = realFetch(u, o);
+        if (String(u).includes('recheck')) {
+          return new Promise(resolve => {
+            window.__releasePost = () => resolve(pending);
+          });
+        }
+        if (String(u).includes('new-images') && window.__releaseGet === null) {
+          return new Promise(resolve => {
+            window.__releaseGet = () => resolve(pending);
+          });
+        }
+        return pending;
+      };
+    }""")
+    page.evaluate("void checkNewImages()")
+    page.wait_for_function("() => window.__releaseGet !== null", timeout=5000)
+
+    gate.online = True
+    recheck = page.locator("#newImagesRecheck")
+    recheck.click()
+    page.wait_for_function("() => window.__releasePost !== null", timeout=5000)
+
+    # The pre-invalidation poll lands while the POST is still open.
+    page.evaluate("window.__releaseGet()")
+    page.wait_for_timeout(300)
+    expect(recheck).to_be_disabled()
+
+    # Once the invalidation lands, the recheck's own poll concludes it.
+    page.evaluate("window.__releasePost()")
+    expect(msg).to_contain_text("1 new image", timeout=15000)

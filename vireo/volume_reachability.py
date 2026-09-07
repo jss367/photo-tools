@@ -1153,12 +1153,33 @@ class VolumeReachability:
                 return root, False
         return candidates[-1], True
 
-    def mark_offline(self, root):
+    def current_generation(self):
+        """Generation to quote back to :meth:`mark_offline` (see there)."""
+        with self._lock:
+            return self._generation
+
+    def mark_offline(self, root, generation=None):
         """Record that ``root`` was just observed offline (e.g. ``ENOTCONN``
-        mid-walk) so subsequent checks fail fast within the backoff window."""
+        mid-walk) so subsequent checks fail fast within the backoff window.
+
+        ``generation`` is what :meth:`current_generation` returned when the
+        caller started. An outage seen through a handle opened before an
+        intervening :meth:`clear` describes the volume as it was *then*: a
+        walk that began before the user remounted can surface its delayed
+        ``ENOTCONN`` afterwards, and republishing it would undo the clear and
+        send the next check straight past the volume again. Callers with no
+        generation to quote (test doubles, one-off observations) still
+        publish unconditionally.
+        """
         if not root:
             return
         with self._lock:
+            if generation is not None and generation != self._generation:
+                log.debug(
+                    "Dropping offline report for %s from a walk that started "
+                    "before the reachability cache was cleared", root,
+                )
+                return
             self._verdicts[root] = (False, self._clock())
         log.warning("Volume %s went offline during a filesystem walk", root)
 

@@ -455,3 +455,37 @@ def test_check_again_releases_the_button_when_the_recheck_fails(
     )
     expect(page.locator("#newImagesRecheck")).to_be_enabled()
     expect(msg).to_contain_text("Couldn't check for new images")
+
+
+def test_check_again_releases_the_button_when_the_follow_up_poll_fails(
+    fresh_server, page, monkeypatch,
+):
+    """The recheck POST can succeed and the poll behind it still fail. The
+    button must not sit on "Checking..." until some later 60s tick happens to
+    return a final payload."""
+    import volume_reachability
+
+    url = fresh_server["url"]
+    photo_dir = fresh_server["photo_dir"]
+    _write_jpeg(photo_dir / "IMG_0008.JPG")
+    gate = _RemountableGate(photo_dir)
+    monkeypatch.setattr(volume_reachability, "get_shared", lambda: gate)
+    _clear_new_images_cache()
+
+    page.goto(f"{url}/browse")
+    msg = page.locator("#newImagesMsg")
+    expect(msg).to_contain_text("Couldn't check for new images", timeout=5000)
+
+    # The POST goes through; only the GET behind it is rejected.
+    page.evaluate("""() => {
+      const realFetch = window.fetch;
+      window.fetch = (u, o) => (
+        String(u).includes('new-images') && !String(u).includes('recheck')
+          ? Promise.resolve(new Response('', {status: 500}))
+          : realFetch(u, o));
+    }""")
+    page.locator("#newImagesRecheck").click()
+    expect(page.locator("#newImagesCheckedAt")).to_contain_text(
+        "recheck failed", timeout=5000,
+    )
+    expect(page.locator("#newImagesRecheck")).to_be_enabled()

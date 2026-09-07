@@ -15506,6 +15506,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         workspace plus every cached volume verdict; the client's follow-up
         poll then starts a genuinely fresh walk.
         """
+        import new_images
         import volume_reachability
 
         db = _get_db()
@@ -15513,6 +15514,11 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         if ws_id is None:
             return jsonify({"workspace_id": None, "rechecked": False})
         volume_reachability.invalidate_caches()
+        # An offline answer can also come from the walk-side watchdog rather
+        # than a volume probe, and that registry is separate: without this a
+        # root whose walk wedged would be reported offline again without the
+        # remounted share ever being touched.
+        new_images.forget_stalled_walks()
         db.invalidate_new_images_cache_for_workspace(ws_id)
         return jsonify({"workspace_id": ws_id, "rechecked": True})
 

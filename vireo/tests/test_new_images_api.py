@@ -1618,3 +1618,37 @@ def test_recheck_without_active_workspace_is_a_no_op(app_and_db, monkeypatch):
     resp = client.post("/api/workspaces/active/new-images/recheck")
     assert resp.status_code == 200
     assert resp.get_json() == {"workspace_id": None, "rechecked": False}
+
+
+def test_recheck_forgets_a_wedged_root_walk(app_and_db, monkeypatch):
+    """An offline answer can come from the walk-side stall watchdog rather
+    than a volume probe. That registry is separate, so the recheck has to
+    clear it too or the fresh walk reports the same root offline without
+    touching the remounted share."""
+    import threading
+
+    import new_images as new_images_module
+
+    app, db, ws_id, tmp_path = app_and_db
+    root = str(tmp_path / "shoot")
+    stalled = {}
+    paths = set()
+    monkeypatch.setattr(new_images_module, "_STALLED_WALKS", stalled)
+    monkeypatch.setattr(new_images_module, "_STALLED_WALK_PATHS", paths)
+    monkeypatch.setattr(new_images_module, "_FORGOTTEN_STALLED_WALKS", set())
+
+    release = threading.Event()
+    wedged = threading.Thread(target=lambda: release.wait(10), daemon=True)
+    wedged.start()
+    stalled[root] = wedged
+    paths.add(root)
+
+    try:
+        resp = app.test_client().post("/api/workspaces/active/new-images/recheck")
+        assert resp.status_code == 200
+        assert paths == set()
+        assert stalled == {}
+        assert wedged in new_images_module._FORGOTTEN_STALLED_WALKS
+    finally:
+        release.set()
+        wedged.join(5)

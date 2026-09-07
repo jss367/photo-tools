@@ -13432,6 +13432,11 @@ let _newImagesInFlight = false;
 // render the pre-recheck state and wait out the full 60s interval before
 // walking again. Run one more check the moment it lands instead.
 let _newImagesForcedRerun = false;
+// True from the moment a manual recheck invalidates the caches until a final
+// answer renders or the attempt fails. Any path that leaves the user without
+// a fresh answer has to release the button, or it sits on "Checking..." until
+// some later 60s tick happens to return a final payload.
+let _newImagesRecheckActive = false;
 
 async function checkNewImages(options) {
   if (_newImagesInFlight) {
@@ -13445,7 +13450,10 @@ async function checkNewImages(options) {
   _newImagesInFlight = true;
   try {
     const resp = await fetch('/api/workspaces/active/new-images');
-    if (!resp.ok) return;
+    if (!resp.ok) {
+      _failNewImagesRecheck();
+      return;
+    }
     const data = await resp.json();
     // The backend returns ``pending: true`` when a fresh-cache walk is still
     // running in the background. The result will land in the cache shortly,
@@ -13460,7 +13468,10 @@ async function checkNewImages(options) {
     if (data && data.error) {
       const banner = document.getElementById('newImagesBanner');
       if (banner) banner.style.display = 'none';
-      if (!_newImagesForcedRerun) _setNewImagesRecheckBusy(false);
+      if (!_newImagesForcedRerun) {
+        _newImagesRecheckActive = false;
+        _setNewImagesRecheckBusy(false);
+      }
       return;
     }
     const banner = document.getElementById('newImagesBanner');
@@ -13523,8 +13534,15 @@ async function checkNewImages(options) {
     // "Check again" is done regardless of which branch above ran — unless a
     // forced re-poll is queued behind this one, in which case this payload
     // predates the recheck and the button is still working.
-    if (!_newImagesForcedRerun) _setNewImagesRecheckBusy(false);
-  } catch (e) { /* ignore */ }
+    if (!_newImagesForcedRerun) {
+      _newImagesRecheckActive = false;
+      _setNewImagesRecheckBusy(false);
+    }
+  } catch (e) {
+    // Network error or malformed payload: the recheck produced no answer,
+    // so hand the button back rather than leaving it disabled.
+    _failNewImagesRecheck();
+  }
   finally {
     _newImagesInFlight = false;
     if (_newImagesForcedRerun) {
@@ -13605,6 +13623,18 @@ function _formatCheckedAt(checkedAt) {
   } catch (e) { return ''; }
 }
 
+// A recheck that produced no answer — rejected request, network error,
+// unreadable payload — says so and hands the button back, instead of holding
+// "Checking..." until some later poll happens to land.
+function _failNewImagesRecheck() {
+  if (!_newImagesRecheckActive) return;
+  const stamp = document.getElementById('newImagesCheckedAt');
+  if (stamp) stamp.textContent = 'recheck failed \u2014 try again';
+  _newImagesRecheckActive = false;
+  _newImagesForcedRerun = false;
+  _setNewImagesRecheckBusy(false);
+}
+
 // The button stays busy until a final payload renders: a recheck drops the
 // cached result, so the poll right after it is usually `pending` and the
 // real answer lands a few seconds later.
@@ -13633,11 +13663,11 @@ async function recheckNewImages() {
     // Nothing was cleared, so polling now would redraw the same cached
     // answer and read as "checked again, still offline". Say the request
     // failed and hand the button back so the click can be retried.
-    const stamp = document.getElementById('newImagesCheckedAt');
-    if (stamp) stamp.textContent = 'recheck failed \u2014 try again';
-    _setNewImagesRecheckBusy(false);
+    _newImagesRecheckActive = true;
+    _failNewImagesRecheck();
     return;
   }
+  _newImagesRecheckActive = true;
   await checkNewImages({force: true});
 }
 

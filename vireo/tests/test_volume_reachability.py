@@ -1148,3 +1148,23 @@ def test_invalidate_caches_lets_a_wedged_generic_probe_be_retried(monkeypatch):
         with vr._GENERIC_PROBE_LOCK:
             vr._GENERIC_PROBES.pop(root, None)
             vr._FORGOTTEN_GENERIC_PROBES.discard(stuck)
+
+
+def test_mark_offline_from_a_walk_that_predates_clear_is_dropped():
+    """A walk that started before the manual recheck can surface its delayed
+    ENOTCONN afterwards. Republishing it would undo the clear and send the
+    next check straight past a volume the user has just remounted."""
+    gate = vr.VolumeReachability(probe=lambda root: True)
+    generation = gate.current_generation()
+
+    gate.clear()
+    gate.mark_offline("/Volumes/NAS", generation=generation)
+    assert gate._verdicts == {}
+
+    # An observation from a walk that started after the clear still counts,
+    # and a caller with no generation to quote is unaffected.
+    gate.mark_offline("/Volumes/NAS", generation=gate.current_generation())
+    assert gate._verdicts["/Volumes/NAS"][0] is False
+    gate.clear()
+    gate.mark_offline("/Volumes/NAS")
+    assert gate._verdicts["/Volumes/NAS"][0] is False

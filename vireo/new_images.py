@@ -275,6 +275,11 @@ def count_new_images_for_workspace(db, workspace_id, sample_limit=5,
         "sample": sample,
         "sample_complete": sample_limit is None or len(sample) >= total,
         "unreachable_roots": unreachable_roots,
+        # Wall-clock stamp of when this answer was produced. The banner shows
+        # it whenever a root was skipped: a user who clicks "Check again" on a
+        # volume that is *still* offline gets the same sentence back, and the
+        # time is the only thing that tells them the recheck really ran.
+        "checked_at": time.time(),
     }
 
 

@@ -323,3 +323,49 @@ def test_dismissed_count_rearms_when_a_folder_goes_offline(fresh_server, page, m
     page.reload()
     expect(banner).to_be_visible(timeout=5000)
     expect(page.locator("#newImagesMsg")).to_contain_text("offline and not checked")
+
+
+class _RemountableGate(_OfflineGate):
+    """Offline gate for a share that can come back mid-test."""
+
+    def __init__(self, offline_prefix):
+        super().__init__(offline_prefix)
+        self.online = False
+
+    def check(self, path):
+        if self.online:
+            return None, True
+        return super().check(path)
+
+
+def test_offline_banner_offers_a_manual_recheck(fresh_server, page, monkeypatch):
+    """A user who just remounted the share can click "Check again" and get
+    the real count now, instead of waiting out the invisible 30s caches that
+    the automatic poll relies on."""
+    import volume_reachability
+
+    url = fresh_server["url"]
+    photo_dir = fresh_server["photo_dir"]
+    _write_jpeg(photo_dir / "IMG_0005.JPG")
+    gate = _RemountableGate(photo_dir)
+    monkeypatch.setattr(volume_reachability, "get_shared", lambda: gate)
+    _clear_new_images_cache()
+
+    page.goto(f"{url}/browse")
+    expect(page.locator("#newImagesBanner")).to_be_visible(timeout=5000)
+    msg = page.locator("#newImagesMsg")
+    expect(msg).to_contain_text("Couldn't check for new images")
+    # Every full path stays available even when the sentence abbreviates.
+    expect(msg).to_have_attribute("title", str(photo_dir))
+    # The walk behind the notice is timestamped, so a recheck that finds the
+    # volume still offline is distinguishable from a frozen banner.
+    expect(page.locator("#newImagesCheckedAt")).to_contain_text("checked")
+
+    recheck = page.locator("#newImagesRecheck")
+    expect(recheck).to_be_visible()
+
+    gate.online = True
+    recheck.click()
+    expect(msg).to_contain_text("1 new image", timeout=15000)
+    expect(recheck).to_be_hidden()
+    expect(page.locator("#newImagesCheckedAt")).to_have_text("")

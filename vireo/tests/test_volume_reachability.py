@@ -1011,3 +1011,23 @@ def test_drive_is_remote_is_false_off_windows():
     if sys.platform == "win32":
         pytest.skip("Windows asks the mount manager")
     assert vr._drive_is_remote("Z:") is False
+
+
+def test_invalidate_caches_drops_verdicts_and_rereads_the_mount_table(monkeypatch):
+    """The manual "Check again" path: both 30s caches that keep automatic
+    polls off a dead share are dropped up front, so a share the user just
+    remounted is probed again immediately."""
+    gate = vr.get_shared()
+    refreshes = []
+    monkeypatch.setattr(
+        vr, "_system_mount_roots",
+        lambda **kwargs: refreshes.append(kwargs) or set(),
+    )
+    try:
+        with gate._lock:
+            gate._verdicts["/Volumes/NAS"] = (False, gate._clock())
+        vr.invalidate_caches()
+        assert gate._verdicts == {}
+        assert refreshes == [{"force_refresh": True}]
+    finally:
+        gate.clear()

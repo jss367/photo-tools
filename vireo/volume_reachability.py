@@ -1091,3 +1091,18 @@ _shared = VolumeReachability()
 def get_shared():
     """Process-wide gate shared by the navbar probe, walks, and scans."""
     return _shared
+
+
+def invalidate_caches():
+    """Forget every cached reachability verdict and re-read the mount table.
+
+    Both caches exist to keep *automatic* polling off a dead share, and both
+    expire on their own within 30s. Someone who just remounted a volume and
+    explicitly asked Vireo to check again should not have to wait out a timer
+    they cannot see, so the user-initiated path drops them up front. Nothing
+    here touches a mounted filesystem: the mount table is read from the
+    kernel (Linux) or ``mount(8)`` (macOS), and the verdicts are discarded
+    without being re-probed.
+    """
+    _shared.clear()
+    _system_mount_roots(force_refresh=True)

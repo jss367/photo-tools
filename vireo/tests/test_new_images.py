@@ -1906,3 +1906,20 @@ def test_count_progress_and_totals_unchanged_by_worker_thread(db_with_workspace)
     assert events[-1] == (8, 8)
     for prev, nxt in zip(events, events[1:], strict=False):
         assert nxt >= prev
+
+
+def test_count_new_images_stamps_when_the_walk_ran(db_with_workspace):
+    """The banner shows this time whenever a root was skipped, so a recheck
+    of a still-offline volume can be told apart from a stale sentence."""
+    import time
+
+    db, ws_id, tmp_path = db_with_workspace
+    root = tmp_path / "USA2026"
+    _touch_image(str(root / "IMG_0001.JPG"))
+    db.add_folder(str(root), name="USA2026")
+
+    from new_images import count_new_images_for_workspace
+    before = time.time()
+    result = count_new_images_for_workspace(db, ws_id)
+
+    assert before <= result["checked_at"] <= time.time()

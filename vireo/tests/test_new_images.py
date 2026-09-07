@@ -1906,3 +1906,146 @@ def test_count_progress_and_totals_unchanged_by_worker_thread(db_with_workspace)
     assert events[-1] == (8, 8)
     for prev, nxt in zip(events, events[1:], strict=False):
         assert nxt >= prev
+
+
+def test_count_new_images_stamps_when_the_walk_ran(db_with_workspace):
+    """The banner shows this time whenever a root was skipped, so a recheck
+    of a still-offline volume can be told apart from a stale sentence."""
+    import time
+
+    db, ws_id, tmp_path = db_with_workspace
+    root = tmp_path / "USA2026"
+    _touch_image(str(root / "IMG_0001.JPG"))
+    db.add_folder(str(root), name="USA2026")
+
+    from new_images import count_new_images_for_workspace
+    before = time.time()
+    result = count_new_images_for_workspace(db, ws_id)
+
+    assert before <= result["checked_at"] <= time.time()
+
+
+def test_forget_stalled_walks_lets_a_wedged_root_be_rewalked(tmp_path, monkeypatch):
+    """A walk abandoned by the stall watchdog makes every later check report
+    its root offline without walking. An explicit recheck has to be able to
+    walk again, or "Check again" answers from the registry without touching
+    the share the user just remounted."""
+    import threading
+
+    import new_images as new_images_module
+
+    root_path = str(tmp_path / "share")
+    os.makedirs(root_path)
+    gate = _FakeReachability()
+    monkeypatch.setattr(new_images_module, "_STALLED_WALKS", {})
+    monkeypatch.setattr(new_images_module, "_STALLED_WALK_PATHS", set())
+    monkeypatch.setattr(new_images_module, "_FORGOTTEN_STALLED_WALKS", set())
+
+    release = threading.Event()
+    wedged = threading.Thread(target=lambda: release.wait(10), daemon=True)
+    wedged.start()
+    new_images_module._STALLED_WALKS[root_path] = wedged
+    new_images_module._STALLED_WALK_PATHS.add(root_path)
+
+    args = (
+        {"id": 1, "path": root_path}, root_path, gate.mount_root,
+        set(), set(), gate, 0, 0, None, 250, 0, 2,
+    )
+    try:
+        assert new_images_module._walk_root_bounded(*args) is None
+        assert gate.marked_offline == [gate.mount_root]
+
+        new_images_module.forget_stalled_walks()
+        gate.marked_offline.clear()
+
+        assert new_images_module._walk_root_bounded(*args) == ([], 0, 0)
+        assert gate.marked_offline == []
+        # The wedged worker still counts against the walk cap while it lives.
+        assert wedged in new_images_module._FORGOTTEN_STALLED_WALKS
+    finally:
+        release.set()
+        wedged.join(5)
+
+
+def test_walk_quotes_the_reachability_generation_it_started_under(
+    tmp_path, monkeypatch,
+):
+    """The generation snapshot is taken before any root is touched, so an
+    outage the walk reports later can be recognised as pre-clear."""
+    import errno
+
+    import new_images as new_images_module
+
+    class _GenerationGate(_FakeReachability):
+        def __init__(self):
+            super().__init__()
+            self.generation = 7
+            self.marked_generations = []
+
+        def current_generation(self):
+            return self.generation
+
+        def mark_offline(self, root, generation=None):
+            self.marked_offline.append(root)
+            self.marked_generations.append(generation)
+
+    root_path = str(tmp_path / "share")
+    gate = _GenerationGate()
+    monkeypatch.setattr(new_images_module, "_STALLED_WALKS", {})
+    monkeypatch.setattr(new_images_module, "_STALLED_WALK_PATHS", set())
+
+    def dead_share(top, onerror=None, **_kwargs):
+        onerror(OSError(errno.ENOTCONN, "socket is not connected", top))
+        if False:
+            yield None
+
+    monkeypatch.setattr(new_images_module, "safe_scan_walk", dead_share)
+    assert new_images_module._walk_root_bounded(
+        {"id": 1, "path": root_path}, root_path, gate.mount_root,
+        set(), set(), gate, 0, 0, None, 250, 0, 2,
+        reachability_generation=gate.current_generation(),
+    ) is None
+    assert gate.marked_generations == [7]
+
+
+def test_a_walk_that_stalls_during_the_recheck_does_not_block_it(
+    tmp_path, monkeypatch,
+):
+    """The window a one-shot sweep cannot close: a walk already hung when the
+    user clicks, whose watchdog fires just after ``forget_stalled_walks``. It
+    dates from before the remount, so the fresh walk must retire it rather
+    than report the root offline on its behalf."""
+    import threading
+
+    import new_images as new_images_module
+
+    root_path = str(tmp_path / "share")
+    os.makedirs(root_path)
+    gate = _FakeReachability()
+    monkeypatch.setattr(new_images_module, "_STALLED_WALKS", {})
+    monkeypatch.setattr(new_images_module, "_STALLED_WALK_PATHS", set())
+    monkeypatch.setattr(new_images_module, "_STALLED_WALK_EPOCHS", {})
+    monkeypatch.setattr(new_images_module, "_FORGOTTEN_STALLED_WALKS", set())
+
+    release = threading.Event()
+    wedged = threading.Thread(target=lambda: release.wait(10), daemon=True)
+    wedged.start()
+    epoch_at_walk_start = new_images_module._current_walk_epoch()
+
+    try:
+        # The recheck lands while the old walk is hung but not yet stalled...
+        new_images_module.forget_stalled_walks()
+        # ...and only then does its watchdog register the root.
+        new_images_module._STALLED_WALKS[root_path] = wedged
+        new_images_module._STALLED_WALK_PATHS.add(root_path)
+        new_images_module._STALLED_WALK_EPOCHS[root_path] = epoch_at_walk_start
+
+        assert new_images_module._walk_root_bounded(
+            {"id": 1, "path": root_path}, root_path, gate.mount_root,
+            set(), set(), gate, 0, 0, None, 250, 0, 2,
+        ) == ([], 0, 0)
+        assert gate.marked_offline == []
+        assert wedged in new_images_module._FORGOTTEN_STALLED_WALKS
+    finally:
+        release.set()
+        wedged.join(5)

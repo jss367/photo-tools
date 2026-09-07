@@ -36,6 +36,15 @@ All notable changes to Vireo are documented in this file.
   optional integration readiness, support long-path-aware packaging, require
   signed release installers, and run Windows browser, native-shell, installer,
   updater, and uninstall-preservation gates before publication.
+- **"Check again" for offline folders.** When the new-images banner reports
+  that a registered folder's volume is offline, it now offers a manual
+  recheck and shows the time of the check behind the message. Clicking it
+  forgets every cached volume verdict and re-walks straight away, so a share
+  you have just remounted is picked up immediately instead of on the
+  automatic 30-second retry. The notice also groups the offline folders under
+  the path they share, so a set of sibling folders reads as the parts that
+  differ rather than as several near-identical absolute paths, with the full
+  paths on hover.
 
 ### Fixed
 - **Offline NAS no longer breaks the new-images check.** When a registered

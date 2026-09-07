@@ -15531,6 +15531,35 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             **_new_images_walk_progress_fields(db_path, ws_id),
         })
 
+    @app.route("/api/workspaces/active/new-images/recheck", methods=["POST"])
+    def api_workspace_new_images_recheck():
+        """User-initiated "Check again" from the offline banner.
+
+        The automatic path already recovers on its own — a result that
+        skipped an offline root is cached for only 30s and the reachability
+        gate re-probes on the same cadence — but the user cannot see either
+        timer. Someone who just remounted the share and is looking at a
+        banner saying their folders are offline needs a way to say "look
+        now". Drop the cached walk (and its error backoff) for this
+        workspace plus every cached volume verdict; the client's follow-up
+        poll then starts a genuinely fresh walk.
+        """
+        import new_images
+        import volume_reachability
+
+        db = _get_db()
+        ws_id = db._active_workspace_id
+        if ws_id is None:
+            return jsonify({"workspace_id": None, "rechecked": False})
+        volume_reachability.invalidate_caches()
+        # An offline answer can also come from the walk-side watchdog rather
+        # than a volume probe, and that registry is separate: without this a
+        # root whose walk wedged would be reported offline again without the
+        # remounted share ever being touched.
+        new_images.forget_stalled_walks()
+        db.invalidate_new_images_cache_for_workspace(ws_id)
+        return jsonify({"workspace_id": ws_id, "rechecked": True})
+
     @app.route("/api/workspaces/active/new-images/snapshot", methods=["POST"])
     def api_workspace_new_images_snapshot_create():
         db = _get_db()

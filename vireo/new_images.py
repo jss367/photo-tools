@@ -157,6 +157,10 @@ def count_new_images_for_workspace(db, workspace_id, sample_limit=5,
         stall_timeout = WALK_STALL_TIMEOUT_SECONDS
     known = _known_paths_for_workspace(db, workspace_id)
     roots = mapped_roots(db, workspace_id)
+    # Snapshot now, before any root is touched: an outage this walk observes
+    # later belongs to the world as it is here. If a manual recheck clears
+    # the gate mid-walk, the stale report is dropped rather than undoing it.
+    reachability_generation = _reachability_generation(reachability)
     volume_reachability.seed_known_mount_roots(
         volume_reachability.load_known_mount_roots(db)
     )
@@ -245,6 +249,7 @@ def count_new_images_for_workspace(db, workspace_id, sample_limit=5,
             root, root_path, mount_root, known, seen_new_paths, reachability,
             files_checked, total, progress_callback, progress_every,
             last_emitted, stall_timeout,
+            reachability_generation=reachability_generation,
         )
         if outcome is None:
             # Offline (error or stall): nothing from this root is kept.
@@ -275,6 +280,11 @@ def count_new_images_for_workspace(db, workspace_id, sample_limit=5,
         "sample": sample,
         "sample_complete": sample_limit is None or len(sample) >= total,
         "unreachable_roots": unreachable_roots,
+        # Wall-clock stamp of when this answer was produced. The banner shows
+        # it whenever a root was skipped: a user who clicks "Check again" on a
+        # volume that is *still* offline gets the same sentence back, and the
+        # time is the only thing that tells them the recheck really ran.
+        "checked_at": time.time(),
     }
 
 
@@ -295,15 +305,98 @@ _WALK_RESERVED = object()
 _STALLED_WALKS = {}
 _STALLED_WALK_PATHS = set()
 _STALLED_WALKS_LOCK = threading.Lock()
+# Workers dropped from the registry by :func:`forget_stalled_walks` while
+# still running. They no longer report their root offline, but they still
+# occupy a slot until they return, so repeated rechecks against a wedged
+# share cannot stack walk threads without bound.
+_FORGOTTEN_STALLED_WALKS = set()
+# Bumped by :func:`forget_stalled_walks`. Each walk records the epoch it
+# started under, so a walk that was already hung at recheck time but only
+# crosses its stall timeout *after* the sweep cannot register itself as the
+# reason to skip the root. Registrations without an epoch (test doubles) read
+# as current, i.e. they keep the historical fail-fast behaviour.
+_WALK_INVALIDATION_EPOCH = 0
+_STALLED_WALK_EPOCHS = {}
+
+
+def _current_walk_epoch():
+    with _STALLED_WALKS_LOCK:
+        return _WALK_INVALIDATION_EPOCH
+
+
+def _live_forgotten_stalled_walks():
+    """Prune finished forgotten workers; return how many are still running.
+
+    Callers must hold ``_STALLED_WALKS_LOCK``.
+    """
+    for worker in list(_FORGOTTEN_STALLED_WALKS):
+        if not worker.is_alive():
+            _FORGOTTEN_STALLED_WALKS.discard(worker)
+    return len(_FORGOTTEN_STALLED_WALKS)
+
+
+def forget_stalled_walks():
+    """Let one fresh walk run for each root with a wedged walker.
+
+    A walk abandoned by the stall watchdog leaves its worker registered, and
+    every later check of that root reports it offline without walking — right
+    for automatic polls, wrong for an explicit recheck, which would otherwise
+    answer "offline" (with a fresh check time) for a volume nobody has looked
+    at since the user remounted it. This is the walk-side counterpart of
+    ``volume_reachability._forget_wedged_probes``: drop the registration so
+    exactly one new walk starts, and if the share is still wedged that walk
+    stalls and re-arms the fast path. The workers keep counting against
+    ``_MAX_STALLED_WALKS`` while they live, and the registry writes in
+    ``_walk_root_bounded`` are all identity-checked, so a worker that wakes
+    later cannot free a slot twice.
+    """
+    global _WALK_INVALIDATION_EPOCH
+    with _STALLED_WALKS_LOCK:
+        # Bump first: a walk that is hung right now and trips its watchdog a
+        # moment after this sweep registers itself with the *old* epoch, so
+        # the check in ``_walk_root_bounded`` retires it instead of reporting
+        # the root offline on its behalf.
+        _WALK_INVALIDATION_EPOCH += 1
+        for root_path in list(_STALLED_WALK_PATHS):
+            _forget_stalled_walk_locked(root_path)
+
+
+def _forget_stalled_walk_locked(root_path):
+    """Drop ``root_path``'s stalled registration, keeping a live worker
+    counted. Callers must hold ``_STALLED_WALKS_LOCK``."""
+    worker = _STALLED_WALKS.get(root_path)
+    if worker is not None and worker is not _WALK_RESERVED:
+        del _STALLED_WALKS[root_path]
+        if worker.is_alive():
+            _FORGOTTEN_STALLED_WALKS.add(worker)
+    _STALLED_WALK_PATHS.discard(root_path)
+    _STALLED_WALK_EPOCHS.pop(root_path, None)
 
 
 class _WalkAbandoned(Exception):
     """Raised inside an abandoned worker so it exits as soon as it wakes."""
 
 
+def _mark_offline(reachability, mount_root, generation):
+    """Publish an outage, tied to the reachability generation this walk began
+    under when the gate supports one (test doubles need not)."""
+    if generation is None:
+        reachability.mark_offline(mount_root)
+    else:
+        reachability.mark_offline(mount_root, generation=generation)
+
+
+def _reachability_generation(reachability):
+    """Generation to quote when reporting an outage, or None for a gate that
+    does not track one."""
+    getter = getattr(reachability, "current_generation", None)
+    return getter() if callable(getter) else None
+
+
 def _walk_root_bounded(root, root_path, mount_root, known, seen_new_paths,
                        reachability, files_checked, total, progress_callback,
-                       progress_every, last_emitted, stall_timeout):
+                       progress_every, last_emitted, stall_timeout,
+                       reachability_generation=None):
     """Walk one root on a worker thread under a stall watchdog.
 
     Returns ``(root_new_paths, files_checked_in_root, last_emitted)`` on
@@ -314,6 +407,10 @@ def _walk_root_bounded(root, root_path, mount_root, known, seen_new_paths,
     merges only on success, so an abandoned thread that wakes up later can
     not corrupt a result that has already been published.
     """
+    # Recorded on this root if the watchdog fires: it dates the outage to the
+    # world this walk started in, so a later recheck can tell it apart from
+    # one observed after the user asked us to look again.
+    walk_epoch = _current_walk_epoch()
     while True:
         wait_for = None
         with _STALLED_WALKS_LOCK:
@@ -323,12 +420,22 @@ def _walk_root_bounded(root, root_path, mount_root, known, seen_new_paths,
                     wait_for = existing
                 elif existing.is_alive():
                     if root_path in _STALLED_WALK_PATHS:
+                        if _STALLED_WALK_EPOCHS.get(
+                            root_path, _WALK_INVALIDATION_EPOCH,
+                        ) < _WALK_INVALIDATION_EPOCH:
+                            # Wedged by a walk that predates the last
+                            # recheck: what it proved is about the volume as
+                            # it was then. Retire the registration and walk.
+                            _forget_stalled_walk_locked(root_path)
+                            continue
                         log.warning(
                             "new-images: %s still has a wedged walk from an "
                             "earlier check; reporting offline without walking "
                             "again", root_path,
                         )
-                        reachability.mark_offline(mount_root)
+                        _mark_offline(
+                            reachability, mount_root, reachability_generation,
+                        )
                         return None
                     # Another workspace is walking the same root. Wait outside
                     # the lock, then retry; an active healthy walk is not
@@ -337,6 +444,7 @@ def _walk_root_bounded(root, root_path, mount_root, known, seen_new_paths,
                 else:
                     del _STALLED_WALKS[root_path]
                     _STALLED_WALK_PATHS.discard(root_path)
+                    _STALLED_WALK_EPOCHS.pop(root_path, None)
             if wait_for is None:
                 # Finished workers for other roots do not consume capacity.
                 # Live workers do: any may become an uninterruptible SMB stall.
@@ -344,7 +452,11 @@ def _walk_root_bounded(root, root_path, mount_root, known, seen_new_paths,
                     if other is not _WALK_RESERVED and not other.is_alive():
                         del _STALLED_WALKS[other_path]
                         _STALLED_WALK_PATHS.discard(other_path)
-                if len(_STALLED_WALKS) >= _MAX_STALLED_WALKS:
+                        _STALLED_WALK_EPOCHS.pop(other_path, None)
+                if (
+                    len(_STALLED_WALKS) + _live_forgotten_stalled_walks()
+                    >= _MAX_STALLED_WALKS
+                ):
                     log.warning(
                         "new-images: root-walk limit reached while checking %s; "
                         "not starting another worker", root_path,
@@ -390,7 +502,7 @@ def _walk_root_bounded(root, root_path, mount_root, known, seen_new_paths,
             == os.path.normcase(os.path.normpath(root_path))
         )
         if volume_reachability.is_offline_error(exc) or root_disappeared:
-            reachability.mark_offline(mount_root)
+            _mark_offline(reachability, mount_root, reachability_generation)
             raise _RootOffline(exc)
         log.debug("new-images: skipping unreadable path: %s", exc)
 
@@ -440,6 +552,7 @@ def _walk_root_bounded(root, root_path, mount_root, known, seen_new_paths,
             if _STALLED_WALKS.get(root_path) is thread:
                 del _STALLED_WALKS[root_path]
                 _STALLED_WALK_PATHS.discard(root_path)
+                _STALLED_WALK_EPOCHS.pop(root_path, None)
             raise
     while True:
         thread.join(_WALK_POLL_SECONDS)
@@ -450,12 +563,13 @@ def _walk_root_bounded(root, root_path, mount_root, known, seen_new_paths,
             with _STALLED_WALKS_LOCK:
                 if _STALLED_WALKS.get(root_path) is thread:
                     _STALLED_WALK_PATHS.add(root_path)
+                    _STALLED_WALK_EPOCHS[root_path] = walk_epoch
             log.warning(
                 "new-images: walk of %s made no progress for %.0fs; "
                 "treating volume %s as offline and abandoning the walk",
                 root_path, stall_timeout, mount_root or root_path,
             )
-            reachability.mark_offline(mount_root)
+            _mark_offline(reachability, mount_root, reachability_generation)
             return None
 
     failure = state["offline"]

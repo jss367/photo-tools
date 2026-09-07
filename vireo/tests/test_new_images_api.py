@@ -1505,3 +1505,150 @@ def test_new_images_walk_job_completes_with_offline_caveat(app_and_db, monkeypat
     assert job is not None, "new_images_walk job never reached a terminal state"
     assert job["status"] == "completed"
     assert job.get("result", {}).get("unreachable_roots") == ["/Volumes/NAS/shoot"]
+
+
+def _settled_new_images(client, timeout=3.0):
+    """GET the navbar payload, waiting out any ``pending`` background walk."""
+    import time
+
+    data = client.get("/api/workspaces/active/new-images").get_json()
+    deadline = time.monotonic() + timeout
+    while data.get("pending") and time.monotonic() < deadline:
+        time.sleep(0.05)
+        data = client.get("/api/workspaces/active/new-images").get_json()
+    return data
+
+
+def test_recheck_rewalks_a_workspace_stuck_on_an_offline_result(app_and_db, monkeypatch):
+    """"Check again" drops the cached partial answer so the very next poll
+    walks for real, instead of serving the offline notice until the 30s
+    partial-result TTL happens to expire."""
+    import new_images as new_images_module
+    import volume_reachability
+
+    app, db, ws_id, tmp_path = app_and_db
+    root = tmp_path / "shoot"
+    _touch_image(str(root / "IMG.JPG"))
+    db.add_folder(str(root), name="shoot")
+
+    walks = {"n": 0}
+
+    def walk(*args, **kwargs):
+        walks["n"] += 1
+        if walks["n"] == 1:
+            return {
+                "new_count": 0, "per_root": [], "sample": [],
+                "sample_complete": True, "unreachable_roots": [str(root)],
+            }
+        return {
+            "new_count": 1, "per_root": [], "sample": [str(root / "IMG.JPG")],
+            "sample_complete": True, "unreachable_roots": [],
+        }
+
+    monkeypatch.setattr(new_images_module, "count_new_images_for_workspace", walk)
+    invalidated = []
+    monkeypatch.setattr(
+        volume_reachability, "invalidate_caches",
+        lambda: invalidated.append(True),
+    )
+
+    client = app.test_client()
+    assert _settled_new_images(client)["unreachable_roots"] == [str(root)]
+    # Still inside the cache window: no second walk, same offline answer.
+    assert _settled_new_images(client)["unreachable_roots"] == [str(root)]
+    assert walks["n"] == 1
+
+    resp = client.post("/api/workspaces/active/new-images/recheck")
+    assert resp.status_code == 200
+    assert resp.get_json() == {"workspace_id": ws_id, "rechecked": True}
+    # The volume gate is dropped too — a verdict cached seconds ago would
+    # otherwise make the fresh walk skip the same root all over again.
+    assert invalidated == [True]
+
+    data = _settled_new_images(client)
+    assert data["new_count"] == 1
+    assert data["unreachable_roots"] == []
+    assert walks["n"] == 2
+
+
+def test_recheck_clears_the_error_backoff(app_and_db, monkeypatch):
+    """A failed walk suppresses retries for 30s. An explicit recheck is the
+    user overriding that backoff, so the next poll must actually retry."""
+    import new_images as new_images_module
+
+    app, db, ws_id, tmp_path = app_and_db
+    root = tmp_path / "shoot"
+    _touch_image(str(root / "IMG.JPG"))
+    db.add_folder(str(root), name="shoot")
+
+    walks = {"n": 0}
+
+    def walk(*args, **kwargs):
+        walks["n"] += 1
+        if walks["n"] == 1:
+            raise RuntimeError("disk unreachable")
+        return {
+            "new_count": 1, "per_root": [], "sample": [str(root / "IMG.JPG")],
+            "sample_complete": True, "unreachable_roots": [],
+        }
+
+    monkeypatch.setattr(new_images_module, "count_new_images_for_workspace", walk)
+
+    client = app.test_client()
+    data = _settled_new_images(client)
+    assert data.get("error"), data
+    # Backoff holds: the poll right after the failure does not re-walk.
+    assert _settled_new_images(client).get("error")
+    assert walks["n"] == 1
+
+    client.post("/api/workspaces/active/new-images/recheck")
+    data = _settled_new_images(client)
+    assert data.get("error") is None
+    assert data["new_count"] == 1
+    assert walks["n"] == 2
+
+
+def test_recheck_without_active_workspace_is_a_no_op(app_and_db, monkeypatch):
+    from db import Database
+    monkeypatch.setattr(Database, "set_active_workspace",
+                        lambda self, ws_id: None)
+
+    app, db, ws_id, tmp_path = app_and_db
+    client = app.test_client()
+    resp = client.post("/api/workspaces/active/new-images/recheck")
+    assert resp.status_code == 200
+    assert resp.get_json() == {"workspace_id": None, "rechecked": False}
+
+
+def test_recheck_forgets_a_wedged_root_walk(app_and_db, monkeypatch):
+    """An offline answer can come from the walk-side stall watchdog rather
+    than a volume probe. That registry is separate, so the recheck has to
+    clear it too or the fresh walk reports the same root offline without
+    touching the remounted share."""
+    import threading
+
+    import new_images as new_images_module
+
+    app, db, ws_id, tmp_path = app_and_db
+    root = str(tmp_path / "shoot")
+    stalled = {}
+    paths = set()
+    monkeypatch.setattr(new_images_module, "_STALLED_WALKS", stalled)
+    monkeypatch.setattr(new_images_module, "_STALLED_WALK_PATHS", paths)
+    monkeypatch.setattr(new_images_module, "_FORGOTTEN_STALLED_WALKS", set())
+
+    release = threading.Event()
+    wedged = threading.Thread(target=lambda: release.wait(10), daemon=True)
+    wedged.start()
+    stalled[root] = wedged
+    paths.add(root)
+
+    try:
+        resp = app.test_client().post("/api/workspaces/active/new-images/recheck")
+        assert resp.status_code == 200
+        assert paths == set()
+        assert stalled == {}
+        assert wedged in new_images_module._FORGOTTEN_STALLED_WALKS
+    finally:
+        release.set()
+        wedged.join(5)

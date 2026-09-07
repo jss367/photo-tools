@@ -57,6 +57,36 @@ _NETWORK_PROBE_LOCK = threading.Lock()
 _NETWORK_PROBE_CONDITION = threading.Condition(_NETWORK_PROBE_LOCK)
 _NETWORK_PROBES = {}
 _ABANDONED_NETWORK_PROBES = set()
+# Probes dropped from a registry by :func:`invalidate_caches` while still
+# running. They no longer block a fresh probe of their root, but they still
+# occupy a slot until they exit, so repeatedly clicking "Check again" against
+# a wedged share cannot stack processes or threads without bound.
+_FORGOTTEN_NETWORK_PROBES = set()
+_FORGOTTEN_GENERIC_PROBES = set()
+# Bumped by :func:`invalidate_caches`. Every probe records the epoch it began
+# under, so a probe that started before the user asked us to look again cannot
+# claim its root as unprobeable afterwards — the race that survives a one-shot
+# sweep is precisely a probe *transitioning* to wedged just after the sweep.
+# Roots registered without an epoch (test doubles) read as current, i.e. they
+# keep the historical fail-fast behaviour.
+_INVALIDATION_EPOCH = 0
+_INVALIDATION_EPOCH_LOCK = threading.Lock()
+# root -> epoch of the probe that abandoned it / that is running.
+_ABANDONED_PROBE_EPOCHS = {}
+_GENERIC_PROBE_EPOCHS = {}
+
+
+def current_invalidation_epoch():
+    """Epoch a probe should record when it starts (see ``_INVALIDATION_EPOCH``)."""
+    with _INVALIDATION_EPOCH_LOCK:
+        return _INVALIDATION_EPOCH
+
+
+def _bump_invalidation_epoch():
+    global _INVALIDATION_EPOCH
+    with _INVALIDATION_EPOCH_LOCK:
+        _INVALIDATION_EPOCH += 1
+        return _INVALIDATION_EPOCH
 
 # ``OSError`` errnos that mean the *volume* is gone, not that one file is
 # unreadable. ``ENOTCONN`` ("Socket is not connected") is what macOS raises
@@ -630,6 +660,18 @@ def _resolve_symlinks_until_mount_shaped(path, candidate, inconclusive=None):
     return prefix or None
 
 
+def _live_forgotten_network_probes():
+    """Prune exited forgotten probes; return how many are still running.
+
+    Callers must hold ``_NETWORK_PROBE_LOCK``.
+    """
+    for process in list(_FORGOTTEN_NETWORK_PROBES):
+        with contextlib.suppress(Exception):
+            if process.poll() is not None:
+                _FORGOTTEN_NETWORK_PROBES.discard(process)
+    return len(_FORGOTTEN_NETWORK_PROBES)
+
+
 def _reserve_network_probe(root, wait_timeout=0):
     """Reserve a slot, waiting boundedly for healthy same-root contention."""
     deadline = time.monotonic() + max(0, wait_timeout)
@@ -637,14 +679,25 @@ def _reserve_network_probe(root, wait_timeout=0):
         while root in _NETWORK_PROBES:
             # A timed-out process may stay in uninterruptible I/O while its
             # reaper waits. It already proved the root unhealthy, so retries
-            # fail immediately instead of waiting another timeout.
+            # fail immediately instead of waiting another timeout — unless it
+            # was started before the last invalidation, in which case what it
+            # proved is about the volume as it was *before* the user remounted
+            # it, and this caller is entitled to look for itself.
             if root in _ABANDONED_NETWORK_PROBES:
-                return False
+                if _ABANDONED_PROBE_EPOCHS.get(
+                    root, current_invalidation_epoch(),
+                ) >= current_invalidation_epoch():
+                    return False
+                _forget_network_probe_locked(root)
+                continue
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 return False
             _NETWORK_PROBE_CONDITION.wait(remaining)
-        if len(_NETWORK_PROBES) >= _MAX_NETWORK_PROBES:
+        if (
+            len(_NETWORK_PROBES) + _live_forgotten_network_probes()
+            >= _MAX_NETWORK_PROBES
+        ):
             return False
         _NETWORK_PROBES[root] = _NETWORK_PROBE_RESERVED
         return True
@@ -656,7 +709,21 @@ def _release_network_probe(root, owner):
         if _NETWORK_PROBES.get(root) is owner:
             _NETWORK_PROBES.pop(root, None)
             _ABANDONED_NETWORK_PROBES.discard(root)
+            _ABANDONED_PROBE_EPOCHS.pop(root, None)
             _NETWORK_PROBE_CONDITION.notify_all()
+
+
+def _forget_network_probe_locked(root):
+    """Drop ``root``'s registration, keeping a running process counted.
+
+    Callers must hold ``_NETWORK_PROBE_LOCK``.
+    """
+    process = _NETWORK_PROBES.pop(root, None)
+    _ABANDONED_NETWORK_PROBES.discard(root)
+    _ABANDONED_PROBE_EPOCHS.pop(root, None)
+    if process is not None and process is not _NETWORK_PROBE_RESERVED:
+        _FORGOTTEN_NETWORK_PROBES.add(process)
+    _NETWORK_PROBE_CONDITION.notify_all()
 
 
 def _reap_abandoned_network_probe(root, process):
@@ -669,11 +736,19 @@ def _reap_abandoned_network_probe(root, process):
         _release_network_probe(root, process)
 
 
-def _abandon_network_probe(root, process):
-    """Kill a timed-out probe without synchronously waiting for it."""
+def _abandon_network_probe(root, process, epoch=None):
+    """Kill a timed-out probe without synchronously waiting for it.
+
+    ``epoch`` is the invalidation epoch the probe started under; a later
+    reservation uses it to tell "this root was proved unprobeable just now"
+    from "…before the user asked us to look again".
+    """
+    if epoch is None:
+        epoch = current_invalidation_epoch()
     with _NETWORK_PROBE_CONDITION:
         if _NETWORK_PROBES.get(root) is process:
             _ABANDONED_NETWORK_PROBES.add(root)
+            _ABANDONED_PROBE_EPOCHS[root] = epoch
             _NETWORK_PROBE_CONDITION.notify_all()
     with contextlib.suppress(OSError):
         process.kill()
@@ -733,6 +808,7 @@ def _bounded_process_probe(argv, root, timeout, accept, run=None,
         root_key = os.path.normcase(os.path.normpath(os.fspath(root)))
     except (TypeError, ValueError):
         return False
+    epoch = current_invalidation_epoch()
     if not _reserve_network_probe(root_key, wait_timeout=timeout):
         return False
 
@@ -751,12 +827,12 @@ def _bounded_process_probe(argv, root, timeout, accept, run=None,
         stdout, _stderr = process.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
         abandoned = True
-        _abandon_network_probe(root_key, process)
+        _abandon_network_probe(root_key, process, epoch)
         return False
     except (OSError, subprocess.SubprocessError):
         if process is not None:
             abandoned = True
-            _abandon_network_probe(root_key, process)
+            _abandon_network_probe(root_key, process, epoch)
         else:
             _release_network_probe(root_key, _NETWORK_PROBE_RESERVED)
         return False
@@ -910,9 +986,23 @@ def _probe_root_generic(root, timeout):
         existing = _GENERIC_PROBES.get(root)
         if existing is not None:
             if existing.is_alive():
-                return False
-            del _GENERIC_PROBES[root]
-        if len(_GENERIC_PROBES) >= _MAX_GENERIC_PROBES:
+                if _GENERIC_PROBE_EPOCHS.get(
+                    root, current_invalidation_epoch(),
+                ) >= current_invalidation_epoch():
+                    return False
+                # Started before the last invalidation: its verdict is about
+                # the volume as it was then, so it must not stand in for a
+                # look at the volume now.
+                del _GENERIC_PROBES[root]
+                _GENERIC_PROBE_EPOCHS.pop(root, None)
+                _FORGOTTEN_GENERIC_PROBES.add(existing)
+            else:
+                del _GENERIC_PROBES[root]
+                _GENERIC_PROBE_EPOCHS.pop(root, None)
+        if (
+            len(_GENERIC_PROBES) + _live_forgotten_generic_probes()
+            >= _MAX_GENERIC_PROBES
+        ):
             return False
         outcome = {}
 
@@ -925,11 +1015,13 @@ def _probe_root_generic(root, timeout):
                 with _GENERIC_PROBE_LOCK:
                     if _GENERIC_PROBES.get(root) is thread:
                         del _GENERIC_PROBES[root]
+                        _GENERIC_PROBE_EPOCHS.pop(root, None)
 
         thread = threading.Thread(
             target=worker, name="vireo-volume-probe", daemon=True,
         )
         _GENERIC_PROBES[root] = thread
+        _GENERIC_PROBE_EPOCHS[root] = current_invalidation_epoch()
         thread.start()
     thread.join(timeout)
     if thread.is_alive():
@@ -937,6 +1029,49 @@ def _probe_root_generic(root, timeout):
         # fails closed instead of stacking another stuck thread.
         return False
     return bool(outcome.get("ok"))
+
+
+def _live_forgotten_generic_probes():
+    """Prune finished forgotten threads; return how many are still running.
+
+    Callers must hold ``_GENERIC_PROBE_LOCK``.
+    """
+    for thread in list(_FORGOTTEN_GENERIC_PROBES):
+        if not thread.is_alive():
+            _FORGOTTEN_GENERIC_PROBES.discard(thread)
+    return len(_FORGOTTEN_GENERIC_PROBES)
+
+
+def _forget_wedged_probes():
+    """Let one fresh probe run for each root whose probe is wedged.
+
+    A probe that timed out keeps its root registered — the macOS one as an
+    abandoned (killed but unreaped) process, the generic one as a live daemon
+    thread — so that *automatic* polls fail fast instead of stacking probes on
+    a dead share. That is right for polling and wrong for an explicit recheck:
+    the registration alone answers "offline" for a volume nobody has looked at
+    since the user remounted it, and the banner would stamp a fresh check time
+    over an answer no probe produced.
+
+    Dropping the registration lets exactly one new probe start per root; if
+    the share is still dead that probe times out and re-arms the fast path.
+    Both releases are owner-checked, so a reaper or worker finishing later
+    cannot free a slot twice, and the still-running probes move to the
+    forgotten sets so they keep counting against the global caps.
+    """
+    # Bump first: a probe that is running right now and crosses its timeout
+    # a moment after the sweep below registers itself with the *old* epoch,
+    # so the reservation path evicts it instead of failing closed on it.
+    _bump_invalidation_epoch()
+    with _NETWORK_PROBE_CONDITION:
+        for root in list(_ABANDONED_NETWORK_PROBES):
+            _forget_network_probe_locked(root)
+    with _GENERIC_PROBE_LOCK:
+        for root, thread in list(_GENERIC_PROBES.items()):
+            if thread.is_alive():
+                del _GENERIC_PROBES[root]
+                _GENERIC_PROBE_EPOCHS.pop(root, None)
+                _FORGOTTEN_GENERIC_PROBES.add(thread)
 
 
 def _darwin_listing_is_directory(stdout):
@@ -1005,6 +1140,10 @@ class VolumeReachability:
         # slot (which would fail the loser closed and cache a false
         # "offline" verdict).
         self._root_locks = {}
+        # Bumped by ``clear``. A probe carries the generation it started
+        # under and only publishes its answer if that generation is still
+        # current — see ``root_reachable``.
+        self._generation = 0
 
     def _root_lock(self, root):
         with self._lock:
@@ -1026,7 +1165,16 @@ class VolumeReachability:
             return reachable
 
     def root_reachable(self, root):
-        """Return the (cached or freshly probed) verdict for a mount root."""
+        """Return the (cached or freshly probed) verdict for a mount root.
+
+        A probe can take seconds on a dead share, so ``clear`` may land while
+        one is in flight. The answer is then about the world *before* the
+        clear: publishing it would let the very next check consume a stale
+        "offline" for a volume the user has just remounted — exactly the case
+        the manual recheck exists to serve. The generation snapshot below
+        drops such a write. The caller still gets its own answer; only the
+        cache is protected, so the next caller probes afresh.
+        """
         cached = self._fresh_verdict(root)
         if cached is not None:
             return cached
@@ -1034,13 +1182,16 @@ class VolumeReachability:
             cached = self._fresh_verdict(root)
             if cached is not None:
                 return cached
+            with self._lock:
+                generation = self._generation
             try:
                 reachable = bool(self._probe(root))
             except Exception:
                 log.exception("volume probe raised for %s; treating as offline", root)
                 reachable = False
             with self._lock:
-                self._verdicts[root] = (reachable, self._clock())
+                if generation == self._generation:
+                    self._verdicts[root] = (reachable, self._clock())
             if not reachable:
                 log.warning("Volume %s is not reachable", root)
             return reachable
@@ -1071,18 +1222,40 @@ class VolumeReachability:
                 return root, False
         return candidates[-1], True
 
-    def mark_offline(self, root):
+    def current_generation(self):
+        """Generation to quote back to :meth:`mark_offline` (see there)."""
+        with self._lock:
+            return self._generation
+
+    def mark_offline(self, root, generation=None):
         """Record that ``root`` was just observed offline (e.g. ``ENOTCONN``
-        mid-walk) so subsequent checks fail fast within the backoff window."""
+        mid-walk) so subsequent checks fail fast within the backoff window.
+
+        ``generation`` is what :meth:`current_generation` returned when the
+        caller started. An outage seen through a handle opened before an
+        intervening :meth:`clear` describes the volume as it was *then*: a
+        walk that began before the user remounted can surface its delayed
+        ``ENOTCONN`` afterwards, and republishing it would undo the clear and
+        send the next check straight past the volume again. Callers with no
+        generation to quote (test doubles, one-off observations) still
+        publish unconditionally.
+        """
         if not root:
             return
         with self._lock:
+            if generation is not None and generation != self._generation:
+                log.debug(
+                    "Dropping offline report for %s from a walk that started "
+                    "before the reachability cache was cleared", root,
+                )
+                return
             self._verdicts[root] = (False, self._clock())
         log.warning("Volume %s went offline during a filesystem walk", root)
 
     def clear(self):
         with self._lock:
             self._verdicts.clear()
+            self._generation += 1
 
 
 _shared = VolumeReachability()
@@ -1091,3 +1264,24 @@ _shared = VolumeReachability()
 def get_shared():
     """Process-wide gate shared by the navbar probe, walks, and scans."""
     return _shared
+
+
+def invalidate_caches():
+    """Forget every cached reachability verdict and re-read the mount table.
+
+    Both caches exist to keep *automatic* polling off a dead share, and both
+    expire on their own within 30s. Someone who just remounted a volume and
+    explicitly asked Vireo to check again should not have to wait out a timer
+    they cannot see, so the user-initiated path drops them up front. Nothing
+    here touches a mounted filesystem: the mount table is read from the
+    kernel (Linux) or ``mount(8)`` (macOS), and the verdicts are discarded
+    without being re-probed.
+
+    Forgetting the verdicts is not enough on its own: a root whose probe
+    timed out is still registered as in flight, and the next check would fail
+    closed on that registration without touching the share. See
+    :func:`_forget_wedged_probes`.
+    """
+    _forget_wedged_probes()
+    _shared.clear()
+    _system_mount_roots(force_refresh=True)

@@ -1011,3 +1011,219 @@ def test_drive_is_remote_is_false_off_windows():
     if sys.platform == "win32":
         pytest.skip("Windows asks the mount manager")
     assert vr._drive_is_remote("Z:") is False
+
+
+def test_invalidate_caches_drops_verdicts_and_rereads_the_mount_table(monkeypatch):
+    """The manual "Check again" path: both 30s caches that keep automatic
+    polls off a dead share are dropped up front, so a share the user just
+    remounted is probed again immediately."""
+    gate = vr.get_shared()
+    refreshes = []
+    monkeypatch.setattr(
+        vr, "_system_mount_roots",
+        lambda **kwargs: refreshes.append(kwargs) or set(),
+    )
+    try:
+        with gate._lock:
+            gate._verdicts["/Volumes/NAS"] = (False, gate._clock())
+        vr.invalidate_caches()
+        assert gate._verdicts == {}
+        assert refreshes == [{"force_refresh": True}]
+    finally:
+        gate.clear()
+
+
+def test_clear_discards_a_probe_that_was_already_running():
+    """A probe launched before ``clear`` must not publish its answer after it.
+
+    A probe of a dead share takes seconds, so the manual recheck can land
+    mid-probe. Publishing that pre-clear "offline" would make the fresh walk
+    skip a volume the user has just remounted — the exact failure the recheck
+    exists to prevent.
+    """
+    import threading
+
+    started = threading.Event()
+    release = threading.Event()
+    probes = []
+
+    def probe(root):
+        probes.append(root)
+        if len(probes) == 1:
+            started.set()
+            release.wait(5)
+            return False
+        return True
+
+    gate = vr.VolumeReachability(probe=probe)
+    worker = threading.Thread(
+        target=lambda: gate.root_reachable("/Volumes/NAS"), daemon=True,
+    )
+    worker.start()
+    assert started.wait(2)
+
+    gate.clear()
+    release.set()
+    worker.join(5)
+    assert not worker.is_alive()
+
+    # The in-flight answer was dropped rather than written back...
+    assert gate._verdicts == {}
+    # ...so the next caller probes again and sees the remounted volume.
+    assert gate.root_reachable("/Volumes/NAS") is True
+    assert probes == ["/Volumes/NAS", "/Volumes/NAS"]
+
+
+class _WedgedProcess:
+    """Killed probe still stuck in uninterruptible I/O: never exits until the
+    test releases it, so ``poll()`` keeps reporting it as running."""
+
+    def __init__(self):
+        import threading
+        self.released = threading.Event()
+
+    def kill(self):
+        pass
+
+    def poll(self):
+        return 0 if self.released.is_set() else None
+
+    def communicate(self, timeout=None):
+        self.released.wait(10)
+        return ("", "")
+
+
+def test_invalidate_caches_lets_a_wedged_macos_probe_be_retried(monkeypatch):
+    """A probe that timed out keeps its root registered so automatic polls
+    fail fast. An explicit recheck must be able to probe anyway — otherwise
+    "Check again" answers offline from the registration alone, without ever
+    looking at the volume the user just remounted."""
+    root = "/Volumes/WedgedNAS"
+    process = _WedgedProcess()
+    monkeypatch.setattr(vr, "_system_mount_roots", lambda **kwargs: set())
+    try:
+        with vr._NETWORK_PROBE_CONDITION:
+            vr._NETWORK_PROBES[root] = process
+        vr._abandon_network_probe(root, process)
+        assert vr._reserve_network_probe(root) is False
+
+        vr.invalidate_caches()
+
+        assert vr._reserve_network_probe(root) is True
+        # The wedged process is untracked as a blocker but still counts
+        # against the global cap while it runs.
+        assert process in vr._FORGOTTEN_NETWORK_PROBES
+    finally:
+        vr._release_network_probe(root, vr._NETWORK_PROBE_RESERVED)
+        process.released.set()
+        with vr._NETWORK_PROBE_CONDITION:
+            vr._NETWORK_PROBES.pop(root, None)
+            vr._ABANDONED_NETWORK_PROBES.discard(root)
+            vr._FORGOTTEN_NETWORK_PROBES.discard(process)
+
+
+def test_invalidate_caches_lets_a_wedged_generic_probe_be_retried(monkeypatch):
+    """Same for the non-macOS thread probe: a live wedged thread makes every
+    later check fail closed without probing."""
+    import threading
+
+    root = "/mnt/wedged"
+    release = threading.Event()
+    stuck = threading.Thread(target=lambda: release.wait(10), daemon=True)
+    stuck.start()
+    monkeypatch.setattr(vr, "_system_mount_roots", lambda **kwargs: set())
+    monkeypatch.setattr(vr, "_classify_generic_root", lambda r: True)
+    try:
+        with vr._GENERIC_PROBE_LOCK:
+            vr._GENERIC_PROBES[root] = stuck
+        assert vr._probe_root_generic(root, 0.5) is False
+
+        vr.invalidate_caches()
+
+        assert vr._probe_root_generic(root, 2) is True
+        assert stuck in vr._FORGOTTEN_GENERIC_PROBES
+    finally:
+        release.set()
+        stuck.join(5)
+        with vr._GENERIC_PROBE_LOCK:
+            vr._GENERIC_PROBES.pop(root, None)
+            vr._FORGOTTEN_GENERIC_PROBES.discard(stuck)
+
+
+def test_mark_offline_from_a_walk_that_predates_clear_is_dropped():
+    """A walk that started before the manual recheck can surface its delayed
+    ENOTCONN afterwards. Republishing it would undo the clear and send the
+    next check straight past a volume the user has just remounted."""
+    gate = vr.VolumeReachability(probe=lambda root: True)
+    generation = gate.current_generation()
+
+    gate.clear()
+    gate.mark_offline("/Volumes/NAS", generation=generation)
+    assert gate._verdicts == {}
+
+    # An observation from a walk that started after the clear still counts,
+    # and a caller with no generation to quote is unaffected.
+    gate.mark_offline("/Volumes/NAS", generation=gate.current_generation())
+    assert gate._verdicts["/Volumes/NAS"][0] is False
+    gate.clear()
+    gate.mark_offline("/Volumes/NAS")
+    assert gate._verdicts["/Volumes/NAS"][0] is False
+
+
+def test_a_probe_that_times_out_during_invalidation_does_not_block_the_recheck(
+    monkeypatch,
+):
+    """The window a one-shot sweep cannot close: a probe still inside its
+    timeout when the recheck lands, abandoning itself immediately after. It
+    dates from before the remount, so it must not answer for the volume."""
+    root = "/Volumes/LateNAS"
+    process = _WedgedProcess()
+    monkeypatch.setattr(vr, "_system_mount_roots", lambda **kwargs: set())
+    epoch_at_probe_start = vr.current_invalidation_epoch()
+    try:
+        # The recheck runs while the probe is still in flight...
+        vr.invalidate_caches()
+        # ...and only then does the probe give up and register its root.
+        with vr._NETWORK_PROBE_CONDITION:
+            vr._NETWORK_PROBES[root] = process
+        vr._abandon_network_probe(root, process, epoch_at_probe_start)
+
+        assert vr._reserve_network_probe(root) is True
+        assert process in vr._FORGOTTEN_NETWORK_PROBES
+    finally:
+        vr._release_network_probe(root, vr._NETWORK_PROBE_RESERVED)
+        process.released.set()
+        with vr._NETWORK_PROBE_CONDITION:
+            vr._NETWORK_PROBES.pop(root, None)
+            vr._ABANDONED_NETWORK_PROBES.discard(root)
+            vr._ABANDONED_PROBE_EPOCHS.pop(root, None)
+            vr._FORGOTTEN_NETWORK_PROBES.discard(process)
+
+
+def test_a_generic_probe_started_before_the_recheck_does_not_block_it(monkeypatch):
+    """Same window on the thread probe: one that was already running when the
+    recheck landed cannot stand in for a look at the volume now."""
+    import threading
+
+    root = "/mnt/late"
+    release = threading.Event()
+    stuck = threading.Thread(target=lambda: release.wait(10), daemon=True)
+    stuck.start()
+    monkeypatch.setattr(vr, "_system_mount_roots", lambda **kwargs: set())
+    monkeypatch.setattr(vr, "_classify_generic_root", lambda r: True)
+    try:
+        with vr._GENERIC_PROBE_LOCK:
+            vr._GENERIC_PROBES[root] = stuck
+            vr._GENERIC_PROBE_EPOCHS[root] = vr.current_invalidation_epoch()
+        assert vr._probe_root_generic(root, 0.5) is False
+
+        vr.invalidate_caches()
+
+        assert vr._probe_root_generic(root, 2) is True
+    finally:
+        release.set()
+        stuck.join(5)
+        with vr._GENERIC_PROBE_LOCK:
+            vr._GENERIC_PROBES.pop(root, None)
+            vr._GENERIC_PROBE_EPOCHS.pop(root, None)
+            vr._FORGOTTEN_GENERIC_PROBES.discard(stuck)

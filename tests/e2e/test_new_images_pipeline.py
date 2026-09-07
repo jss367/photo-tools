@@ -323,3 +323,228 @@ def test_dismissed_count_rearms_when_a_folder_goes_offline(fresh_server, page, m
     page.reload()
     expect(banner).to_be_visible(timeout=5000)
     expect(page.locator("#newImagesMsg")).to_contain_text("offline and not checked")
+
+
+class _RemountableGate(_OfflineGate):
+    """Offline gate for a share that can come back mid-test."""
+
+    def __init__(self, offline_prefix):
+        super().__init__(offline_prefix)
+        self.online = False
+
+    def check(self, path):
+        if self.online:
+            return None, True
+        return super().check(path)
+
+
+def test_offline_banner_offers_a_manual_recheck(fresh_server, page, monkeypatch):
+    """A user who just remounted the share can click "Check again" and get
+    the real count now, instead of waiting out the invisible 30s caches that
+    the automatic poll relies on."""
+    import volume_reachability
+
+    url = fresh_server["url"]
+    photo_dir = fresh_server["photo_dir"]
+    _write_jpeg(photo_dir / "IMG_0005.JPG")
+    gate = _RemountableGate(photo_dir)
+    monkeypatch.setattr(volume_reachability, "get_shared", lambda: gate)
+    _clear_new_images_cache()
+
+    page.goto(f"{url}/browse")
+    expect(page.locator("#newImagesBanner")).to_be_visible(timeout=5000)
+    msg = page.locator("#newImagesMsg")
+    expect(msg).to_contain_text("Couldn't check for new images")
+    # Every full path stays available even when the sentence abbreviates.
+    expect(msg).to_have_attribute("title", str(photo_dir))
+    # The walk behind the notice is timestamped, so a recheck that finds the
+    # volume still offline is distinguishable from a frozen banner.
+    expect(page.locator("#newImagesCheckedAt")).to_contain_text("checked")
+
+    recheck = page.locator("#newImagesRecheck")
+    expect(recheck).to_be_visible()
+
+    gate.online = True
+    recheck.click()
+    expect(msg).to_contain_text("1 new image", timeout=15000)
+    expect(recheck).to_be_hidden()
+    expect(page.locator("#newImagesCheckedAt")).to_have_text("")
+
+
+def test_check_again_is_not_swallowed_by_an_in_flight_poll(fresh_server, page, monkeypatch):
+    """Clicking "Check again" while the 60s poll is mid-request must still
+    produce a post-invalidation walk. The in-flight poll was issued before
+    the recheck cleared the caches, so its answer predates the click; without
+    a queued re-poll the banner would sit on the stale offline notice until
+    the next 60s tick."""
+    import volume_reachability
+
+    url = fresh_server["url"]
+    photo_dir = fresh_server["photo_dir"]
+    _write_jpeg(photo_dir / "IMG_0006.JPG")
+    gate = _RemountableGate(photo_dir)
+    monkeypatch.setattr(volume_reachability, "get_shared", lambda: gate)
+    _clear_new_images_cache()
+
+    page.goto(f"{url}/browse")
+    msg = page.locator("#newImagesMsg")
+    expect(msg).to_contain_text("Couldn't check for new images", timeout=5000)
+
+    # Hold the *response* of the next navbar poll: the request goes out (and
+    # is answered with the offline state) but the client does not see it
+    # until the test releases it.
+    page.evaluate("""() => {
+      const realFetch = window.fetch;
+      window.__hold = true;
+      window.__release = null;
+      window.fetch = (u, o) => {
+        const pending = realFetch(u, o);
+        if (window.__hold && String(u).includes('new-images')
+            && !String(u).includes('recheck')) {
+          return new Promise(resolve => {
+            window.__release = () => { window.__hold = false; resolve(pending); };
+          });
+        }
+        return pending;
+      };
+    }""")
+    page.evaluate("void checkNewImages()")
+    page.wait_for_function("() => window.__release !== null", timeout=5000)
+
+    gate.online = True
+    page.locator("#newImagesRecheck").click()
+    # The recheck landed while the poll above was still open, so the button
+    # stays busy rather than being released by the stale answer.
+    expect(page.locator("#newImagesRecheck")).to_be_disabled()
+
+    page.evaluate("window.__release()")
+    expect(msg).to_contain_text("1 new image", timeout=15000)
+
+
+def test_check_again_releases_the_button_when_the_recheck_fails(
+    fresh_server, page, monkeypatch,
+):
+    """A rejected recheck POST clears nothing, so polling would redraw the
+    same cached answer and read as "checked again, still offline". The button
+    comes back instead, so the click can be retried."""
+    import volume_reachability
+
+    url = fresh_server["url"]
+    photo_dir = fresh_server["photo_dir"]
+    _write_jpeg(photo_dir / "IMG_0007.JPG")
+    gate = _RemountableGate(photo_dir)
+    monkeypatch.setattr(volume_reachability, "get_shared", lambda: gate)
+    _clear_new_images_cache()
+
+    page.goto(f"{url}/browse")
+    msg = page.locator("#newImagesMsg")
+    expect(msg).to_contain_text("Couldn't check for new images", timeout=5000)
+
+    page.evaluate("""() => {
+      const realFetch = window.fetch;
+      window.fetch = (u, o) => (String(u).includes('recheck')
+        ? Promise.resolve(new Response('', {status: 500}))
+        : realFetch(u, o));
+    }""")
+    # Even with the volume back, a failed recheck must not be reported as a
+    # completed check: nothing was invalidated, so the cached answer stands.
+    gate.online = True
+    page.locator("#newImagesRecheck").click()
+    expect(page.locator("#newImagesCheckedAt")).to_contain_text(
+        "recheck failed", timeout=5000,
+    )
+    expect(page.locator("#newImagesRecheck")).to_be_enabled()
+    expect(msg).to_contain_text("Couldn't check for new images")
+
+
+def test_check_again_releases_the_button_when_the_follow_up_poll_fails(
+    fresh_server, page, monkeypatch,
+):
+    """The recheck POST can succeed and the poll behind it still fail. The
+    button must not sit on "Checking..." until some later 60s tick happens to
+    return a final payload."""
+    import volume_reachability
+
+    url = fresh_server["url"]
+    photo_dir = fresh_server["photo_dir"]
+    _write_jpeg(photo_dir / "IMG_0008.JPG")
+    gate = _RemountableGate(photo_dir)
+    monkeypatch.setattr(volume_reachability, "get_shared", lambda: gate)
+    _clear_new_images_cache()
+
+    page.goto(f"{url}/browse")
+    msg = page.locator("#newImagesMsg")
+    expect(msg).to_contain_text("Couldn't check for new images", timeout=5000)
+
+    # The POST goes through; only the GET behind it is rejected.
+    page.evaluate("""() => {
+      const realFetch = window.fetch;
+      window.fetch = (u, o) => (
+        String(u).includes('new-images') && !String(u).includes('recheck')
+          ? Promise.resolve(new Response('', {status: 500}))
+          : realFetch(u, o));
+    }""")
+    page.locator("#newImagesRecheck").click()
+    expect(page.locator("#newImagesCheckedAt")).to_contain_text(
+        "recheck failed", timeout=5000,
+    )
+    expect(page.locator("#newImagesRecheck")).to_be_enabled()
+
+
+def test_a_poll_landing_mid_recheck_does_not_release_the_button(
+    fresh_server, page, monkeypatch,
+):
+    """A 60s poll that was already in flight when "Check again" was clicked
+    answers a question from before the invalidation. Rendering it must not
+    re-enable the button — the recheck is still running, and an enabled
+    button invites a duplicate invalidation."""
+    import volume_reachability
+
+    url = fresh_server["url"]
+    photo_dir = fresh_server["photo_dir"]
+    _write_jpeg(photo_dir / "IMG_0009.JPG")
+    gate = _RemountableGate(photo_dir)
+    monkeypatch.setattr(volume_reachability, "get_shared", lambda: gate)
+    _clear_new_images_cache()
+
+    page.goto(f"{url}/browse")
+    msg = page.locator("#newImagesMsg")
+    expect(msg).to_contain_text("Couldn't check for new images", timeout=5000)
+
+    # Hold both the next poll's response and the recheck POST, so the stale
+    # poll can be made to land first — while the POST is still open.
+    page.evaluate("""() => {
+      const realFetch = window.fetch;
+      window.__releaseGet = null;
+      window.__releasePost = null;
+      window.fetch = (u, o) => {
+        const pending = realFetch(u, o);
+        if (String(u).includes('recheck')) {
+          return new Promise(resolve => {
+            window.__releasePost = () => resolve(pending);
+          });
+        }
+        if (String(u).includes('new-images') && window.__releaseGet === null) {
+          return new Promise(resolve => {
+            window.__releaseGet = () => resolve(pending);
+          });
+        }
+        return pending;
+      };
+    }""")
+    page.evaluate("void checkNewImages()")
+    page.wait_for_function("() => window.__releaseGet !== null", timeout=5000)
+
+    gate.online = True
+    recheck = page.locator("#newImagesRecheck")
+    recheck.click()
+    page.wait_for_function("() => window.__releasePost !== null", timeout=5000)
+
+    # The pre-invalidation poll lands while the POST is still open.
+    page.evaluate("window.__releaseGet()")
+    page.wait_for_timeout(300)
+    expect(recheck).to_be_disabled()
+
+    # Once the invalidation lands, the recheck's own poll concludes it.
+    page.evaluate("window.__releasePost()")
+    expect(msg).to_contain_text("1 new image", timeout=15000)

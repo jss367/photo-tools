@@ -1822,12 +1822,14 @@ input[type=text], input[type=date], select, .path-input, .text-input, .model-sel
   border-bottom: 1px solid var(--border-primary, #14374E);
 }
 .new-images-banner a,
-.new-images-banner .banner-cta {
+.new-images-banner .banner-cta,
+.new-images-banner .banner-recheck {
   color: var(--accent, #24E5CA);
   font-weight: 600;
   text-decoration: underline;
 }
-.new-images-banner .banner-cta {
+.new-images-banner .banner-cta,
+.new-images-banner .banner-recheck {
   background: none;
   border: none;
   padding: 0;
@@ -1835,7 +1837,19 @@ input[type=text], input[type=date], select, .path-input, .text-input, .model-sel
   cursor: pointer;
 }
 .new-images-banner a:hover,
-.new-images-banner .banner-cta:hover { opacity: 0.85; }
+.new-images-banner .banner-cta:hover,
+.new-images-banner .banner-recheck:hover { opacity: 0.85; }
+.new-images-banner .banner-recheck:disabled {
+  color: var(--text-secondary, #9fb3bd);
+  cursor: default;
+  text-decoration: none;
+}
+/* Timestamp of the walk behind an offline notice — secondary information,
+   so it reads as a footnote rather than competing with the sentence. */
+.new-images-banner .banner-meta {
+  color: var(--text-secondary, #9fb3bd);
+  font-size: 12px;
+}
 .new-images-banner .banner-dismiss {
   color: var(--text-secondary, #9fb3bd);
 }
@@ -2584,6 +2598,9 @@ function sendReport() {
 <div class="new-images-banner" id="newImagesBanner" style="display:none;">
   <span id="newImagesMsg"></span>
   <button type="button" class="banner-cta" onclick="reviewNewImagesImport(this)">Review import</button>
+  <button type="button" class="banner-recheck" id="newImagesRecheck"
+          style="display:none;" onclick="recheckNewImages()">Check again</button>
+  <span class="banner-meta" id="newImagesCheckedAt"></span>
   <button class="banner-dismiss" onclick="dismissNewImagesBanner()">&times;</button>
 </div>
 
@@ -13417,9 +13434,37 @@ function _isNewImagesDismissed(wsId, newCount, offlineRoots) {
 // start-of-call clearTimeout only catches the most recent handle.
 let _newImagesPendingTimer = null;
 let _newImagesInFlight = false;
+// Set when a *forced* check — the manual recheck — is dropped by the
+// in-flight guard. That poll was issued before the recheck cleared the
+// caches, so its answer predates the request and the client would otherwise
+// render the pre-recheck state and wait out the full 60s interval before
+// walking again. Run one more check the moment it lands instead.
+let _newImagesForcedRerun = false;
+// Non-zero while a manual recheck is outstanding. The click takes a token and
+// the token is recorded in _newImagesInvalidatedToken once the POST that
+// clears the caches returns. A poll that was already in flight at either
+// moment is answering a question from before the invalidation: it must not
+// release the button or present its payload as the recheck's answer, or the
+// button reads "Check again" while the recheck is still running and a second
+// click can fire a duplicate invalidation.
+let _newImagesRecheckToken = 0;
+let _newImagesRecheckSeq = 0;
+let _newImagesInvalidatedToken = 0;
 
-async function checkNewImages() {
-  if (_newImagesInFlight) return;
+// Whether a call that started with ``startInvalidated`` is entitled to
+// conclude the outstanding recheck. Evaluated at render time, because the
+// token can change while a call is in flight.
+function _newImagesAnswersRecheck(startInvalidated) {
+  return _newImagesRecheckToken === 0
+    || startInvalidated === _newImagesRecheckToken;
+}
+
+async function checkNewImages(options) {
+  if (_newImagesInFlight) {
+    if (options && options.force) _newImagesForcedRerun = true;
+    return;
+  }
+  const startInvalidated = _newImagesInvalidatedToken;
   if (_newImagesPendingTimer !== null) {
     clearTimeout(_newImagesPendingTimer);
     _newImagesPendingTimer = null;
@@ -13427,7 +13472,10 @@ async function checkNewImages() {
   _newImagesInFlight = true;
   try {
     const resp = await fetch('/api/workspaces/active/new-images');
-    if (!resp.ok) return;
+    if (!resp.ok) {
+      _failNewImagesRecheck(_newImagesAnswersRecheck(startInvalidated));
+      return;
+    }
     const data = await resp.json();
     // The backend returns ``pending: true`` when a fresh-cache walk is still
     // running in the background. The result will land in the cache shortly,
@@ -13442,6 +13490,11 @@ async function checkNewImages() {
     if (data && data.error) {
       const banner = document.getElementById('newImagesBanner');
       if (banner) banner.style.display = 'none';
+      if (!_newImagesForcedRerun
+          && _newImagesAnswersRecheck(startInvalidated)) {
+        _newImagesRecheckToken = 0;
+        _setNewImagesRecheckBusy(false);
+      }
       return;
     }
     const banner = document.getElementById('newImagesBanner');
@@ -13483,6 +13536,7 @@ async function checkNewImages() {
       }
       msg.textContent = text;
       if (cta) cta.style.display = '';
+      _applyOfflineBannerDetail(unreachable, data.checked_at);
       banner.dataset.count = String(data.new_count);
       banner.style.display = 'flex';
     } else if (data.new_count === 0 && unreachable.length && wsId !== '' && !_isNewImagesDismissed(wsId, 0, unreachable)) {
@@ -13493,18 +13547,158 @@ async function checkNewImages() {
       // roots must stay dismissed, not fall through to this notice.)
       msg.textContent = `Couldn't check for new images: ${_offlineRootsPhrase(unreachable)} offline.`;
       if (cta) cta.style.display = 'none';
+      _applyOfflineBannerDetail(unreachable, data.checked_at);
       banner.dataset.count = '0';
       banner.style.display = 'flex';
     } else {
       banner.style.display = 'none';
     }
-  } catch (e) { /* ignore */ }
-  finally { _newImagesInFlight = false; }
+    // A payload we could render is a finished answer, so the manual
+    // "Check again" is done regardless of which branch above ran — unless a
+    // forced re-poll is queued behind this one, in which case this payload
+    // predates the recheck and the button is still working.
+    if (!_newImagesForcedRerun && _newImagesAnswersRecheck(startInvalidated)) {
+      _newImagesRecheckToken = 0;
+      _setNewImagesRecheckBusy(false);
+    }
+  } catch (e) {
+    // Network error or malformed payload: the recheck produced no answer,
+    // so hand the button back rather than leaving it disabled.
+    _failNewImagesRecheck(_newImagesAnswersRecheck(startInvalidated));
+  }
+  finally {
+    _newImagesInFlight = false;
+    if (_newImagesForcedRerun) {
+      _newImagesForcedRerun = false;
+      // Supersedes any pending-retry timer this call just scheduled: the
+      // queued check is the one that observes post-invalidation state.
+      if (_newImagesPendingTimer !== null) clearTimeout(_newImagesPendingTimer);
+      _newImagesPendingTimer = setTimeout(
+        () => checkNewImages({force: true}), 0,
+      );
+    }
+  }
 }
 
+// Beyond this many folders the list is summarized; the full set is always
+// on the message's title attribute.
+const OFFLINE_ROOTS_MAX_LISTED = 6;
+
+// Subject of "... offline", naming the roots the walk had to skip.
+//
+// Registered folders are typically siblings under one long path, so spelling
+// out five absolute paths inline buries the only part that differs. Factor
+// the shared parent out and list just the tails: the differences end up next
+// to each other instead of at the end of five near-identical strings.
 function _offlineRootsPhrase(roots) {
   if (roots.length === 1) return `${roots[0]} is`;
-  return `${roots.length} folders (${roots.join(', ')}) are`;
+  const sorted = roots.slice().sort();
+  const partsList = sorted.map(p => p.split(/[\\/]/));
+  const depth = _commonParentDepth(partsList);
+  // Depth 1 is just the filesystem root (or a bare drive) — naming it saves
+  // nothing and the "tails" would still be near-full paths.
+  const sep = (sorted[0].indexOf('\\') !== -1 && sorted[0].indexOf('/') === -1)
+    ? '\\' : '/';
+  const prefix = depth >= 2 ? partsList[0].slice(0, depth).join(sep) : '';
+  const labels = partsList.map(parts => parts.slice(prefix ? depth : 0).join(sep));
+  const shown = labels.slice(0, OFFLINE_ROOTS_MAX_LISTED);
+  const hidden = labels.length - shown.length;
+  const list = hidden > 0
+    ? `${shown.join(', ')} and ${hidden} more`
+    : shown.join(', ');
+  return `${sorted.length} folders${prefix ? ` in ${prefix}` : ''} (${list}) are`;
+}
+
+// Number of leading path components every path shares, never consuming a
+// path's own last component so each one keeps a non-empty tail.
+function _commonParentDepth(partsList) {
+  const shortest = Math.min(...partsList.map(parts => parts.length));
+  let depth = 0;
+  while (depth < shortest - 1
+         && partsList.every(parts => parts[depth] === partsList[0][depth])) {
+    depth++;
+  }
+  return depth;
+}
+
+// Detail that rides along with any offline notice: every full path on hover
+// (the sentence itself shows only what differs), the "Check again" button,
+// and the time the walk behind this answer ran — without that stamp, a
+// recheck of a still-offline volume redraws the same sentence and looks
+// like nothing happened.
+function _applyOfflineBannerDetail(roots, checkedAt) {
+  const msg = document.getElementById('newImagesMsg');
+  const recheck = document.getElementById('newImagesRecheck');
+  const stamp = document.getElementById('newImagesCheckedAt');
+  if (msg) msg.title = roots.length ? roots.join('\n') : '';
+  if (recheck) recheck.style.display = roots.length ? '' : 'none';
+  if (stamp) {
+    const when = roots.length ? _formatCheckedAt(checkedAt) : '';
+    stamp.textContent = when ? `checked ${when}` : '';
+  }
+}
+
+function _formatCheckedAt(checkedAt) {
+  const secs = Number(checkedAt);
+  if (!Number.isFinite(secs) || secs <= 0) return '';
+  try {
+    return new Date(secs * 1000).toLocaleTimeString();
+  } catch (e) { return ''; }
+}
+
+// A recheck that produced no answer — rejected request, network error,
+// unreadable payload — says so and hands the button back, instead of holding
+// "Checking..." until some later poll happens to land.
+function _failNewImagesRecheck(answersRecheck) {
+  if (!answersRecheck || _newImagesRecheckToken === 0) return;
+  const stamp = document.getElementById('newImagesCheckedAt');
+  if (stamp) stamp.textContent = 'recheck failed \u2014 try again';
+  _newImagesRecheckToken = 0;
+  _newImagesForcedRerun = false;
+  _setNewImagesRecheckBusy(false);
+}
+
+// The button stays busy until a final payload renders: a recheck drops the
+// cached result, so the poll right after it is usually `pending` and the
+// real answer lands a few seconds later.
+function _setNewImagesRecheckBusy(busy) {
+  const btn = document.getElementById('newImagesRecheck');
+  if (!btn) return;
+  btn.disabled = !!busy;
+  btn.textContent = busy ? 'Checking...' : 'Check again';
+}
+
+// Manual recheck. The automatic poll recovers on its own once the offline
+// caches expire (30s), but those timers are invisible: someone who just
+// remounted the share gets to say "look now" instead of waiting them out.
+async function recheckNewImages() {
+  const btn = document.getElementById('newImagesRecheck');
+  if (btn && btn.disabled) return;
+  // Claim the recheck before awaiting anything: a poll that lands while the
+  // POST is still open (the endpoint re-reads the mount table, which is
+  // bounded but not instant) must not decide the button is idle.
+  const token = ++_newImagesRecheckSeq;
+  _newImagesRecheckToken = token;
+  _setNewImagesRecheckBusy(true);
+  let invalidated = false;
+  try {
+    const resp = await fetch(
+      '/api/workspaces/active/new-images/recheck', {method: 'POST'},
+    );
+    invalidated = resp.ok;
+  } catch (e) { invalidated = false; }
+  if (_newImagesRecheckToken !== token) return;
+  if (!invalidated) {
+    // Nothing was cleared, so polling now would redraw the same cached
+    // answer and read as "checked again, still offline". Say the request
+    // failed and hand the button back so the click can be retried.
+    _failNewImagesRecheck(true);
+    return;
+  }
+  // From here a poll observes post-invalidation state, so it may conclude
+  // the recheck.
+  _newImagesInvalidatedToken = token;
+  await checkNewImages({force: true});
 }
 
 function _offlineRootsKey(roots) {

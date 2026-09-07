@@ -405,6 +405,7 @@ POST         /api/workspaces/active/local-folders/sync
 POST         /api/workspaces/active/local-workspace/discard
 POST         /api/workspaces/active/local-workspace/stage
 POST         /api/workspaces/active/local-workspace/sync
+POST         /api/workspaces/active/new-images/recheck
 POST         /api/workspaces/active/new-images/snapshot
 POST,PUT     /api/photos/<int:photo_id>/edit-recipe
 PUT          /api/collections/<int:collection_id>

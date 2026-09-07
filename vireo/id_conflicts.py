@@ -1275,6 +1275,16 @@ class Snapshot:
             self.by_id = {
                 record.photo_id: index for index, record in enumerate(records)
             }
+            # A sibling can also carry a model no photo in the snapshot had,
+            # and the columns, agreement and filter counts were all derived
+            # without it. Widening the known inventory is enough to correct
+            # that: a page comparing every model sends no model at all, so
+            # the next request resolves to this longer list, fails the
+            # snapshot's ``matches`` check and derives the comparison again
+            # under the full set. A page pinned to a specific model keeps
+            # sending that model and is rightly left alone.
+            if not set(built["models"]).issubset(self.all_models):
+                self.all_models = sorted(set(self.all_models) | set(built["models"]))
 
 
 class SnapshotStore:

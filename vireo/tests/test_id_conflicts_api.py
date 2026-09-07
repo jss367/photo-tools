@@ -266,3 +266,90 @@ def test_unknown_filter_and_sort_fall_back_instead_of_failing(compare_collection
     payload = _get(app, cid, filter="not-a-filter", sort="not-a-sort")
 
     assert payload["total"] == len(photo_ids)
+
+
+def test_a_joining_sibling_that_carries_a_new_model_reassesses(app_and_db):
+    """A sibling pulled into the collection by a grouped decision can carry a
+    model no photo in the snapshot had. Its column, its agreement and its
+    filter counts were all derived without it, so the snapshot has to be
+    derived again rather than keep answering from a stale model inventory."""
+    app, db = app_and_db
+    photo_ids = [
+        row["id"] for row in
+        db.conn.execute("SELECT id FROM photos ORDER BY id").fetchall()
+    ]
+    bird = db.add_keyword("Bird", is_species=True)
+    db.tag_photo(photo_ids[0], bird)
+    db.tag_photo(photo_ids[1], bird)
+    for photo_id in photo_ids:
+        det_ids = db.save_detections(photo_id, [{
+            "box": {"x": 0.1, "y": 0.1, "w": 0.3, "h": 0.3},
+            "confidence": 0.9,
+            "category": "animal",
+        }], detector_model="MDV6")
+        db.add_prediction(det_ids[0], "Bird", 0.9, "model-a")
+        # Only the photo still outside the collection was run through this
+        # model, so nothing in the first snapshot knows it exists.
+        if photo_id == photo_ids[2]:
+            db.add_prediction(det_ids[0], "Sparrow", 0.7, "model-z")
+    cid = db.add_collection(
+        "Birds",
+        json.dumps([{"field": "keyword", "op": "equals", "value": "Bird"}]),
+    )
+
+    first = _get(app, cid, filter="all")
+    assert first["models"] == ["model-a"]
+
+    db.tag_photo(photo_ids[2], bird)
+    refreshed = app.test_client().get(
+        f"/api/predictions/compare?collection_id={cid}&filter=all"
+        f"&token={first['token']}"
+        f"&refresh_photo_id={photo_ids[2]}"
+    ).get_json()
+    assert refreshed["models"] == ["model-a", "model-z"]
+
+    # The page compares every model, so it sends no model at all. That now
+    # resolves to a longer list than the snapshot was derived under, which is
+    # what forces the fresh derivation.
+    corrected = _get(app, cid, filter="all", token=first["token"])
+    assert corrected["token"] != first["token"]
+    assert corrected["models"] == ["model-a", "model-z"]
+    assert corrected["visible_models"] == ["model-a", "model-z"]
+
+
+def test_a_pinned_model_survives_a_sibling_that_widens_the_inventory(app_and_db):
+    """The page pinned to one model keeps asking for that model, so widening
+    the known inventory must not throw its snapshot away underneath it."""
+    app, db = app_and_db
+    photo_ids = [
+        row["id"] for row in
+        db.conn.execute("SELECT id FROM photos ORDER BY id").fetchall()
+    ]
+    bird = db.add_keyword("Bird", is_species=True)
+    db.tag_photo(photo_ids[0], bird)
+    for photo_id in photo_ids:
+        det_ids = db.save_detections(photo_id, [{
+            "box": {"x": 0.1, "y": 0.1, "w": 0.3, "h": 0.3},
+            "confidence": 0.9,
+            "category": "animal",
+        }], detector_model="MDV6")
+        db.add_prediction(det_ids[0], "Bird", 0.9, "model-a")
+        if photo_id == photo_ids[1]:
+            db.add_prediction(det_ids[0], "Sparrow", 0.7, "model-z")
+    cid = db.add_collection(
+        "Birds",
+        json.dumps([{"field": "keyword", "op": "equals", "value": "Bird"}]),
+    )
+
+    first = _get(app, cid, filter="all", model="model-a")
+
+    db.tag_photo(photo_ids[1], bird)
+    app.test_client().get(
+        f"/api/predictions/compare?collection_id={cid}&filter=all"
+        f"&model=model-a&token={first['token']}"
+        f"&refresh_photo_id={photo_ids[1]}"
+    )
+
+    still = _get(app, cid, filter="all", model="model-a", token=first["token"])
+    assert still["token"] == first["token"]
+    assert still["visible_models"] == ["model-a"]

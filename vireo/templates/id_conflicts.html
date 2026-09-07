@@ -696,9 +696,23 @@ async function fetchRows(options) {
   options = options || {};
   var collId = document.getElementById('collectionPicker').value;
   if (!collId) return;
-  var seq = ++requestSeq;
   var fullLoadSeq = loadingSeq;
   showLoading(true);
+  // A control the user just touched — filter, sort, search, threshold, pager
+  // — must not overtake a decision refresh that is still in flight. The
+  // server rebuilds the changed photos inside the stored comparison while
+  // that refresh runs, and a query that reads the comparison first would take
+  // the newer sequence number and then discard the refresh's answer, leaving
+  // the counts and the decided row exactly as they were before the decision.
+  // Waiting for the queue lets the decision land first, so this query reads
+  // the comparison the decision produced. Only user controls wait: the
+  // refresh's own queries run inside the queue and would deadlock on it.
+  if (options.control) {
+    await decisionRefreshQueue;
+  }
+  // Claimed after the wait, so the query the user asked for most recently is
+  // the one that wins rather than the one that stopped waiting last.
+  var seq = ++requestSeq;
   var data;
   try {
     data = await jsonFetch(buildRowsUrl(options));
@@ -767,7 +781,11 @@ function applyRowsResponse(data, options) {
   // re-query inherits this load's intent, so the default-filter decision the
   // caller would have made is made once, on the corrected counts.
   if (modelSelectionReset) {
-    reloadRows({initial: options.initial, afterDecision: options.afterDecision});
+    reloadRows({
+      initial: options.initial,
+      afterDecision: options.afterDecision,
+      internal: true,
+    });
   }
   return modelSelectionReset;
 }
@@ -803,14 +821,19 @@ async function loadComparison() {
 // Re-query the comparison with the current controls, back at the first page.
 // A caller that is re-querying on behalf of a load still owed a default-filter
 // decision passes that intent through so the decision survives the detour.
-// Only those two flags are carried: this also runs as a plain change handler,
-// and handlers are called with arguments of their own.
+// Only those three flags are carried: this also runs as a plain change
+// handler, and handlers are called with arguments of their own.
 function reloadRows(carry) {
   comparePage = 1;
   selectedRows.clear();
   var options = {page: 1};
   if (carry && carry.initial) options.initial = true;
   if (carry && carry.afterDecision) options.afterDecision = true;
+  // A change handler fired by a control the user touched has to queue behind
+  // any decision refresh still running. The one caller that re-queries from
+  // inside the page's own machinery says so, because it can already be
+  // running inside that queue.
+  if (!(carry && carry.internal)) options.control = true;
   return fetchRows(options).catch(function() {});
 }
 
@@ -827,7 +850,7 @@ function goToPage(page) {
   if (page < 1 || page > pages || page === comparePage) return;
   comparePage = page;
   selectedRows.clear();
-  fetchRows({page: page}).catch(function() {});
+  fetchRows({page: page, control: true}).catch(function() {});
 }
 
 function setPerPage(value) {

@@ -755,3 +755,69 @@ def test_compare_search_narrows_the_listed_rows(live_server, page):
 
     rows = page.locator(".compare-table tbody tr")
     expect(rows.first).to_contain_text("Red-tailed Hawk")
+
+
+def test_compare_control_query_waits_for_an_in_flight_decision_refresh(
+    live_server, page,
+):
+    """A filter touched mid-decision reads the comparison the decision made.
+
+    Without the ordering the control query reads the stored comparison before
+    the refresh has patched it, then wins the staleness guard with its newer
+    sequence number and paints pre-decision counts.
+    """
+    page.goto(f"{live_server['url']}/id-conflicts")
+    page.wait_for_function("() => window.compareData !== null")
+
+    result = page.evaluate(
+        """async () => {
+          var baseline = JSON.parse(JSON.stringify(compareData));
+          var photoId = baseline.photos[0].photo_id;
+          var originalFetch = jsonFetch;
+          var calls = [];
+          var releaseRefresh;
+          var refreshGate = new Promise(function(resolve) {
+            releaseRefresh = resolve;
+          });
+          // Stands in for the server's stored comparison: the decision only
+          // shows up in the counts once its refresh has been answered.
+          var serverNeedsReview = 7;
+          jsonFetch = async function(url) {
+            var isRefresh = url.indexOf('refresh_photo_id') >= 0;
+            calls.push(isRefresh ? 'refresh' : 'control');
+            if (isRefresh) {
+              await refreshGate;
+              serverNeedsReview = 3;
+            }
+            var body = JSON.parse(JSON.stringify(baseline));
+            body.summary.needs_review = serverNeedsReview;
+            return body;
+          };
+          try {
+            var refresh = refreshDecisionPhotos([photoId]);
+            await new Promise(function(resolve) { setTimeout(resolve, 0); });
+            // Every user control -- filter, sort, search, threshold, per-page
+            // -- re-queries through reloadRows.
+            activeFilter = 'all';
+            var control = reloadRows();
+            await new Promise(function(resolve) { setTimeout(resolve, 0); });
+            var beforeRelease = calls.slice();
+            releaseRefresh();
+            await refresh;
+            await control;
+            return {
+              beforeRelease: beforeRelease,
+              afterRelease: calls,
+              needsReview: effectiveSummary().needs_review,
+            };
+          } finally {
+            jsonFetch = originalFetch;
+          }
+        }"""
+    )
+
+    assert result == {
+        "beforeRelease": ["refresh"],
+        "afterRelease": ["refresh", "control"],
+        "needsReview": 3,
+    }

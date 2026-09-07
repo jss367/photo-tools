@@ -279,3 +279,16 @@ def test_prepared_manifest_can_resume_before_cli_postprocessing(library, tmp_pat
     assert saved["code"]["source_digest"]
     assert main(["compare", "--resume", str(output), "--partition", "all"]) == 0
     assert (output / "report.html").is_file()
+
+
+@pytest.mark.parametrize("size", [30, 100, 256])
+@pytest.mark.parametrize("seed", [0, 42])
+def test_growing_random_budget_preserves_prior_trials(size, seed):
+    space = {"a": list(range(size))}
+    previous = []
+    for budget in (19, 22, 31, size + 1):
+        trials = parameter_trials(space, "random", budget, seed)
+        assert trials[:len(previous)] == previous
+        assert len({digest(t) for t in trials}) == min(size, budget)
+        previous = trials
+

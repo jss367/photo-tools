@@ -63,9 +63,16 @@ def parameter_trials(space, method, budget, seed):
         return [dict(zip(keys, value, strict=True)) for value in values]
     if method != "random":
         raise ValueError("Search method must be grid or random")
-    indices = random.Random(seed).sample(range(size), min(size, budget))
+    # Sparse Fisher-Yates: each draw depends only on prior draws, so increasing
+    # a resume budget extends the same sequence without dropping cached trials.
+    rng = random.Random(seed)
+    swaps = {}
     trials = []
-    for index in indices:
+    for remaining in range(size, size - min(size, budget), -1):
+        picked = rng.randrange(remaining)
+        index = swaps.get(picked, picked)
+        swaps[picked] = swaps.get(remaining - 1, remaining - 1)
+        swaps.pop(remaining - 1, None)
         trial = {}
         for key in reversed(keys):
             index, offset = divmod(index, len(space[key]))

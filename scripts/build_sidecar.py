@@ -15,6 +15,20 @@ import sys
 from pathlib import Path
 
 
+def assert_no_evaluation_modules(binary_path):
+    """Inspect archive indexes without unpacking the app or running experiments."""
+    from PyInstaller.archive.readers import CArchiveReader
+
+    archive = CArchiveReader(str(binary_path))
+    names = list(archive.toc)
+    for name, entry in archive.toc.items():
+        if entry[-1] == "z":  # PyInstaller's embedded Python module archive
+            names.extend(archive.open_embedded_archive(name).toc)
+    unexpected = [name for name in names if "encounter_eval" in name or "encounter-evaluation" in name]
+    if unexpected:
+        raise RuntimeError(f"Developer evaluation code leaked into the app: {unexpected}")
+
+
 def sign_binary(binary_path, entitlements_path=None):
     """Sign the binary with the hardened runtime for macOS notarization."""
     if platform.system() != "Darwin":
@@ -78,6 +92,9 @@ def main():
         "--onefile",
         "--name", "vireo-server",
         "--paths", vireo_dir,
+        # Offline experiments have a separate environment/package. Exclude them
+        # for local and release builds even if installed in the build environment.
+        "--exclude-module", "encounter_eval",
         # Bundle Flask templates and static assets — destinations are
         # relative to _MEIPASS, and Flask resolves them relative to
         # os.path.dirname(__file__) which is _MEIPASS for the entry script.
@@ -167,6 +184,8 @@ def main():
     src = os.path.join(repo_root, "dist", "vireo-server")
     if platform.system() == "Windows":
         src += ".exe"
+
+    assert_no_evaluation_modules(src)
 
     dest_dir = os.path.join(repo_root, "src-tauri", "binaries")
     os.makedirs(dest_dir, exist_ok=True)

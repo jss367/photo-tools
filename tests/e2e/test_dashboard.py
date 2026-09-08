@@ -31,7 +31,8 @@ def test_dashboard_scope_and_chart_drill_down(live_server, page):
     expect(page).to_have_url(re.compile(r"/browse\?"))
     query = parse_qs(urlparse(page.url).query)
     assert query["folder_id"] == [str(yard_id)]
-    assert query["keyword"] == ["American Robin"]
+    assert query["keyword_label"] == ["American Robin"]
+    assert query["keyword_identity"][0].startswith(("keyword:", "taxon:", "inat:"))
     assert query["dashboard_scope"] == ["1"]
     expect(page.locator(".grid-card")).to_have_count(1)
     expect(page.locator(".grid-card-name")).to_have_text("robin1.jpg")

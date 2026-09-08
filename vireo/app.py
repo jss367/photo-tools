@@ -7689,6 +7689,30 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         keywords = db.get_all_keywords()
         return jsonify([dict(k) for k in keywords])
 
+    @app.route('/api/keywords/identities')
+    def api_keyword_identities():
+        from keyword_identity import grouped_keywords
+        return jsonify(grouped_keywords(_get_db()))
+
+    @app.route('/api/keywords/location-matches')
+    def api_keyword_location_matches():
+        from keyword_identity import location_candidates
+        return jsonify(location_candidates(_get_db()))
+
+    @app.route('/api/keywords/reconcile-location', methods=['POST'])
+    def api_reconcile_keyword_location():
+        from keyword_identity import reconcile_location
+        body = request.get_json(silent=True)
+        if not isinstance(body, dict) or any(
+            type(body.get(key)) is not int for key in ('source_id', 'target_id')
+        ):
+            return json_error('source_id and target_id must be integers', 400)
+        try:
+            result = reconcile_location(_get_db(), body['source_id'], body['target_id'])
+        except ValueError as error:
+            return json_error(str(error), 400)
+        return jsonify(result)
+
     @app.route("/api/keywords")
     def api_keywords():
         db = _get_db()

@@ -294,6 +294,7 @@ def _import_keywords_for_photo(db, photo_id, xmp_path_str):
     # normalizes to `""` (e.g. `"|Birds"` or `"Birds|'|Hawk"`). add_keyword()
     # raises ValueError on those, and letting it propagate would abort the
     # whole scan on a malformed sidecar entry instead of ignoring it.
+    hierarchy_leaf_keys = set()
     for hier in hier_keywords:
         parts = hier.split("|")
         if any(not keyword_match_key(part) for part in parts):
@@ -304,14 +305,15 @@ def _import_keywords_for_photo(db, photo_id, xmp_path_str):
         ):
             continue
         parent_id = None
-        for part in parts:
-            kid = db.add_keyword(part, parent_id=parent_id)
+        for index, part in enumerate(parts):
+            kid = db.add_keyword(part, parent_id=parent_id, _resolve_alias=index == len(parts) - 1)
             parent_id = kid
         # Tag with the leaf keyword. A sidecar term is genuinely ambiguous —
         # the user may have typed it in Lightroom, or Vireo may have written
         # it out itself — so this is one of the few writers that declines to
         # claim manual authorship.
         db.tag_photo(photo_id, parent_id, source=KEYWORD_SOURCE_UNKNOWN)
+        hierarchy_leaf_keys.add(keyword_match_key(parts[-1]))
 
     # Also add any flat keywords not already covered by hierarchy. Compare
     # via the normalized match key on both sides: DB names are stored in
@@ -323,7 +325,7 @@ def _import_keywords_for_photo(db, photo_id, xmp_path_str):
     # add_keyword() and abort the scan.
     existing_keys = {
         keyword_match_key(k["name"]) for k in db.get_photo_keywords(photo_id)
-    }
+    } | hierarchy_leaf_keys
     for kw in flat_keywords:
         key = keyword_match_key(kw)
         if not key:

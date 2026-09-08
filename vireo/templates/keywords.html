@@ -196,6 +196,17 @@
       </button>
       <span class="kw-stats" id="kwStats">Loading...</span>
     </div>
+    <p class="kw-parent">Species and linked places are grouped together. Expand their details to see imported names and paths.</p>
+    <p>
+      <label><input type="checkbox" id="kwShowRecords"> Show individual records for editing</label>
+      <button class="kw-link-btn" id="kwReviewLocations" type="button">Review matching locations</button>
+    </p>
+    <div id="kwLocationReview" hidden>
+      <p>Choose a linked place only when both entries refer to the same location.
+        This combines their photo tags across the catalog, including other workspaces,
+        and remembers the imported path for future imports. Counts below cover the entire catalog.</p>
+      <div id="kwLocationMatches" role="status"></div>
+    </div>
 
     <!-- Bulk action bar -->
     <div class="kw-bulk-bar" id="kwBulkBar">
@@ -218,7 +229,7 @@
       <table class="kw-table" id="kwTable">
         <thead>
           <tr>
-            <th class="cb-cell"><input type="checkbox" id="kwSelectAll" title="Select / deselect all"></th>
+            <th class="cb-cell"><input type="checkbox" id="kwSelectAll" title="Select / deselect editable records"></th>
             <th data-col="name">Name <span class="sort-arrow">&#9650;</span></th>
             <th data-col="type">Type <span class="sort-arrow">&#9650;</span></th>
             <th data-col="parent">Parent <span class="sort-arrow">&#9650;</span></th>
@@ -259,6 +270,8 @@
   const TYPES = ['general','taxonomy','individual','location','genre'];
 
   let allKeywords = [];
+  let identityGroups = [];
+  let showRecords = false;
   let sortCol = 'name';
   let sortDir = 1; // 1 = asc, -1 = desc
   let filterType = 'all';
@@ -270,8 +283,12 @@
   // -- Load data --
   async function loadKeywords() {
     try {
-      const r = await fetch('/api/keywords/all');
-      allKeywords = await r.json();
+      const response = await fetch('/api/keywords/identities');
+      if (!response.ok) throw new Error('Could not load keywords');
+      identityGroups = await response.json();
+      allKeywords = identityGroups.flatMap(group => group.members);
+      const editable = new Set((showRecords ? allKeywords : identityGroups.filter(k => k.members.length === 1)).map(k => k.id));
+      selectedIds.forEach(id => { if (!editable.has(id)) selectedIds.delete(id); });
       parentMap = {};
       allKeywords.forEach(k => { parentMap[k.id] = k.name; });
       render();
@@ -282,7 +299,7 @@
   }
 
   function getFiltered() {
-    let list = allKeywords;
+    let list = showRecords ? allKeywords : identityGroups;
     if (filterType === 'unlinked-location') {
       list = list.filter(k => isActionableUnlinkedLocation(k));
     } else if (filterType !== 'all') {
@@ -290,7 +307,8 @@
     }
     if (searchTerm) {
       const options = VireoTextSearch.readOptions('kwSearch');
-      list = list.filter(k => VireoTextSearch.matchesFields(k.name, searchTerm, options));
+      list = list.filter(k => VireoTextSearch.matchesFields(
+        [k.name].concat((k.paths || (k.path ? [k.path] : [])).map(path => path.join(' → '))).join('\n'), searchTerm, options));
     }
     return list;
   }
@@ -341,7 +359,7 @@
     const empty = document.getElementById('kwEmpty');
     const stats = document.getElementById('kwStats');
 
-    stats.textContent = filtered.length + ' of ' + allKeywords.length + ' keywords';
+    stats.textContent = filtered.length + ' of ' + (showRecords ? allKeywords.length : identityGroups.length) + ' keywords';
     const unlinkedEl = document.getElementById('kwUnlinkedCount');
     if (unlinkedEl) unlinkedEl.textContent = unlinkedLocationCount();
 
@@ -349,12 +367,15 @@
       tbody.innerHTML = '';
       empty.style.display = 'block';
       empty.textContent = searchTerm || filterType !== 'all' ? 'No matching keywords.' : 'No keywords found.';
+      updateBulkBar();
+      updateSelectAllCheckbox();
       return;
     }
     empty.style.display = 'none';
 
     const rows = filtered.map(k => {
       const t = k.type || 'general';
+      const grouped = !showRecords && k.members && k.members.length > 1;
       const icon = TYPE_ICONS[t] || TYPE_ICONS.general;
       const checked = selectedIds.has(k.id) ? 'checked' : '';
       const parentName = k.parent_id ? (parentMap[k.parent_id] || '#' + k.parent_id) : '';
@@ -378,10 +399,14 @@
         }
       }
 
+      const details = !showRecords && k.paths && k.paths.length > 1
+        ? '<details><summary>' + k.paths.length + ' names and paths</summary>' +
+          k.paths.map(path => '<div class="kw-parent">' + escapeHtml(path.join(' → ')) + '</div>').join('') +
+          '<button type="button" class="kw-link-btn" data-edit-records="1">Edit individual records</button></details>' : '';
       return '<tr data-id="' + k.id + '">' +
-        '<td class="cb-cell"><input type="checkbox" class="kw-cb" data-id="' + k.id + '" ' + checked + '></td>' +
-        '<td class="kw-name-cell"><span class="name-text" data-id="' + k.id + '">' + escapeHtml(k.name) + '</span></td>' +
-        '<td><span class="kw-type-badge type-' + t + '" data-id="' + k.id + '" data-type="' + t + '">' + icon + ' ' + t + '</span></td>' +
+        '<td class="cb-cell">' + (grouped ? '' : '<input type="checkbox" class="kw-cb" data-id="' + k.id + '" ' + checked + '>') + '</td>' +
+        '<td class="kw-name-cell"><span class="' + (grouped ? '' : 'name-text') + '" data-id="' + k.id + '">' + escapeHtml(k.name) + '</span>' + details + '</td>' +
+        '<td><span class="kw-type-badge type-' + t + '" ' + (grouped ? '' : 'data-id="' + k.id + '"') + ' data-type="' + t + '">' + icon + ' ' + t + '</span></td>' +
         '<td><span class="kw-parent">' + escapeHtml(parentName) + '</span></td>' +
         '<td><span class="kw-taxon">' + escapeHtml(taxonStr) + '</span></td>' +
         '<td>' + (k.photo_count || 0) + '</td>' +
@@ -395,6 +420,63 @@
   }
 
   // -- Search & filter --
+  document.getElementById('kwShowRecords').addEventListener('change', function() {
+    showRecords = this.checked;
+    selectedIds.clear();
+    render();
+  });
+  document.getElementById('kwBody').addEventListener('click', function(event) {
+    if (!event.target.closest('[data-edit-records]')) return;
+    document.getElementById('kwShowRecords').checked = true;
+    showRecords = true;
+    selectedIds.clear();
+    render();
+  });
+
+  async function loadLocationMatches() {
+    const container = document.getElementById('kwLocationMatches');
+    container.textContent = 'Loading matches…';
+    try {
+      const response = await fetch('/api/keywords/location-matches');
+      if (!response.ok) throw new Error('Could not load location matches.');
+      const matches = await response.json();
+      container.innerHTML = matches.length ? matches.map(c =>
+        '<div style="margin-bottom:12px">' +
+        '<strong>' + escapeHtml(c.source_path.join(' → ')) + '</strong> (' + c.source_count + ' photos)' +
+        '<div>Linked place: ' + escapeHtml(c.target_path.join(' → ')) +
+        ' · <a target="_blank" rel="noopener" href="https://www.google.com/maps/search/?api=1&amp;query=' +
+        encodeURIComponent(c.name) + '&amp;query_place_id=' + encodeURIComponent(c.place_id) + '">View place</a></div>' +
+        '<div>' + c.combined_count + ' distinct photos after combining</div>' +
+        (c.conflicting_photo_count ? '<div>' + c.conflicting_photo_count + ' photos already have a different linked place. Resolve those locations before combining.</div>' : '') +
+        '<button type="button" class="kw-link-btn" ' + (c.conflicting_photo_count ? 'disabled ' : '') +
+        'data-source="' + c.source_id + '" data-target="' + c.target_id + '">Use this place</button></div>'
+      ).join('') : 'No matching location keywords to review.';
+    } catch (error) { container.textContent = error.message; }
+  }
+  document.getElementById('kwReviewLocations').addEventListener('click', function() {
+    document.getElementById('kwLocationReview').hidden = false;
+    loadLocationMatches();
+  });
+  document.getElementById('kwLocationMatches').addEventListener('click', async function(event) {
+    const button = event.target.closest('button[data-source]');
+    if (!button) return;
+    button.disabled = true;
+    try {
+      const response = await fetch('/api/keywords/reconcile-location', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({source_id: Number(button.dataset.source), target_id: Number(button.dataset.target)})
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || 'Could not combine locations.');
+      selectedIds.clear();
+      await loadKeywords();
+      await loadLocationMatches();
+      showToast('Location keywords combined.');
+    } catch (error) {
+      showToast(error.message, 'error');
+      button.disabled = false;
+    }
+  });
   document.getElementById('kwSearch').addEventListener('input', function() {
     searchTerm = this.value.trim();
     render();
@@ -439,7 +521,7 @@
 
   document.getElementById('kwSelectAll').addEventListener('change', function() {
     const checked = this.checked;
-    const filtered = getFiltered();
+    const filtered = getFiltered().filter(k => showRecords || !k.members || k.members.length === 1);
     filtered.forEach(k => {
       if (checked) { selectedIds.add(k.id); } else { selectedIds.delete(k.id); }
     });
@@ -447,7 +529,7 @@
   });
 
   function updateSelectAllCheckbox() {
-    const filtered = getFiltered();
+    const filtered = getFiltered().filter(k => showRecords || !k.members || k.members.length === 1);
     const cb = document.getElementById('kwSelectAll');
     if (!filtered.length) { cb.checked = false; cb.indeterminate = false; return; }
     const allChecked = filtered.every(k => selectedIds.has(k.id));
@@ -466,7 +548,7 @@
   // -- Inline type change via badge click --
   document.getElementById('kwBody').addEventListener('click', function(e) {
     const badge = e.target.closest('.kw-type-badge');
-    if (!badge) return;
+    if (!badge || !badge.dataset.id) return;
     e.stopPropagation();
     closeDropdown();
 
@@ -517,9 +599,8 @@
         await loadKeywords();
         return;
       }
-      const kw = allKeywords.find(k => k.id === kwId);
-      if (kw) kw.type = newType;
-      render();
+      if (!resp.ok) throw new Error(data.error || 'Could not update keyword');
+      await loadKeywords();
     } catch(e) { console.error('Failed to update type', e); }
   }
 
@@ -582,8 +663,8 @@
         await loadKeywords();
         return;
       }
-      const kw = allKeywords.find(k => k.id === kwId);
-      if (kw) { kw.name = newName; parentMap[kw.id] = newName; }
+      if (!resp.ok) throw new Error(data.error || 'Could not rename keyword');
+      await loadKeywords();
     } catch(e) { console.error('Failed to rename', e); }
     render();
   }
@@ -595,7 +676,6 @@
     const ids = Array.from(selectedIds);
     if (!ids.length) return;
 
-    let anyMerged = false;
     for (const id of ids) {
       try {
         const resp = await fetch('/api/keywords/' + id, {
@@ -607,7 +687,6 @@
         if (data && data.merged) {
           // Row was merged into a normalized-equal peer -- can't update in
           // place, will refetch after the loop rather than 100+ round trips.
-          anyMerged = true;
           continue;
         }
         const kw = allKeywords.find(k => k.id === id);
@@ -616,11 +695,7 @@
     }
     selectedIds.clear();
     document.getElementById('kwBulkType').value = '';
-    if (anyMerged) {
-      await loadKeywords();
-    } else {
-      render();
-    }
+    await loadKeywords();
   });
 
   // -- Bulk delete --
@@ -637,7 +712,7 @@
       } catch(e) { console.error('Failed to delete', id, e); }
     }
     selectedIds.clear();
-    render();
+    await loadKeywords();
   }
   document.getElementById('kwBulkDelete').addEventListener('click', deleteSelectedKeywords);
 
@@ -691,6 +766,22 @@
     e.preventDefault();
     const kwId = parseInt(row.dataset.id, 10);
     if (!kwId) return;
+    const group = !showRecords && identityGroups.find(k => k.id === kwId);
+    if (group && group.members.length > 1) {
+      openContextMenu(e, [
+        {label: 'Show photos', onClick: function() {
+          window.location.href = '/browse?keyword_identity=' + encodeURIComponent(group.identity) +
+            '&keyword_label=' + encodeURIComponent(group.name);
+        }},
+        {label: 'Edit individual records', onClick: function() {
+          document.getElementById('kwShowRecords').checked = true;
+          showRecords = true;
+          selectedIds.clear();
+          render();
+        }}
+      ]);
+      return;
+    }
     // Finder-style coercion: right-click outside current selection replaces it.
     const ids = coerceSelectionOnContext(selectedIds, kwId);
     // Re-render so the checkbox visual state reflects the coerced selection.

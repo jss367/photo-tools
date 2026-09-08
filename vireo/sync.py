@@ -8,8 +8,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 
 from db import KEYWORD_SOURCE_UNKNOWN
+from keyword_identity import resolve_import_path
 from keyword_normalization import keyword_match_key
-from xmp import SidecarEditor, read_keywords
+from xmp import SidecarEditor, read_hierarchical_keywords, read_keywords
 
 log = logging.getLogger(__name__)
 
@@ -609,21 +610,33 @@ def sync_from_xmp(db, photo_ids):
             db_keywords_by_key = {
                 keyword_match_key(k["name"]): k for k in db_keywords
             }
+            # Confirmed imported paths remain valid even if the linked place
+            # was subsequently renamed. Preserve the resolved association
+            # during the removal pass as well as the add pass.
+            aliases_by_key = defaultdict(set)
+            for hierarchy in read_hierarchical_keywords(xmp_path):
+                parts = hierarchy.split('|')
+                if any(keyword_match_key(part) in pending_hierarchical_removals for part in parts):
+                    continue
+                resolved = resolve_import_path(db, parts)
+                if resolved is not None:
+                    aliases_by_key[keyword_match_key(parts[-1])].add(resolved)
+            resolved_ids = set()
 
             # Reconcile DB keyword associations to match the current XMP file.
             for kw_key, kw_name in xmp_keywords_by_key.items():
-                if kw_key in db_keywords_by_key:
+                aliases = aliases_by_key.get(kw_key, set())
+                if not aliases and kw_key in db_keywords_by_key:
                     continue
-                kid = db.add_keyword(kw_name, _commit=False)
-                # Reconciling *from* a sidecar cannot tell a hand-typed Lightroom
-                # keyword from one Vireo wrote out, so this writer stays
-                # provenance-neutral instead of claiming manual authorship.
-                db.tag_photo(
-                    photo_id,
-                    kid,
-                    source=KEYWORD_SOURCE_UNKNOWN,
-                    _commit=False,
-                )
+                for kid in sorted(aliases) if aliases else [db.add_keyword(kw_name, _commit=False)]:
+                    resolved_ids.add(kid)
+                    # Reconciling from a sidecar cannot establish authorship.
+                    db.tag_photo(
+                        photo_id,
+                        kid,
+                        source=KEYWORD_SOURCE_UNKNOWN,
+                        _commit=False,
+                    )
 
             for kw in db_keywords:
                 kw_key = keyword_match_key(kw["name"])
@@ -631,7 +644,7 @@ def sync_from_xmp(db, photo_ids):
                     kw["parent_id"] is not None
                     and kw_key in pending_flat_only_removals
                 )
-                if kw_key not in xmp_keywords_by_key and not preserve_hierarchy:
+                if kw_key not in xmp_keywords_by_key and kw['id'] not in resolved_ids and not preserve_hierarchy:
                     db.untag_photo(photo_id, kw["id"], _commit=False)
 
             # Update xmp_mtime in the same transaction as reconciliation.

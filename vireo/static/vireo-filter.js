@@ -274,6 +274,7 @@
   }
 
   function ruleLabel(rule) {
+    if (rule.field === 'keyword_identity') return 'Keyword · ' + (rule.label || 'Selected species or place');
     if (rule.field === 'photo_ids') {
       const n = Array.isArray(rule.value) ? rule.value.length : 0;
       return `${n} hand-picked photo${n === 1 ? '' : 's'}`;
@@ -501,6 +502,10 @@
 
   function applyLegacyParams(params) {
     const rules = [];
+    if (params.has('keyword_identity')) {
+      rules.push({field: 'keyword_identity', op: 'equals', value: params.get('keyword_identity'),
+                  label: params.get('keyword_label') || 'Selected species or place'});
+    }
     const ratingMin = params.get('rating_min');
     if (ratingMin) rules.push(makeRule('rating', '>=', Number(ratingMin)));
     const flag = params.get('flag');

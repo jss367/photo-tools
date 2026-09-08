@@ -16414,11 +16414,21 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 if photo_id in already_tagged:
                     continue
                 db.tag_photo(photo_id, keyword_id, source="manual", _commit=False)
+                flat_removals = [dict(row) for row in db.conn.execute(
+                    """SELECT workspace_id, value FROM pending_changes
+                       WHERE photo_id = ? AND change_type = 'keyword_remove_flat'
+                         AND value = ? COLLATE NOCASE""",
+                    (photo_id, species),
+                )]
                 _queue_keyword_add(photo_id, species, _commit=False)
-                # Empty old_value is a keyword-only prediction_accept item:
-                # undo/redo changes the tag without inventing a prediction.
+                # Keep the suppression records cleared by the add, including
+                # those in other workspaces sharing this photo's sidecar.
                 items.append({
-                    "photo_id": photo_id, "old_value": "", "new_value": str(keyword_id),
+                    "photo_id": photo_id,
+                    "old_value": json.dumps({
+                        "keyword_only": True, "flat_removals": flat_removals,
+                    }),
+                    "new_value": str(keyword_id),
                 })
 
         # History joins the same transaction rather than committing after it:

@@ -21390,12 +21390,22 @@ class Database:
         kw_name = self._keyword_name(kid)
         skip_tag = action == 'prediction_accept' and old_meta.get('no_tag')
         if not skip_tag:
-            if action == 'prediction_accept' and not old_val:
+            if action == 'prediction_accept' and (not old_val or old_meta.get('keyword_only')):
                 # Accept on all uses keyword-only items for photos without
                 # a matching prediction. Its add may have cancelled a pending
                 # removal (or already synced), so undo must restore a removal
                 # when there is no pending add left to cancel.
                 self._untag_for_edit(pid, kid)
+                for removal in old_meta.get('flat_removals', []):
+                    # A shared workspace can be deleted between the edit and
+                    # undo. Restore only records whose workspace still exists.
+                    if self.conn.execute(
+                        'SELECT 1 FROM workspaces WHERE id = ?', (removal['workspace_id'],),
+                    ).fetchone():
+                        self.queue_change(
+                            pid, 'keyword_remove_flat', removal['value'],
+                            workspace_id=removal['workspace_id'],
+                        )
             else:
                 self.untag_photo(pid, kid)
                 if kw_name:
@@ -21418,9 +21428,14 @@ class Database:
         kw_name = self._keyword_name(kid)
         skip_tag = action == 'prediction_accept' and old_meta.get('no_tag')
         if not skip_tag:
-            if action == 'prediction_accept' and not old_val:
+            if action == 'prediction_accept' and (not old_val or old_meta.get('keyword_only')):
                 # Cancel the removal restored by undo before queueing an add.
                 self._retag_for_edit(pid, kid)
+                for removal in old_meta.get('flat_removals', []):
+                    self.remove_pending_changes(
+                        pid, 'keyword_remove_flat', removal['value'],
+                        workspace_id=removal['workspace_id'],
+                    )
             else:
                 self.tag_photo(pid, kid, source='manual')
                 if kw_name:

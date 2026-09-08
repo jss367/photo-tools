@@ -18816,6 +18816,44 @@ def test_batch_accept_on_all_undo_redo_preserves_sidecar_changes(
         assert pending_types() == ([] if sidecar_has_keyword else ["keyword_add"])
 
 
+@pytest.mark.parametrize("delete_other_workspace", [False, True])
+def test_batch_accept_on_all_undo_restores_flat_removals(app_and_db, delete_other_workspace):
+    app, db = app_and_db
+    photo, _ = _seed_prediction_photo(db, "all-flat-removal.jpg", "Osprey", 0.9)
+    active_ws = db._ws_id()
+    other_ws = db.create_workspace("Shared sidecar")
+    for ws, value in [(active_ws, "Bald Eagle"), (other_ws, "bald eagle")]:
+        db.queue_change(photo, "keyword_remove_flat", value, workspace_id=ws)
+    db.queue_change(photo, "keyword_remove_flat", "Osprey")
+
+    def flat_removals():
+        return {
+            (row["workspace_id"], row["value"]) for row in db.conn.execute(
+                "SELECT workspace_id, value FROM pending_changes "
+                "WHERE photo_id = ? AND change_type = 'keyword_remove_flat'", (photo,),
+            )
+        }
+
+    response = app.test_client().post("/api/predictions/batch-accept", json={
+        "prediction_ids": [], "expected_species": "Bald Eagle", "photo_ids": [photo],
+    })
+    assert response.status_code == 200
+    assert flat_removals() == {(active_ws, "Osprey")}
+    expected = {(active_ws, "Bald Eagle"), (active_ws, "Osprey")}
+    if delete_other_workspace:
+        db.conn.execute("DELETE FROM workspaces WHERE id = ?", (other_ws,))
+        db.conn.commit()
+    else:
+        expected.add((other_ws, "bald eagle"))
+    for _ in range(2):
+        db.undo_last_edit()
+        assert flat_removals() == expected
+        assert "Bald Eagle" not in {k["name"] for k in db.get_photo_keywords(photo)}
+        db.redo_last_undo()
+        assert flat_removals() == {(active_ws, "Osprey")}
+        assert "Bald Eagle" in {k["name"] for k in db.get_photo_keywords(photo)}
+
+
 @pytest.mark.parametrize("invalid", ["missing_species", "outside_selection", "foreign_photo"])
 def test_batch_accept_on_all_validates_scope_before_writing(app_and_db, invalid):
     app, db = app_and_db

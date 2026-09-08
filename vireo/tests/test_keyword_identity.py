@@ -189,7 +189,8 @@ def test_reconciliation_does_not_override_a_different_assigned_place(catalog):
 
 
 @pytest.mark.parametrize('nested', [False, True])
-def test_rescanning_and_syncing_renamed_place_keep_confirmed_import_alias(catalog, nested):
+@pytest.mark.parametrize('flat_present', [False, True])
+def test_rescanning_and_syncing_renamed_place_keep_confirmed_import_alias(catalog, nested, flat_present):
     from pathlib import Path
 
     from scanner import _import_keywords_for_photo
@@ -205,9 +206,12 @@ def test_rescanning_and_syncing_renamed_place_keep_confirmed_import_alias(catalo
     folder.mkdir()
     sidecar = folder / '0.xmp'
     hierarchy = 'Imported places|Lake Hodges' if nested else 'Lake Hodges'
-    write_sidecar(str(sidecar), {'Lake Hodges'}, {hierarchy})
+    write_sidecar(str(sidecar), {'Lake Hodges'} if flat_present else set(), {hierarchy})
     _import_keywords_for_photo(db, photos[0], str(sidecar))
     assert {k['id'] for k in db.get_photo_keywords(photos[0])} == {target}
+    sync_from_xmp(db, [photos[0]])
+    assert {k['id'] for k in db.get_photo_keywords(photos[0])} == {target}
+    db.untag_photo(photos[0], target)
     sync_from_xmp(db, [photos[0]])
     assert {k['id'] for k in db.get_photo_keywords(photos[0])} == {target}
 

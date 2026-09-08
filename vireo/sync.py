@@ -623,12 +623,14 @@ def sync_from_xmp(db, photo_ids):
                     aliases_by_key[keyword_match_key(parts[-1])].add(resolved)
             resolved_ids = set()
 
-            # Reconcile DB keyword associations to match the current XMP file.
-            for kw_key, kw_name in xmp_keywords_by_key.items():
+            # A confirmed hierarchical alias is sufficient even when the
+            # sidecar omits its flat dc:subject entry. Process both sources
+            # so the removal pass cannot discard that linked location.
+            for kw_key in xmp_keywords_by_key.keys() | aliases_by_key.keys():
                 aliases = aliases_by_key.get(kw_key, set())
                 if not aliases and kw_key in db_keywords_by_key:
                     continue
-                for kid in sorted(aliases) if aliases else [db.add_keyword(kw_name, _commit=False)]:
+                for kid in sorted(aliases) if aliases else [db.add_keyword(xmp_keywords_by_key[kw_key], _commit=False)]:
                     resolved_ids.add(kid)
                     # Reconciling from a sidecar cannot establish authorship.
                     db.tag_photo(

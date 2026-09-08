@@ -8,7 +8,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 
 from db import KEYWORD_SOURCE_UNKNOWN
-from keyword_identity import resolve_import_path
+from keyword_identity import resolve_import_path, validate_import_locations
 from keyword_normalization import keyword_match_key
 from xmp import SidecarEditor, read_hierarchical_keywords, read_keywords
 
@@ -614,10 +614,15 @@ def sync_from_xmp(db, photo_ids):
             # was subsequently renamed. Preserve the resolved association
             # during the removal pass as well as the add pass.
             aliases_by_key = defaultdict(set)
-            for hierarchy in read_hierarchical_keywords(xmp_path):
+            hierarchical_keywords = [
+                hierarchy for hierarchy in read_hierarchical_keywords(xmp_path)
+                if not any(keyword_match_key(part) in pending_hierarchical_removals
+                           for part in hierarchy.split('|'))
+            ]
+            validate_import_locations(db, photo_id, list(xmp_keywords_by_key.values()),
+                                      hierarchical_keywords, additive=False)
+            for hierarchy in hierarchical_keywords:
                 parts = hierarchy.split('|')
-                if any(keyword_match_key(part) in pending_hierarchical_removals for part in parts):
-                    continue
                 resolved = resolve_import_path(db, parts)
                 if resolved is not None:
                     aliases_by_key[keyword_match_key(parts[-1])].add(resolved)

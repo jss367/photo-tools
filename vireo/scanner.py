@@ -32,6 +32,7 @@ from image_loader import (
     safe_iter_dir,
     safe_scan_walk,
 )
+from keyword_identity import validate_import_locations
 from keyword_normalization import keyword_match_key
 from metadata import EXIF_SUMMARY_COLUMNS, exif_summary_columns, extract_metadata
 from PIL import Image
@@ -286,6 +287,12 @@ def _import_keywords_for_photo(db, photo_id, xmp_path_str):
     pending_flat_removals = db.get_pending_keyword_removal_keys(photo_id)
     pending_hierarchical_removals = db.get_pending_keyword_removal_keys(
         photo_id, hierarchical=True,
+    )
+    validate_import_locations(
+        db, photo_id,
+        [kw for kw in flat_keywords if keyword_match_key(kw) not in pending_flat_removals],
+        [hier for hier in hier_keywords
+         if not any(keyword_match_key(part) in pending_hierarchical_removals for part in hier.split('|'))],
     )
 
     # Build hierarchy from lr:hierarchicalSubject

@@ -254,3 +254,52 @@ def test_leaf_import_alias_does_not_reparent_new_subtrees(catalog):
     child = db.add_keyword('Picnic area', parent_id=imported_parent)
     assert imported_parent != target
     assert db.conn.execute('SELECT parent_id FROM keywords WHERE id = ?', (child,)).fetchone()[0] == imported_parent
+
+
+@pytest.mark.parametrize('reader', ['scanner', 'sync', 'catalog'])
+@pytest.mark.parametrize('existing_place', [False, True])
+def test_import_rejects_conflicting_confirmed_locations_before_changing_tags(catalog, monkeypatch, reader, existing_place):
+    from pathlib import Path
+
+    from importer import execute_import
+    from scanner import _import_keywords_for_photo
+    from sync import sync_from_xmp
+    from xmp import write_sidecar
+
+    db, photos = catalog
+    targets = []
+    for index, state in enumerate(['Illinois', 'Missouri']):
+        parent = db.add_keyword(state)
+        source = db.add_keyword('Springfield', parent_id=parent)
+        target = db.upsert_place_chain({'name': 'Springfield', 'place_id': f'springfield-{index}',
+                                        'lat': 38 + index, 'lng': -90, 'address_components': []})
+        db.tag_photo(photos[index], source)
+        reconcile_location(db, source, target)
+        targets.append(target)
+    original = db.add_keyword('Original keyword')
+    db.tag_photo(photos[2], original)
+    if existing_place:
+        db.tag_photo(photos[2], targets[0])
+    before = {k['id'] for k in db.get_photo_keywords(photos[2])}
+    hierarchy = {'Missouri|Springfield'} if existing_place else {'Illinois|Springfield', 'Missouri|Springfield'}
+    # Including Springfield keeps an existing same-name location during
+    # Sync from XMP too; adding the other alias must not leave both assigned.
+    flat = {'Springfield', 'Do not partially import'}
+    folder = Path(db.conn.execute('SELECT path FROM folders LIMIT 1').fetchone()[0])
+    folder.mkdir()
+    sidecar = folder / '2.xmp'
+    write_sidecar(str(sidecar), flat, hierarchy)
+    if reader == 'catalog':
+        monkeypatch.setattr('importer.read_catalog', lambda *args, **kwargs: {
+            str(folder / '2.jpg'): {'flat_keywords': flat, 'hierarchical_keywords': hierarchy},
+        })
+        result = execute_import(['dummy.lrcat'], db, write_xmp=False)
+        assert result['failed'] == 1
+        assert result['imported'] == 0
+    else:
+        with pytest.raises(ValueError, match='different linked places'):
+            if reader == 'scanner':
+                _import_keywords_for_photo(db, photos[2], str(sidecar))
+            else:
+                sync_from_xmp(db, [photos[2]])
+    assert {k['id'] for k in db.get_photo_keywords(photos[2])} == before

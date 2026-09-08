@@ -6,6 +6,7 @@ import sqlite3
 from pathlib import Path
 
 from catalog import read_catalog
+from keyword_identity import validate_import_locations
 from keyword_normalization import keyword_match_key, normalize_keyword_display
 from xmp import write_sidecar
 
@@ -177,6 +178,7 @@ def execute_import(
             # after this PR, and the surrounding try/except would otherwise
             # count the whole photo as failed rather than just dropping the
             # malformed keyword.
+            validate_import_locations(db, photo['id'], kw_data['flat_keywords'], kw_data['hierarchical_keywords'])
             # Import hierarchical keywords. Skip an entry whose chain
             # contains any segment that normalizes to `""` — the resulting
             # `add_keyword()` call would raise and the whole hierarchical

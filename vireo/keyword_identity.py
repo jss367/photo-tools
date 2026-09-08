@@ -68,6 +68,50 @@ def resolve_import_path(db, parts):
     return row['keyword_id'] if row else None
 
 
+def validate_import_locations(db, photo_id, flat_keywords, hierarchical_keywords, *, additive=True):
+    """Reject conflicting confirmed locations before an import changes tags.
+
+    Scans/catalog imports retain existing tags; sync retains existing tags
+    only when they are still named in the sidecar. Ancestor places in the
+    same location chain are compatible with its more specific leaf.
+    """
+    targets, hierarchy_leaves = set(), set()
+    for hierarchy in hierarchical_keywords:
+        parts = hierarchy.split('|')
+        if any(not keyword_match_key(part) for part in parts):
+            continue
+        hierarchy_leaves.add(keyword_match_key(parts[-1]))
+        target = resolve_import_path(db, parts)
+        if target is not None:
+            targets.add(target)
+    flat_keys = {keyword_match_key(name) for name in flat_keywords}
+    for name in flat_keywords:
+        if keyword_match_key(name) not in hierarchy_leaves:
+            target = resolve_import_path(db, [name])
+            if target is not None:
+                targets.add(target)
+    if not targets:
+        return
+    for row in db.conn.execute(
+        "SELECT k.id, k.name FROM photo_keywords pk JOIN keywords k ON k.id = pk.keyword_id "
+        "WHERE pk.photo_id = ? AND k.type = 'location' AND k.place_id IS NOT NULL", (photo_id,),
+    ):
+        if additive or keyword_match_key(row['name']) in flat_keys:
+            targets.add(row['id'])
+    ancestors = set()
+    for target in targets:
+        seen = {target}
+        while target is not None:
+            row = db.conn.execute('SELECT parent_id FROM keywords WHERE id = ?', (target,)).fetchone()
+            target = row['parent_id'] if row else None
+            if target is None or target in seen:
+                break
+            seen.add(target)
+            ancestors.add(target)
+    if len(targets - ancestors) > 1:
+        raise ValueError('Imported keywords resolve to different linked places; choose one location before importing.')
+
+
 def grouped_keywords(db):
     rows = [dict(r) for r in db.get_all_keywords()]
     identities = {r['id']: r['identity'] for r in db.conn.execute(

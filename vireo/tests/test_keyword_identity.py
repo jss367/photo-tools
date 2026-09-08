@@ -276,6 +276,42 @@ def test_manual_keyword_addition_does_not_resolve_import_aliases(catalog, nested
     assert db.add_keyword('Lake Hodges', parent_id=parent, _resolve_alias=True) == target
 
 
+def test_api_add_keyword_does_not_attach_reconciled_place_for_homonym(app_and_db):
+    """Codex flagged the /api/photos/<id>/keywords entry point: an untyped
+    manual add of a homonym must not silently attach the reconciled place
+    and reassign the photo's map/GPS location. Exercise the HTTP boundary
+    to catch a future regression where the handler grows an opt-in flag.
+    """
+    app, db = app_and_db
+    client = app.test_client()
+    source, target, _ = place_pair(db)
+    seed_photo, target_photo = [
+        r['id'] for r in db.conn.execute(
+            'SELECT id FROM photos ORDER BY id LIMIT 2'
+        )
+    ]
+    db.tag_photo(seed_photo, source)
+    reconcile_location(db, source, target)
+    before = {k['id'] for k in db.get_photo_keywords(target_photo)}
+    response = client.post(
+        f'/api/photos/{target_photo}/keywords',
+        json={'name': 'Lake Hodges'},
+    )
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert payload['ok'] is True
+    kid = payload['keyword_id']
+    assert kid != target
+    row = db.conn.execute(
+        'SELECT type, place_id FROM keywords WHERE id = ?', (kid,),
+    ).fetchone()
+    assert row['place_id'] is None
+    assert row['type'] != 'location'
+    tagged = {k['id'] for k in db.get_photo_keywords(target_photo)}
+    assert target not in tagged
+    assert tagged - before == {kid}
+
+
 def test_leaf_import_alias_does_not_reparent_new_subtrees(catalog):
     db, photos = catalog
     source, target, _ = place_pair(db)

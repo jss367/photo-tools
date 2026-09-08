@@ -18784,6 +18784,38 @@ def test_batch_accept_on_all_without_acceptable_predictions(app_and_db):
     assert {k["name"] for k in db.get_photo_keywords(photo)} == {"Osprey"}
 
 
+@pytest.mark.parametrize("pending_removal,sync_after_accept", [(True, False), (False, False), (False, True)])
+def test_batch_accept_on_all_undo_redo_preserves_sidecar_changes(
+    app_and_db, pending_removal, sync_after_accept,
+):
+    app, db = app_and_db
+    photo, _ = _seed_prediction_photo(db, "all-sidecar.jpg", "Osprey", 0.9)
+    if pending_removal:
+        db.queue_change(photo, "keyword_remove", "Bald Eagle")
+
+    def pending_types():
+        return [
+            row["change_type"] for row in db.get_pending_changes()
+            if row["photo_id"] == photo and row["value"] == "Bald Eagle"
+        ]
+
+    response = app.test_client().post("/api/predictions/batch-accept", json={
+        "prediction_ids": [], "expected_species": "Bald Eagle", "photo_ids": [photo],
+    })
+    assert response.status_code == 200
+    assert pending_types() == ([] if pending_removal else ["keyword_add"])
+    if sync_after_accept:
+        db.clear_pending([row["id"] for row in db.get_pending_changes()])
+    sidecar_has_keyword = pending_removal or sync_after_accept
+    for _ in range(2):
+        db.undo_last_edit()
+        assert "Bald Eagle" not in {k["name"] for k in db.get_photo_keywords(photo)}
+        assert pending_types() == (["keyword_remove"] if sidecar_has_keyword else [])
+        db.redo_last_undo()
+        assert "Bald Eagle" in {k["name"] for k in db.get_photo_keywords(photo)}
+        assert pending_types() == ([] if sidecar_has_keyword else ["keyword_add"])
+
+
 @pytest.mark.parametrize("invalid", ["missing_species", "outside_selection", "foreign_photo"])
 def test_batch_accept_on_all_validates_scope_before_writing(app_and_db, invalid):
     app, db = app_and_db

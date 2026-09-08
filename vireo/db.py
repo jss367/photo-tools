@@ -12303,6 +12303,12 @@ class Database:
                         "DELETE FROM photo_keywords WHERE keyword_id = ?",
                         (keyword_id,),
                     )
+                    # Preserve remembered import paths before the foreign-key
+                    # cascade deletes aliases of the absorbed place.
+                    self.conn.execute(
+                        'UPDATE keyword_import_aliases SET keyword_id = ? WHERE keyword_id = ?',
+                        (canonical_id, keyword_id),
+                    )
                     # Delete the now-empty old keyword row.
                     self.conn.execute(
                         "DELETE FROM keywords WHERE id = ?", (keyword_id,),

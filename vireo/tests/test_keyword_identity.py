@@ -256,6 +256,21 @@ def test_leaf_import_alias_does_not_reparent_new_subtrees(catalog):
     assert db.conn.execute('SELECT parent_id FROM keywords WHERE id = ?', (child,)).fetchone()[0] == imported_parent
 
 
+def test_linking_a_place_to_an_existing_place_preserves_import_aliases(catalog):
+    db, photos = catalog
+    source, target, parent = place_pair(db, nested=True)
+    db.tag_photo(photos[0], source)
+    reconcile_location(db, source, target)
+    details = {'name': 'Lake Hodges Preserve', 'place_id': 'corrected-place',
+               'lat': 33, 'lng': -117, 'address_components': []}
+    survivor = db.upsert_place_chain(details)
+    result = db.link_keyword_to_place(target, details)
+    assert result == {'keyword_id': survivor, 'merged': True}
+    assert db.conn.execute('SELECT keyword_id FROM keyword_import_aliases').fetchone()[0] == survivor
+    assert db.add_keyword('Lake Hodges', parent_id=parent) == survivor
+    assert {k['id'] for k in db.get_photo_keywords(photos[0])} == {survivor}
+
+
 @pytest.mark.parametrize('reader', ['scanner', 'sync', 'catalog'])
 @pytest.mark.parametrize('existing_place', [False, True])
 def test_import_rejects_conflicting_confirmed_locations_before_changing_tags(catalog, monkeypatch, reader, existing_place):

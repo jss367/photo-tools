@@ -49,7 +49,7 @@ storage coverage, and troubleshooting.
 
 ### Requirements
 
-- Python 3.11+
+- Python 3.14+
 - A GPU is recommended for classification but not required
 
 ### Install for development

@@ -30,7 +30,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-python@v6
         with:
-          python-version: '3.13'
+          python-version: '3.14'
       - name: Install only the evaluation tool and its tests
         run: pip install -e 'tools/encounter-evaluation[test]'
       - name: Check tool code

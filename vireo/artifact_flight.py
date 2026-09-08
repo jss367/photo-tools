@@ -14,7 +14,7 @@ import tempfile
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Generic, TypeVar
+from typing import TypeVar
 
 T = TypeVar("T")
 
@@ -30,7 +30,7 @@ class _Flight:
 
 
 @dataclass(frozen=True)
-class FlightResult(Generic[T]):
+class FlightResult[T]:
     value: T | None = None
     produced: bool = False
     skipped: bool = False

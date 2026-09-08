@@ -295,7 +295,7 @@ class MountRootCandidates(list):
     conclusive = True
 
 
-def mount_root_candidates(path: str) -> "MountRootCandidates":
+def mount_root_candidates(path: str) -> MountRootCandidates:
     """Return the plausible mount-root prefix(es) for ``path``, if any.
 
     Extracts the mount-root component under each OS's mount conventions —

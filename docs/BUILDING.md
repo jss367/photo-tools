@@ -2,11 +2,11 @@
 
 ## Prerequisites
 
-- Python 3.11+ with project dependencies installed
+- Python 3.14+ with project dependencies installed
 - Rust toolchain (`rustup`)
 - Node.js 20+
 - Tauri CLI: `cargo install tauri-cli@2`
-- PyInstaller: `pip install pyinstaller`
+- PyInstaller: `pip install "pyinstaller>=6.15"`
 
 ## Development
 

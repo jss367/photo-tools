@@ -91,7 +91,7 @@ class ModelCorruptError(Exception):
     integrity check. pipeline_job.model_loader_stage translates this
     into the existing 'open Settings → Models and click Repair' message."""
 
-    def __init__(self, model_id: str, result: "VerifyResult"):
+    def __init__(self, model_id: str, result: VerifyResult):
         self.model_id = model_id
         self.result = result
         parts = []

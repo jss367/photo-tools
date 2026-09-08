@@ -176,6 +176,9 @@ fn build_about_metadata() -> tauri::menu::AboutMetadata<'static> {
 
 /// Build the application menu bar.
 pub fn build_menu(app: &AppHandle) -> tauri::Result<tauri::menu::Menu<tauri::Wry>> {
+    let check_updates =
+        MenuItemBuilder::with_id(ids::CHECK_FOR_UPDATES, "Check for Updates...").build(app)?;
+
     // -- macOS app submenu --
     #[cfg(target_os = "macos")]
     let app_menu = {
@@ -187,6 +190,7 @@ pub fn build_menu(app: &AppHandle) -> tauri::Result<tauri::menu::Menu<tauri::Wry
 
         SubmenuBuilder::new(app, "Vireo")
             .item(&about)
+            .item(&check_updates)
             .separator()
             .item(&settings_item)
             .separator()
@@ -468,8 +472,6 @@ pub fn build_menu(app: &AppHandle) -> tauri::Result<tauri::menu::Menu<tauri::Wry
     let open_logs = MenuItemBuilder::with_id(ids::HELP_OPEN_LOGS, "Open Logs").build(app)?;
     let copy_diagnostics =
         MenuItemBuilder::with_id(ids::HELP_COPY_DIAGNOSTICS, "Copy Diagnostics").build(app)?;
-    let check_updates =
-        MenuItemBuilder::with_id(ids::CHECK_FOR_UPDATES, "Check for Updates...").build(app)?;
     let report_issue =
         MenuItemBuilder::with_id(ids::REPORT_ISSUE, "Report an Issue...").build(app)?;
     help_builder = help_builder
@@ -477,11 +479,14 @@ pub fn build_menu(app: &AppHandle) -> tauri::Result<tauri::menu::Menu<tauri::Wry
         .item(&open_help)
         .separator()
         .item(&open_logs)
-        .item(&copy_diagnostics)
-        .separator()
-        .item(&check_updates)
-        .separator()
-        .item(&report_issue);
+        .item(&copy_diagnostics);
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        help_builder = help_builder.separator().item(&check_updates);
+    }
+
+    help_builder = help_builder.separator().item(&report_issue);
 
     #[cfg(not(target_os = "macos"))]
     {

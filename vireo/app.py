@@ -16136,6 +16136,12 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         undo reverses it, matching the per-photo ``changed_tag`` / ``no_tag``
         encoding ``api_accept_prediction`` already uses.
 
+        With ``photo_ids`` and ``expected_species``, Browse's "Accept on all"
+        also adds that species to every selected photo missing it. Existing
+        keywords are preserved. Prediction decisions still follow the checks
+        below; photos without an acceptable prediction get keyword-only undo
+        items. ``accepted`` counts photos changed by either part of the action.
+
         Contract: every row this endpoint accepts is one that is still
         undecided, still unambiguous, and still from the current label set *at
         the moment of the write* — judged against the database rather than
@@ -16177,7 +16183,17 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 "single-photo replacement",
                 400,
             )
-        pred_ids, err = _parse_prediction_ids(db, body)
+        # An explicit selection extends the accept to photos without a
+        # matching prediction. Their keyword additions share the same undo.
+        all_photo_ids = None
+        if "photo_ids" in body:
+            all_photo_ids, err = _parse_selection_photo_ids(body)
+            if err is not None:
+                return err
+        if all_photo_ids is not None and body.get("prediction_ids") == []:
+            pred_ids, err = [], None
+        else:
+            pred_ids, err = _parse_prediction_ids(db, body)
         if err is not None:
             return err
 
@@ -16193,6 +16209,8 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         expected_species = (
             raw_expected.strip() if isinstance(raw_expected, str) else None
         ) or None
+        if all_photo_ids is not None and not expected_species:
+            return json_error("expected_species required when accepting on all photos")
 
         # Everything from here to the commit is one transaction, taken with
         # the writer lock held from the first read (see
@@ -16212,12 +16230,23 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         if lock_err is not None:
             return lock_err
         try:
-            return _batch_accept_under_lock(db, pred_ids, expected_species)
+            if all_photo_ids is not None:
+                # Recheck ownership inside the write transaction, including
+                # photos that have no prediction rows to validate below.
+                all_photo_ids, err = _parse_selection_photo_ids(body)
+                if err is not None:
+                    db.conn.rollback()
+                    return err
+                selected = set(all_photo_ids)
+                if any(row["photo_id"] not in selected for row in _load_prediction_rows(db, pred_ids)):
+                    db.conn.rollback()
+                    return json_error("prediction_ids must belong to the selected photos")
+            return _batch_accept_under_lock(db, pred_ids, expected_species, all_photo_ids)
         except Exception:
             db.conn.rollback()
             raise
 
-    def _batch_accept_under_lock(db, pred_ids, expected_species=None):
+    def _batch_accept_under_lock(db, pred_ids, expected_species=None, all_photo_ids=None):
         """The checks and writes of ``batch-accept``, inside its transaction.
 
         Split out only so the transaction's boundaries are impossible to
@@ -16372,6 +16401,24 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     "photo_id": a["photo_id"],
                     "old_value": old_value,
                     "new_value": str(keyword_id),
+                })
+
+        if all_photo_ids is not None:
+            if keyword_id is None:
+                keyword_id = db.add_keyword(expected_species, is_species=True, _commit=False)
+                species = db.conn.execute(
+                    "SELECT name FROM keywords WHERE id = ?", (keyword_id,),
+                ).fetchone()["name"]
+            already_tagged = db.get_photos_with_equivalent_species(all_photo_ids, keyword_id)
+            for photo_id in all_photo_ids:
+                if photo_id in already_tagged:
+                    continue
+                db.tag_photo(photo_id, keyword_id, source="manual", _commit=False)
+                _queue_keyword_add(photo_id, species, _commit=False)
+                # Empty old_value is a keyword-only prediction_accept item:
+                # undo/redo changes the tag without inventing a prediction.
+                items.append({
+                    "photo_id": photo_id, "old_value": "", "new_value": str(keyword_id),
                 })
 
         # History joins the same transaction rather than committing after it:

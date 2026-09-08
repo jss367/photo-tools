@@ -816,6 +816,16 @@ body.sidebar-resizing {
   cursor: pointer;
 }
 .prediction-accept:hover { filter: brightness(1.05); }
+#selectionPredictions .prediction-actions {
+  flex-direction: column;
+  align-items: stretch;
+}
+.prediction-accept-all {
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  border: 1px solid var(--border-secondary);
+}
+.prediction-accept:disabled { opacity: 0.6; cursor: wait; }
 .prediction-reject {
   flex-shrink: 0;
   background: var(--bg-primary);
@@ -9364,6 +9374,9 @@ function renderSelectionPredictions(predictions, selectedCount, meta) {
         ')" title="Accept this species on the selected photos that are unambiguous">Accept on ' +
         acceptablePhotoCount + '</button>';
     }
+    actions += '<button class="prediction-accept prediction-accept-all" onclick="acceptSelectionPrediction(' + idx +
+      ', true, this)" title="Add this species to all ' + selectedCount +
+      ' selected photos, including those without this prediction. Existing keywords are kept; conflicts still need review.">Accept on all</button>';
     var why = '';
     if (ambiguousPhotos.length) {
       why = ambiguousPhotos.length + (ambiguousPhotos.length === 1 ? ' photo needs' : ' photos need') +
@@ -9408,11 +9421,16 @@ function renderSelectionPredictions(predictions, selectedCount, meta) {
   list.innerHTML = html + hiddenNote;
 }
 
-async function acceptSelectionPrediction(idx) {
+async function acceptSelectionPrediction(idx, onAll, button) {
   var ids = selectionPredictionAcceptableById[idx] || [];
-  if (!ids.length) return;
+  if (!onAll && !ids.length) return;
   var expectedSpecies = selectionPredictionSpeciesByIdx[idx];
   var selection = getActiveSelection();
+  if (!expectedSpecies || !selection.length) return;
+  if (button) {
+    button.disabled = true;
+    button.textContent = 'Accepting…';
+  }
   var data;
   try {
     data = await safeFetch('/api/predictions/batch-accept', {
@@ -9425,9 +9443,16 @@ async function acceptSelectionPrediction(idx) {
         // the drifted row rather than tagging with something the user was
         // never shown.
         expected_species: expectedSpecies || null,
+        photo_ids: onAll ? selection : undefined,
       }),
     });
   } catch(e) { return; }
+  finally {
+    if (button) {
+      button.disabled = false;
+      button.textContent = 'Accept on all';
+    }
+  }
   await _afterPredictionMutation(
     selection, { accepted: (data || {}).accepted },
   );

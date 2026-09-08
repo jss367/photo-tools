@@ -11,9 +11,13 @@ on disk — which would make "new images" detection unreliable. Instead this
 module spins up its own Flask server backed by an empty workspace and a real
 temp folder.
 """
+import logging
 import os
 import sys
+from contextlib import ExitStack
+from pathlib import Path
 
+import psutil
 import pytest
 from PIL import Image
 from playwright.sync_api import expect
@@ -49,28 +53,67 @@ def fresh_server(tmp_path, monkeypatch):
     photo_dir = tmp_path / "photos"
     photo_dir.mkdir()
 
-    db = Database(db_path)
-    ws_id = db.ensure_default_workspace()
-    db.set_active_workspace(ws_id)
-    # Register the folder so it's "known" to the workspace but empty on disk.
-    folder_id = db.add_folder(str(photo_dir), name="photos")
-    db.add_workspace_folder(ws_id, folder_id)
+    with ExitStack() as cleanup:
+        db = cleanup.enter_context(Database(db_path))
+        ws_id = db.ensure_default_workspace()
+        db.set_active_workspace(ws_id)
+        # Register the folder so it's "known" to the workspace but empty on disk.
+        folder_id = db.add_folder(str(photo_dir), name="photos")
+        db.add_workspace_folder(ws_id, folder_id)
 
-    app = create_app(db_path=db_path, thumb_cache_dir=thumb_dir)
+        app = create_app(db_path=db_path, thumb_cache_dir=thumb_dir)
+        cleanup.callback(app._cleanup_app_resources)
 
-    # Threaded, for the same reason as the shared ``live_server`` fixture in
-    # conftest.py: a single-threaded server makes every page load queue
-    # behind whatever else the page requested.
-    server, thread, url = start_server(app)
+        # Drain requests before closing app resources and the seed database.
+        # Register cleanup as resources are acquired so setup failures also
+        # release them, without waiting for cyclic garbage collection.
+        server, thread, url = start_server(app)
+        cleanup.callback(stop_server, server, thread)
 
-    yield {
-        "url": url,
-        "db": db,
-        "photo_dir": photo_dir,
-        "app": app,
-    }
+        yield {
+            "url": url,
+            "db": db,
+            "photo_dir": photo_dir,
+            "app": app,
+        }
 
-    stop_server(server, thread)
+
+@pytest.mark.parametrize("fail_to_start", [False, True])
+def test_fresh_server_releases_resources(tmp_path, monkeypatch, fail_to_start):
+    """Closing the fixture must release files even if the server cannot start."""
+    apps = []
+    real_start_server = start_server
+
+    def capture_app(app):
+        apps.append(app)
+        if fail_to_start:
+            raise OSError("server startup failed")
+        return real_start_server(app)
+
+    monkeypatch.setattr(sys.modules[__name__], "start_server", capture_app)
+    # Drive setup/teardown directly so resources can be inspected afterwards.
+    fixture = fresh_server.__wrapped__(tmp_path, monkeypatch)
+    try:
+        if fail_to_start:
+            with pytest.raises(OSError, match="server startup failed"):
+                next(fixture)
+        else:
+            data = next(fixture)
+            with pytest.raises(StopIteration):
+                next(fixture)
+            assert data["db"].conn is None
+
+        assert apps[0]._log_broadcaster not in logging.getLogger().handlers
+        db_path = (tmp_path / "test.db").resolve()
+        database_files = {db_path, Path(f"{db_path}-wal"), Path(f"{db_path}-shm")}
+        assert not [
+            f.path for f in psutil.Process().open_files()
+            if Path(f.path).resolve() in database_files
+        ]
+    finally:
+        fixture.close()
+        for app in apps:
+            app._cleanup_app_resources()
 
 
 def _clear_new_images_cache():

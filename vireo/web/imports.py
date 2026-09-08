@@ -2602,7 +2602,7 @@ def create_imports_blueprint(
                     f"failed to enqueue processing: {e}"
                 )
 
-        def _run_import_in_place(job):
+        def _import_in_place(job, thread_db):
             import errno as errno_mod
 
             import config as cfg
@@ -2625,7 +2625,6 @@ def create_imports_blueprint(
                 scan as do_scan,
             )
 
-            thread_db = Database(db_path)
             thread_db.set_active_workspace(active_ws)
             if thread_db.check_folder_health():
                 invalidate_missing_originals()
@@ -3421,6 +3420,12 @@ def create_imports_blueprint(
                 result["cancelled"] = True
             _chain_after_import(job, result)
             return result
+
+        def _run_import_in_place(job):
+            # Scan callbacks form reference cycles that can outlive the job.
+            # Release SQLite files on every return/error without waiting for GC.
+            with Database(db_path) as thread_db:
+                return _import_in_place(job, thread_db)
 
         def work(job):
             if snapshot_import_lock is None:

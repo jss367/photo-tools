@@ -905,6 +905,14 @@
         </div>
       </div>`;
     }
+    if (node.field === 'keyword_identity') {
+      // Chart links select a confirmed identity, which cannot be edited as
+      // free text. Keep its readable label and allow removing the constraint.
+      return `<div class="vf-rule-row vf-identity-row">
+        <span>${esc(ruleLabel(node))}</span>
+        <button class="vf-remove" data-action="remove" data-path="${path}" type="button" aria-label="Remove rule">×</button>
+      </div>`;
+    }
     const spec = fieldSpec(node.field) || { label: node.field, type: 'text', ops: ['is'] };
     const fieldOptions = state.fieldOrder.filter((key) =>
       fieldAvailable(key) || key === node.field).map((key) =>

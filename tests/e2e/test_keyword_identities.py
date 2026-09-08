@@ -31,6 +31,16 @@ def test_species_groups_preserve_paths_and_chart_drill_down(live_server, page):
     expect(bar.locator('.bar-value')).to_have_text('2')
     bar.click()
     expect(page.locator('.grid-card')).to_have_count(2)
+    page.locator('.vf-filters-btn').click()
+    page.locator('.vf-advanced input').check()
+    identity_row = page.locator('.vf-identity-row')
+    expect(identity_row).to_contain_text('Keyword · Test bird')
+    expect(identity_row.locator('select, input')).to_have_count(0)
+    page.reload()
+    expect(page.locator('.grid-card')).to_have_count(2)
+    page.locator('.vf-filters-btn').click()
+    page.locator('.vf-identity-row').get_by_role('button', name='Remove rule').click()
+    expect(page.locator('.grid-card')).to_have_count(len(photos))
     assert errors == []
 
 
@@ -56,4 +66,4 @@ def test_location_preview_combines_only_chosen_match(live_server, page):
     expect(preview).to_have_text('No matching location keywords to review.')
     expect(page.locator('#kwBody tr .kw-linked-badge')).to_be_visible()
     assert db.get_assigned_photo_location(photos[0])['place_id'] == 'test-place'
-    assert db.add_keyword('Lake Hodges') == target
+    assert db.add_keyword('Lake Hodges', _resolve_alias=True) == target

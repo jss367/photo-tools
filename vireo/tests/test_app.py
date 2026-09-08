@@ -18787,11 +18787,13 @@ def test_batch_accept_on_all_without_acceptable_predictions(app_and_db):
 
 
 @pytest.mark.parametrize("pending_removal,sync_after_accept", [(True, False), (False, False), (False, True)])
+@pytest.mark.parametrize("with_prediction", [False, True])
 def test_batch_accept_on_all_undo_redo_preserves_sidecar_changes(
-    app_and_db, pending_removal, sync_after_accept,
+    app_and_db, pending_removal, sync_after_accept, with_prediction,
 ):
     app, db = app_and_db
-    photo, _ = _seed_prediction_photo(db, "all-sidecar.jpg", "Osprey", 0.9)
+    species = "Bald Eagle" if with_prediction else "Osprey"
+    photo, _ = _seed_prediction_photo(db, "all-sidecar.jpg", species, 0.9)
     if pending_removal:
         db.queue_change(photo, "keyword_remove", "Bald Eagle")
 
@@ -18802,7 +18804,8 @@ def test_batch_accept_on_all_undo_redo_preserves_sidecar_changes(
         ]
 
     response = app.test_client().post("/api/predictions/batch-accept", json={
-        "prediction_ids": [], "expected_species": "Bald Eagle", "photo_ids": [photo],
+        "prediction_ids": [_prediction_id(db, photo, species)] if with_prediction else [],
+        "expected_species": "Bald Eagle", "photo_ids": [photo],
     })
     assert response.status_code == 200
     assert pending_types() == ([] if pending_removal else ["keyword_add"])
@@ -18813,15 +18816,19 @@ def test_batch_accept_on_all_undo_redo_preserves_sidecar_changes(
         db.undo_last_edit()
         assert "Bald Eagle" not in {k["name"] for k in db.get_photo_keywords(photo)}
         assert pending_types() == (["keyword_remove"] if sidecar_has_keyword else [])
+        assert db.get_predictions(photo_ids=[photo])[0]["status"] == "pending"
         db.redo_last_undo()
         assert "Bald Eagle" in {k["name"] for k in db.get_photo_keywords(photo)}
         assert pending_types() == ([] if sidecar_has_keyword else ["keyword_add"])
+        assert db.get_predictions(photo_ids=[photo])[0]["status"] == ("accepted" if with_prediction else "pending")
 
 
 @pytest.mark.parametrize("delete_other_workspace", [False, True])
-def test_batch_accept_on_all_undo_restores_flat_removals(app_and_db, delete_other_workspace):
+@pytest.mark.parametrize("with_prediction", [False, True])
+def test_batch_accept_on_all_undo_restores_flat_removals(app_and_db, delete_other_workspace, with_prediction):
     app, db = app_and_db
-    photo, _ = _seed_prediction_photo(db, "all-flat-removal.jpg", "Osprey", 0.9)
+    species = "Bald Eagle" if with_prediction else "Osprey"
+    photo, _ = _seed_prediction_photo(db, "all-flat-removal.jpg", species, 0.9)
     active_ws = db._ws_id()
     other_ws = db.create_workspace("Shared sidecar")
     for ws, value in [(active_ws, "Bald Eagle"), (other_ws, "bald eagle")]:
@@ -18837,7 +18844,8 @@ def test_batch_accept_on_all_undo_restores_flat_removals(app_and_db, delete_othe
         }
 
     response = app.test_client().post("/api/predictions/batch-accept", json={
-        "prediction_ids": [], "expected_species": "Bald Eagle", "photo_ids": [photo],
+        "prediction_ids": [_prediction_id(db, photo, species)] if with_prediction else [],
+        "expected_species": "Bald Eagle", "photo_ids": [photo],
     })
     assert response.status_code == 200
     assert flat_removals() == {(active_ws, "Osprey")}

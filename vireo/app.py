@@ -16415,22 +16415,37 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 if photo_id in already_tagged:
                     continue
                 db.tag_photo(photo_id, keyword_id, source="manual", _commit=False)
+                items.append({
+                    "photo_id": photo_id,
+                    "old_value": json.dumps({"keyword_only": True}),
+                    "new_value": str(keyword_id),
+                })
+
+            # Every new tag in Accept on all needs the same sidecar handling,
+            # including tags already added by accept_prediction above.
+            for item in items:
+                old_value = item["old_value"]
+                old_meta = (
+                    json.loads(old_value) if old_value.startswith("{")
+                    else {"prediction_id": int(old_value)}
+                )
+                if old_meta.get("no_tag"):
+                    continue
+                photo_id = item["photo_id"]
                 flat_removals = [dict(row) for row in db.conn.execute(
                     """SELECT workspace_id, value FROM pending_changes
                        WHERE photo_id = ? AND change_type = 'keyword_remove_flat'
                          AND value = ? COLLATE NOCASE""",
                     (photo_id, species),
                 )]
+                # accept_prediction queues an add directly. Reconcile it
+                # with any pending removal before applying the shared helper.
+                db.remove_pending_changes(photo_id, "keyword_add", species, _commit=False)
                 _queue_keyword_add(photo_id, species, _commit=False)
                 # Keep the suppression records cleared by the add, including
                 # those in other workspaces sharing this photo's sidecar.
-                items.append({
-                    "photo_id": photo_id,
-                    "old_value": json.dumps({
-                        "keyword_only": True, "flat_removals": flat_removals,
-                    }),
-                    "new_value": str(keyword_id),
-                })
+                old_meta.update(symmetric_keyword_queue=True, flat_removals=flat_removals)
+                item["old_value"] = json.dumps(old_meta)
 
         # History joins the same transaction rather than committing after it:
         # the accepted statuses and the entry that undoes them become visible

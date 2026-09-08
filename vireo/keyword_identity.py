@@ -168,6 +168,9 @@ def location_candidates(db):
     by_id = {r['id']: r for r in rows}
     visible = {r['id'] for r in db.get_keyword_tree()}
     parents = {r['parent_id'] for r in rows}
+    children = defaultdict(list)
+    for row in rows:
+        children[row['parent_id']].append(row['id'])
     places = defaultdict(list)
     for row in rows:
         if row['type'] == 'location' and row['place_id']:
@@ -184,6 +187,12 @@ def location_candidates(db):
             while parent_id is not None and parent_id not in same_chain:
                 same_chain.add(parent_id)
                 parent_id = by_id[parent_id]['parent_id']
+            descendants = list(children[target['id']])
+            while descendants:
+                descendant = descendants.pop()
+                if descendant not in same_chain:
+                    same_chain.add(descendant)
+                    descendants.extend(children[descendant])
             placeholders = ','.join('?' for _ in same_chain)
             conflicts = db.conn.execute(
                 f"""SELECT COUNT(DISTINCT source.photo_id) FROM photo_keywords source

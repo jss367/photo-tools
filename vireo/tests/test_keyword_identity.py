@@ -204,6 +204,21 @@ def test_identity_and_reconciliation_api(app_and_db):
     assert client.post('/api/keywords/reconcile-location', json={'source_id': source, 'target_id': target}).status_code == 400
 
 
+def test_reconciliation_accepts_an_existing_descendant_location(catalog):
+    db, photos = catalog
+    source, target, _ = place_pair(db)
+    child = db.upsert_place_chain({'name': 'Picnic area', 'place_id': 'picnic-place',
+                                   'lat': 33.1, 'lng': -117.1, 'address_components': []})
+    db.conn.execute('UPDATE keywords SET parent_id = ? WHERE id = ?', (target, child))
+    db.conn.commit()
+    db.tag_photo(photos[0], source)
+    db.set_photo_location(photos[0], child)
+    assert location_candidates(db)[0]['conflicting_photo_count'] == 0
+    reconcile_location(db, source, target)
+    assert {k['id'] for k in db.get_photo_keywords(photos[0])} == {target, child}
+    assert db.get_assigned_photo_location(photos[0])['place_id'] == 'picnic-place'
+
+
 def test_reconciliation_does_not_override_a_different_assigned_place(catalog):
     db, photos = catalog
     source, target, _ = place_pair(db)

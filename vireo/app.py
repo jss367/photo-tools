@@ -16391,7 +16391,37 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 )
             for a in result["affected"]:
                 if a.get("changed_tag", True):
-                    old_value = str(a["prediction_id"])
+                    # ``accept_prediction`` tags the photo and queues a
+                    # ``keyword_add`` directly, without clearing any
+                    # migration-generated ``keyword_remove_flat`` for the
+                    # same species. Leaving that suppression in place lets
+                    # a later "Use XMP" filter the species out and detach
+                    # the tag the user just accepted, so capture and clear
+                    # it here in the same transaction, and stash the
+                    # captured rows on the history item so Undo can
+                    # restore them (Redo re-clears).
+                    photo_id = a["photo_id"]
+                    flat_removals = [dict(row) for row in db.conn.execute(
+                        """SELECT workspace_id, value FROM pending_changes
+                           WHERE photo_id = ? AND change_type = 'keyword_remove_flat'
+                             AND value = ? COLLATE NOCASE""",
+                        (photo_id, species),
+                    )]
+                    if flat_removals:
+                        db.clear_equivalent_flat_removals(
+                            [{
+                                "photo_id": photo_id,
+                                "change_type": "keyword_remove_flat",
+                                "value": species,
+                            }],
+                            _commit=False,
+                        )
+                        old_value = json.dumps({
+                            "prediction_id": a["prediction_id"],
+                            "flat_removals": flat_removals,
+                        })
+                    else:
+                        old_value = str(a["prediction_id"])
                 else:
                     old_value = json.dumps({
                         "prediction_id": a["prediction_id"],

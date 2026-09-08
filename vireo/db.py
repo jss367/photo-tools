@@ -21382,6 +21382,38 @@ class Database:
     # highlight/representative rows under other species. Those rows are
     # restored / re-applied here too, mirroring the `species_replace` path.
 
+    def _restore_edit_flat_removals(self, pid, old_meta):
+        """Re-queue ``keyword_remove_flat`` rows an edit had cleared.
+
+        Undo of an ``Accept on all`` add — whether the item was
+        ``keyword_only`` or a tagged prediction accept — has to put the
+        migration-generated suppression back, or the tag it just removed
+        would re-attach on the next "Use XMP". Skip rows whose workspace
+        was deleted between the edit and undo: nothing shared the sidecar
+        with the survivor any more, and re-queuing them here would
+        resurrect suppression against a workspace that no longer exists.
+        """
+        for removal in old_meta.get('flat_removals', []):
+            if self.conn.execute(
+                'SELECT 1 FROM workspaces WHERE id = ?', (removal['workspace_id'],),
+            ).fetchone():
+                self.queue_change(
+                    pid, 'keyword_remove_flat', removal['value'],
+                    workspace_id=removal['workspace_id'],
+                )
+
+    def _reclear_edit_flat_removals(self, pid, old_meta):
+        """Cancel the ``keyword_remove_flat`` rows a prior undo restored.
+
+        Redo of the same accept has to re-clear them; leaving them in
+        place would re-arm the suppression the accept had cleared.
+        """
+        for removal in old_meta.get('flat_removals', []):
+            self.remove_pending_changes(
+                pid, 'keyword_remove_flat', removal['value'],
+                workspace_id=removal['workspace_id'],
+            )
+
     def _undo_keyword_add(self, entry, item):
         pid, old_val = item['photo_id'], item['old_value']
         action = entry['action_type']
@@ -21396,20 +21428,16 @@ class Database:
                 # removal (or already synced), so undo must restore a removal
                 # when there is no pending add left to cancel.
                 self._untag_for_edit(pid, kid)
-                for removal in old_meta.get('flat_removals', []):
-                    # A shared workspace can be deleted between the edit and
-                    # undo. Restore only records whose workspace still exists.
-                    if self.conn.execute(
-                        'SELECT 1 FROM workspaces WHERE id = ?', (removal['workspace_id'],),
-                    ).fetchone():
-                        self.queue_change(
-                            pid, 'keyword_remove_flat', removal['value'],
-                            workspace_id=removal['workspace_id'],
-                        )
             else:
                 self.untag_photo(pid, kid)
                 if kw_name:
                     self.remove_pending_changes(pid, 'keyword_add', kw_name)
+            if action == 'prediction_accept':
+                # Every prediction_accept item — keyword-only or tagged —
+                # may have stashed flat removals it cleared; restore them
+                # uniformly so a subsequent "Use XMP" cannot re-detach the
+                # tag the undo just took off.
+                self._restore_edit_flat_removals(pid, old_meta)
         if action == 'keyword_add':
             self._restore_edit_prediction_status(old_meta)
             if kw_name:
@@ -21431,15 +21459,12 @@ class Database:
             if action == 'prediction_accept' and (not old_val or old_meta.get('keyword_only')):
                 # Cancel the removal restored by undo before queueing an add.
                 self._retag_for_edit(pid, kid)
-                for removal in old_meta.get('flat_removals', []):
-                    self.remove_pending_changes(
-                        pid, 'keyword_remove_flat', removal['value'],
-                        workspace_id=removal['workspace_id'],
-                    )
             else:
                 self.tag_photo(pid, kid, source='manual')
                 if kw_name:
                     self.queue_change(pid, 'keyword_add', kw_name)
+            if action == 'prediction_accept':
+                self._reclear_edit_flat_removals(pid, old_meta)
         if action == 'keyword_add':
             self._reject_edit_prediction(old_meta)
             if kw_name:

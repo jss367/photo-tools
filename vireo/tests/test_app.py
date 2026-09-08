@@ -18856,6 +18856,65 @@ def test_batch_accept_on_all_undo_restores_flat_removals(app_and_db, delete_othe
         assert "Bald Eagle" in {k["name"] for k in db.get_photo_keywords(photo)}
 
 
+@pytest.mark.parametrize("delete_other_workspace", [False, True])
+def test_batch_accept_on_all_prediction_tagged_clears_flat_removals(
+    app_and_db, delete_other_workspace,
+):
+    """Prediction-tagged photos also need their flat suppression cleared.
+
+    ``accept_prediction`` tags the photo before the batch's ``already_tagged``
+    probe runs, so the keyword-only branch skips these photos entirely. The
+    flat-removal capture therefore has to happen alongside the prediction
+    accept itself — otherwise a later "Use XMP" filters the species out and
+    detaches the tag the user just accepted.
+    """
+    app, db = app_and_db
+    photo, _ = _seed_prediction_photo(db, "pred-flat-removal.jpg", "Bald Eagle", 0.9)
+    pred_id = _prediction_id(db, photo, "Bald Eagle")
+    active_ws = db._ws_id()
+    other_ws = db.create_workspace("Shared sidecar")
+    for ws, value in [(active_ws, "Bald Eagle"), (other_ws, "bald eagle")]:
+        db.queue_change(photo, "keyword_remove_flat", value, workspace_id=ws)
+    db.queue_change(photo, "keyword_remove_flat", "Osprey")
+
+    def flat_removals():
+        return {
+            (row["workspace_id"], row["value"]) for row in db.conn.execute(
+                "SELECT workspace_id, value FROM pending_changes "
+                "WHERE photo_id = ? AND change_type = 'keyword_remove_flat'", (photo,),
+            )
+        }
+
+    response = app.test_client().post("/api/predictions/batch-accept", json={
+        "prediction_ids": [pred_id],
+        "expected_species": "Bald Eagle",
+        "photo_ids": [photo],
+    })
+    assert response.status_code == 200, response.get_data(as_text=True)
+    assert response.json["accepted"] == 1
+    assert "Bald Eagle" in {k["name"] for k in db.get_photo_keywords(photo)}
+    # The accept cleared the "Bald Eagle" flat removals across every
+    # workspace sharing the sidecar; the "Osprey" one is untouched.
+    assert flat_removals() == {(active_ws, "Osprey")}
+    edits = [e for e in db.get_edit_history() if e["action_type"] == "prediction_accept"]
+    assert len(edits) == 1
+    assert edits[0]["description"].startswith('Accepted prediction: added "Bald Eagle"')
+
+    expected = {(active_ws, "Bald Eagle"), (active_ws, "Osprey")}
+    if delete_other_workspace:
+        db.conn.execute("DELETE FROM workspaces WHERE id = ?", (other_ws,))
+        db.conn.commit()
+    else:
+        expected.add((other_ws, "bald eagle"))
+    for _ in range(2):
+        db.undo_last_edit()
+        assert flat_removals() == expected
+        assert "Bald Eagle" not in {k["name"] for k in db.get_photo_keywords(photo)}
+        db.redo_last_undo()
+        assert flat_removals() == {(active_ws, "Osprey")}
+        assert "Bald Eagle" in {k["name"] for k in db.get_photo_keywords(photo)}
+
+
 @pytest.mark.parametrize("invalid", ["missing_species", "outside_selection", "foreign_photo"])
 def test_batch_accept_on_all_validates_scope_before_writing(app_and_db, invalid):
     app, db = app_and_db

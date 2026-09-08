@@ -18726,6 +18726,167 @@ def test_batch_accept_records_single_undo_entry(app_and_db):
         assert "Bald Eagle" not in names
 
 
+def test_batch_accept_on_all_tags_full_selection_with_one_undo(app_and_db):
+    app, db = app_and_db
+    client = app.test_client()
+    predicted, _ = _seed_prediction_photo(db, "all-predicted.jpg", "Bald Eagle", 0.91)
+    other, _ = _seed_prediction_photo(db, "all-other.jpg", "Osprey", 0.8)
+    existing, _ = _seed_prediction_photo(db, "all-existing.jpg", "Bald Eagle", 0.9)
+    outside, _ = _seed_prediction_photo(db, "all-outside.jpg", "Bald Eagle", 0.9)
+    unclassified = db.add_photo(
+        folder_id=db.get_folder_tree()[0]["id"], filename="all-unclassified.jpg",
+        extension=".jpg", file_size=100, file_mtime=1.0,
+    )
+    eagle = db.add_keyword("Bald Eagle", is_species=True)
+    osprey = db.add_keyword("Osprey", is_species=True)
+    db.tag_photo(existing, eagle)
+    db.tag_photo(other, osprey)
+    selection = [predicted, other, existing, unclassified]
+    payload = {
+        "prediction_ids": [_prediction_id(db, pid, "Bald Eagle") for pid in (predicted, existing)],
+        "expected_species": "Bald Eagle", "photo_ids": selection,
+    }
+    response = client.post("/api/predictions/batch-accept", json=payload)
+    assert response.status_code == 200, response.get_data(as_text=True)
+    assert response.json["accepted"] == 4
+    for pid in selection:
+        assert "Bald Eagle" in {k["name"] for k in db.get_photo_keywords(pid)}
+    assert not db.get_photo_keywords(outside)
+    assert "Osprey" in {k["name"] for k in db.get_photo_keywords(other)}
+    statuses = {p["photo_id"]: p["status"] for p in db.get_predictions(photo_ids=selection)}
+    assert statuses == {predicted: "accepted", existing: "accepted", other: "pending"}
+    edits = [e for e in db.get_edit_history() if e["action_type"] == "prediction_accept"]
+    assert len(edits) == 1
+    assert edits[0]["description"].startswith('Accepted prediction: added "Bald Eagle"')
+    # Repeating the click must not create a second undo entry.
+    assert client.post("/api/predictions/batch-accept", json=payload).json["accepted"] == 0
+    db.undo_last_edit()
+    for pid in (predicted, other, unclassified):
+        assert "Bald Eagle" not in {k["name"] for k in db.get_photo_keywords(pid)}
+    assert "Bald Eagle" in {k["name"] for k in db.get_photo_keywords(existing)}
+    assert all(p["status"] == "pending" for p in db.get_predictions(photo_ids=selection))
+    db.redo_last_undo()
+    for pid in selection:
+        assert "Bald Eagle" in {k["name"] for k in db.get_photo_keywords(pid)}
+
+
+def test_batch_accept_on_all_without_acceptable_predictions(app_and_db):
+    app, db = app_and_db
+    photo, _ = _seed_prediction_photo(db, "all-conflict.jpg", "Bald Eagle", 0.9)
+    osprey = db.add_keyword("Osprey", is_species=True)
+    db.tag_photo(photo, osprey)
+    response = app.test_client().post("/api/predictions/batch-accept", json={
+        "prediction_ids": [], "expected_species": "Bald Eagle", "photo_ids": [photo],
+    })
+    assert response.status_code == 200, response.get_data(as_text=True)
+    assert {k["name"] for k in db.get_photo_keywords(photo)} == {"Bald Eagle", "Osprey"}
+    assert db.get_predictions(photo_ids=[photo])[0]["status"] == "pending"
+    assert db.get_edit_history()[0]["description"] == 'Added species "Bald Eagle"'
+    db.undo_last_edit()
+    assert {k["name"] for k in db.get_photo_keywords(photo)} == {"Osprey"}
+
+
+@pytest.mark.parametrize("pending_removal,sync_after_accept", [(True, False), (False, False), (False, True)])
+@pytest.mark.parametrize("with_prediction", [False, True])
+def test_batch_accept_on_all_undo_redo_preserves_sidecar_changes(
+    app_and_db, pending_removal, sync_after_accept, with_prediction,
+):
+    app, db = app_and_db
+    species = "Bald Eagle" if with_prediction else "Osprey"
+    photo, _ = _seed_prediction_photo(db, "all-sidecar.jpg", species, 0.9)
+    if pending_removal:
+        db.queue_change(photo, "keyword_remove", "Bald Eagle")
+
+    def pending_types():
+        return [
+            row["change_type"] for row in db.get_pending_changes()
+            if row["photo_id"] == photo and row["value"] == "Bald Eagle"
+        ]
+
+    response = app.test_client().post("/api/predictions/batch-accept", json={
+        "prediction_ids": [_prediction_id(db, photo, species)] if with_prediction else [],
+        "expected_species": "Bald Eagle", "photo_ids": [photo],
+    })
+    assert response.status_code == 200
+    assert pending_types() == ([] if pending_removal else ["keyword_add"])
+    if sync_after_accept:
+        db.clear_pending([row["id"] for row in db.get_pending_changes()])
+    sidecar_has_keyword = pending_removal or sync_after_accept
+    for _ in range(2):
+        db.undo_last_edit()
+        assert "Bald Eagle" not in {k["name"] for k in db.get_photo_keywords(photo)}
+        assert pending_types() == (["keyword_remove"] if sidecar_has_keyword else [])
+        assert db.get_predictions(photo_ids=[photo])[0]["status"] == "pending"
+        db.redo_last_undo()
+        assert "Bald Eagle" in {k["name"] for k in db.get_photo_keywords(photo)}
+        assert pending_types() == ([] if sidecar_has_keyword else ["keyword_add"])
+        assert db.get_predictions(photo_ids=[photo])[0]["status"] == ("accepted" if with_prediction else "pending")
+
+
+@pytest.mark.parametrize("delete_other_workspace", [False, True])
+@pytest.mark.parametrize("with_prediction", [False, True])
+def test_batch_accept_on_all_undo_restores_flat_removals(app_and_db, delete_other_workspace, with_prediction):
+    app, db = app_and_db
+    species = "Bald Eagle" if with_prediction else "Osprey"
+    photo, _ = _seed_prediction_photo(db, "all-flat-removal.jpg", species, 0.9)
+    active_ws = db._ws_id()
+    other_ws = db.create_workspace("Shared sidecar")
+    for ws, value in [(active_ws, "Bald Eagle"), (other_ws, "bald eagle")]:
+        db.queue_change(photo, "keyword_remove_flat", value, workspace_id=ws)
+    db.queue_change(photo, "keyword_remove_flat", "Osprey")
+
+    def flat_removals():
+        return {
+            (row["workspace_id"], row["value"]) for row in db.conn.execute(
+                "SELECT workspace_id, value FROM pending_changes "
+                "WHERE photo_id = ? AND change_type = 'keyword_remove_flat'", (photo,),
+            )
+        }
+
+    response = app.test_client().post("/api/predictions/batch-accept", json={
+        "prediction_ids": [_prediction_id(db, photo, species)] if with_prediction else [],
+        "expected_species": "Bald Eagle", "photo_ids": [photo],
+    })
+    assert response.status_code == 200
+    assert flat_removals() == {(active_ws, "Osprey")}
+    expected = {(active_ws, "Bald Eagle"), (active_ws, "Osprey")}
+    if delete_other_workspace:
+        db.conn.execute("DELETE FROM workspaces WHERE id = ?", (other_ws,))
+        db.conn.commit()
+    else:
+        expected.add((other_ws, "bald eagle"))
+    for _ in range(2):
+        db.undo_last_edit()
+        assert flat_removals() == expected
+        assert "Bald Eagle" not in {k["name"] for k in db.get_photo_keywords(photo)}
+        db.redo_last_undo()
+        assert flat_removals() == {(active_ws, "Osprey")}
+        assert "Bald Eagle" in {k["name"] for k in db.get_photo_keywords(photo)}
+
+
+@pytest.mark.parametrize("invalid", ["missing_species", "outside_selection", "foreign_photo"])
+def test_batch_accept_on_all_validates_scope_before_writing(app_and_db, invalid):
+    app, db = app_and_db
+    client = app.test_client()
+    photo, _ = _seed_prediction_photo(db, "all-scope.jpg", "Bald Eagle", 0.9)
+    other, _ = _seed_prediction_photo(db, "all-scope-other.jpg", "Bald Eagle", 0.9)
+    payload = {
+        "prediction_ids": [_prediction_id(db, photo, "Bald Eagle")],
+        "expected_species": "Bald Eagle", "photo_ids": [photo],
+    }
+    if invalid == "missing_species":
+        del payload["expected_species"]
+    elif invalid == "outside_selection":
+        payload["photo_ids"] = [other]
+    else:
+        workspace = db.create_workspace("Other")
+        assert client.post(f"/api/workspaces/{workspace}/activate").status_code == 200
+    response = client.post("/api/predictions/batch-accept", json=payload)
+    assert response.status_code == (403 if invalid == "foreign_photo" else 400)
+    assert not db.get_photo_keywords(photo)
+    assert not db.get_photo_keywords(other)
+
+
 def test_batch_accept_chunks_oversized_id_payloads(app_and_db):
     """The raised cap must not hand SQLite a 25,000-variable IN clause.
 
@@ -21833,6 +21994,69 @@ def _run_node(source, args):
         )
     assert proc.returncode == 0, proc.stderr
     return _json.loads(proc.stdout)
+
+
+def test_selection_predictions_accept_on_all_renders_and_submits_full_selection(app_and_db):
+    app, _ = app_and_db
+    html = app.test_client().get("/browse").get_data(as_text=True)
+    source = "\n".join([
+        _PANEL_DOM_STUB.replace("id === 'detailPredictions'", "id === 'selectionPredictions'"),
+        _browse_escape_helpers(),
+        _browse_js_function_body(html, "function formatPredictionConfidence("),
+        _browse_js_function_body(html, "function renderSelectionPredictions("),
+        _browse_js_function_body(html, "async function acceptSelectionPrediction("),
+        """
+var selectionPredictionsExpanded = false;
+var selectionPredictionAcceptableById = {};
+var selectionPredictionSpeciesByIdx = {};
+var requests = [], refreshes = [];
+function getActiveSelection() { return [11, 12, 13]; }
+async function safeFetch(url, opts) {
+  requests.push({url: url, body: JSON.parse(opts.body)});
+  return {accepted: 3};
+}
+async function _afterPredictionMutation(ids, opts) { refreshes.push(ids); }
+function _reportSkippedAccepts() {}
+var predictions = Array.from({length: 6}, function(_, idx) {
+  return {
+    species: idx === 0 ? "Say's Phoebe" : 'Species ' + idx,
+    predicted_count: idx === 0 ? 3 : 1,
+    acceptable_photo_count: idx === 2 ? 0 : 1,
+    acceptable_prediction_ids: idx === 2 ? [] : [100 + idx],
+    ambiguous_photo_ids: idx === 2 ? [12] : [],
+    min_confidence: 0.2, max_confidence: 0.9,
+  };
+});
+(async function() {
+  renderSelectionPredictions(predictions, 3, {});
+  var collapsedHTML = __list.innerHTML;
+  selectionPredictionsExpanded = true;
+  renderSelectionPredictions(predictions, 3, {});
+  var button = {disabled: false, textContent: 'Accept on all'};
+  await acceptSelectionPrediction(0, true, button);
+  await acceptSelectionPrediction(2, true, button);
+  await acceptSelectionPrediction(1);
+  process.stdout.write(JSON.stringify({
+    collapsedHTML: collapsedHTML, expandedHTML: __list.innerHTML,
+    requests: requests, refreshes: refreshes, button: button,
+  }));
+})();
+""",
+    ])
+    result = _run_node(source, [])
+    assert result["collapsedHTML"].count(">Accept on all</button>") == 5
+    assert result["expandedHTML"].count(">Accept on all</button>") == 6
+    assert result["requests"][0]["body"] == {
+        "prediction_ids": [100], "expected_species": "Say's Phoebe", "photo_ids": [11, 12, 13],
+    }
+    assert result["requests"][1]["body"] == {
+        "prediction_ids": [], "expected_species": "Species 2", "photo_ids": [11, 12, 13],
+    }
+    assert result["requests"][2]["body"] == {
+        "prediction_ids": [101], "expected_species": "Species 1",
+    }
+    assert result["refreshes"] == [[11, 12, 13]] * 3
+    assert result["button"] == {"disabled": False, "textContent": "Accept on all"}
 
 
 def _browse_escape_helpers():

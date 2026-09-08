@@ -434,7 +434,7 @@ def test_no_working_copy_for_small_jpeg(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# Candidate-count helper (drives the startup gate + before/after totals)
+# Candidate-count helper (before/after totals for explicit backfill)
 # ---------------------------------------------------------------------------
 
 
@@ -522,7 +522,7 @@ def test_candidate_count_includes_raw(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# Library-wide backfill (used by the startup self-healing job)
+# Explicit library-wide extraction
 # ---------------------------------------------------------------------------
 
 
@@ -530,7 +530,7 @@ def test_backfill_processes_legacy_null_working_copy_path(tmp_path, monkeypatch)
     """``backfill_working_copies`` covers photos imported before the feature.
 
     Simulates a row that exists with ``working_copy_path=NULL`` from a prior
-    scan that never had ``vireo_dir`` passed in. The new startup pass must
+    scan that never had ``vireo_dir`` passed in. An explicit backfill must
     pick it up library-wide (no ``scope`` argument).
     """
     import config as cfg
@@ -1007,199 +1007,84 @@ def test_scan_progress_callback_not_clobbered_by_working_copy_phase(tmp_path, mo
 
 
 # ---------------------------------------------------------------------------
-# Startup self-healing kickoff (app.create_app -> ephemeral JobRunner job)
+# Startup must not generate working copies for unrequested photos.
 # ---------------------------------------------------------------------------
 
 
-def test_startup_backfill_skips_when_no_candidates(tmp_path, monkeypatch):
-    """If no photo needs work, no working_copy_backfill job is started."""
-    import os
+def test_startup_does_not_generate_working_copies(tmp_path, monkeypatch):
+    """Run deferred startup callbacks with an eligible, uncached photo."""
+    import threading
 
-    import config as cfg
-    import models
-    monkeypatch.setenv("HOME", str(tmp_path))
-    monkeypatch.setattr(cfg, "CONFIG_PATH", str(tmp_path / "config.json"))
-    monkeypatch.setattr(models, "DEFAULT_MODELS_DIR", str(tmp_path / "vireo-models"))
-    monkeypatch.setattr(models, "CONFIG_PATH", str(tmp_path / "models.json"))
-
-    from app import create_app
     from db import Database
 
-    db_path = str(tmp_path / "test.db")
-    thumb_dir = str(tmp_path / "thumbs")
-    os.makedirs(thumb_dir)
-    Database(db_path)  # create empty DB with workspace
+    callbacks = []
 
-    app = create_app(db_path=db_path, thumb_cache_dir=thumb_dir, api_token="t")
+    class DeferredTimer:
+        def __init__(self, interval, function, args=None, kwargs=None):
+            self.callback = lambda: function(*(args or ()), **(kwargs or {}))
+            self.daemon = False
 
-    # Drive the kickoff synchronously instead of waiting for the 5s Timer.
-    app._kickoff_working_copy_backfill()
+        def start(self):
+            callbacks.append(self.callback)
 
-    backfill_jobs = [
-        j for j in app._job_runner.list_jobs()
-        if j["type"] == "working_copy_backfill"
-    ]
-    assert backfill_jobs == []
+    # Exercise production startup wiring without real timer delays or the
+    # unrelated perpetual folder-health thread.
+    real_start = threading.Thread.start
+
+    def start_thread(thread):
+        if getattr(thread._target, "__name__", "") != "_folder_health_loop":
+            real_start(thread)
+
+    monkeypatch.delenv("VIREO_DISABLE_STARTUP_BACKFILL_TIMERS", raising=False)
+    monkeypatch.setattr(threading, "Timer", DeferredTimer)
+    monkeypatch.setattr(threading.Thread, "start", start_thread)
+    app, vireo_dir, ids = _prepare_backfill_app(
+        tmp_path, monkeypatch, ["big.jpg"],
+    )
+    try:
+        assert callbacks, "startup timers must be enabled for this regression"
+        for callback in callbacks:
+            callback()
+        assert app._job_runner.shutdown(timeout=30)
+        assert not any(
+            job["type"] == "working_copy_backfill"
+            for job in app._job_runner.list_jobs()
+        )
+        assert not (vireo_dir / "working" / f"{ids[0]}.jpg").exists()
+        db = Database(app.config["DB_PATH"])
+        try:
+            row = db.conn.execute(
+                "SELECT working_copy_path FROM photos WHERE id=?", (ids[0],),
+            ).fetchone()
+            assert row["working_copy_path"] is None
+        finally:
+            db.close()
+    finally:
+        app._cleanup_app_resources()
 
 
-def test_startup_backfill_skips_for_small_jpeg_only_library(tmp_path, monkeypatch):
-    """Small JPEGs (under working_copy_max_size) are intentionally not extracted.
+def _start_backfill(app):
+    """Explicitly run extraction in a worker for the scanner race tests.
 
-    The startup gate must skip them rather than launching a no-op backfill on
-    every restart. Regression test for a library that contains only small
-    JPEGs — naive ``working_copy_path IS NULL`` check would fire forever.
+    Production no longer schedules this job at startup. These tests still
+    need a worker they can pause while another connection changes the catalog.
     """
-    import os
-
-    import config as cfg
-    import models
-    monkeypatch.setenv("HOME", str(tmp_path))
-    monkeypatch.setattr(cfg, "CONFIG_PATH", str(tmp_path / "config.json"))
-    monkeypatch.setattr(models, "DEFAULT_MODELS_DIR", str(tmp_path / "vireo-models"))
-    monkeypatch.setattr(models, "CONFIG_PATH", str(tmp_path / "models.json"))
-    cfg.save({**cfg.DEFAULTS, "working_copy_max_size": 1000, "working_copy_quality": 90})
-
-    from app import create_app
     from db import Database
+    from scanner import backfill_working_copies
 
-    vireo_dir = tmp_path / "vireo"
-    vireo_dir.mkdir()
-    thumb_dir = vireo_dir / "thumbnails"
-    thumb_dir.mkdir()
-    db_path = str(vireo_dir / "test.db")
+    runner = app._job_runner
 
-    photos_dir = tmp_path / "photos"
-    photos_dir.mkdir()
-    src = photos_dir / "small.jpg"
-    _make_jpeg(str(src), 800, 600)  # below the 1000 cap
+    def work(job):
+        db = Database(app.config["DB_PATH"])
+        try:
+            return backfill_working_copies(
+                db, os.path.dirname(app.config["THUMB_CACHE_DIR"]),
+                cancel_check=lambda: runner.is_cancelled(job["id"]),
+            )
+        finally:
+            db.close()
 
-    db = Database(db_path)
-    folder_id = db.add_folder(str(photos_dir))
-    db.add_photo(
-        folder_id, "small.jpg", ".jpg",
-        file_size=os.path.getsize(str(src)),
-        file_mtime=os.path.getmtime(str(src)),
-        width=800, height=600,
-    )
-    db.conn.close()
-
-    app = create_app(db_path=db_path, thumb_cache_dir=str(thumb_dir), api_token="t")
-    app._kickoff_working_copy_backfill()
-
-    backfill_jobs = [
-        j for j in app._job_runner.list_jobs()
-        if j["type"] == "working_copy_backfill"
-    ]
-    assert backfill_jobs == [], (
-        "small-JPEG-only library should not trigger working_copy_backfill"
-    )
-
-
-def test_startup_backfill_runs_when_candidates_exist(tmp_path, monkeypatch):
-    """A photo with NULL working_copy_path triggers an ephemeral backfill job
-    that produces the working copy and completes successfully.
-    """
-    import os
-
-    import config as cfg
-    import models
-    monkeypatch.setenv("HOME", str(tmp_path))
-    monkeypatch.setattr(cfg, "CONFIG_PATH", str(tmp_path / "config.json"))
-    monkeypatch.setattr(models, "DEFAULT_MODELS_DIR", str(tmp_path / "vireo-models"))
-    monkeypatch.setattr(models, "CONFIG_PATH", str(tmp_path / "models.json"))
-    cfg.save({**cfg.DEFAULTS, "working_copy_max_size": 1000, "working_copy_quality": 90})
-
-    from app import create_app
-    from db import Database
-
-    vireo_dir = tmp_path / "vireo"
-    vireo_dir.mkdir()
-    thumb_dir = vireo_dir / "thumbnails"
-    thumb_dir.mkdir()
-    db_path = str(vireo_dir / "test.db")
-
-    photos_dir = tmp_path / "photos"
-    photos_dir.mkdir()
-    src = photos_dir / "big.jpg"
-    _make_jpeg(str(src), 2000, 1500)
-
-    db = Database(db_path)
-    folder_id = db.add_folder(str(photos_dir))
-    pid = db.add_photo(
-        folder_id, "big.jpg", ".jpg",
-        file_size=os.path.getsize(str(src)),
-        file_mtime=os.path.getmtime(str(src)),
-        width=2000, height=1500,
-    )
-    db.conn.close()
-
-    app = create_app(db_path=db_path, thumb_cache_dir=str(thumb_dir), api_token="t")
-    app._kickoff_working_copy_backfill()
-
-    job = _wait_for_backfill_terminal(app._job_runner)
-    assert job["status"] == "completed", f"job: {job}"
-    assert job.get("ephemeral") is True
-
-    # The working copy actually exists.
-    assert (vireo_dir / "working" / f"{pid}.jpg").exists()
-
-    # The DB row was updated with the working copy path.
-    db2 = Database(db_path)
-    row = db2.conn.execute(
-        "SELECT working_copy_path FROM photos WHERE id=?", (pid,)
-    ).fetchone()
-    assert row["working_copy_path"] == f"working/{pid}.jpg"
-
-
-def test_startup_backfill_does_not_persist_to_history(tmp_path, monkeypatch):
-    """Ephemeral backfill job must NOT land in job_history.
-
-    Otherwise every restart adds a noise row.
-    """
-    import os
-
-    import config as cfg
-    import models
-    monkeypatch.setenv("HOME", str(tmp_path))
-    monkeypatch.setattr(cfg, "CONFIG_PATH", str(tmp_path / "config.json"))
-    monkeypatch.setattr(models, "DEFAULT_MODELS_DIR", str(tmp_path / "vireo-models"))
-    monkeypatch.setattr(models, "CONFIG_PATH", str(tmp_path / "models.json"))
-    cfg.save({**cfg.DEFAULTS, "working_copy_max_size": 1000, "working_copy_quality": 90})
-
-    from app import create_app
-    from db import Database
-
-    vireo_dir = tmp_path / "vireo"
-    vireo_dir.mkdir()
-    thumb_dir = vireo_dir / "thumbnails"
-    thumb_dir.mkdir()
-    db_path = str(vireo_dir / "test.db")
-
-    photos_dir = tmp_path / "photos"
-    photos_dir.mkdir()
-    src = photos_dir / "big.jpg"
-    _make_jpeg(str(src), 2000, 1500)
-
-    db = Database(db_path)
-    folder_id = db.add_folder(str(photos_dir))
-    db.add_photo(
-        folder_id, "big.jpg", ".jpg",
-        file_size=os.path.getsize(str(src)),
-        file_mtime=os.path.getmtime(str(src)),
-        width=2000, height=1500,
-    )
-    db.conn.close()
-
-    app = create_app(db_path=db_path, thumb_cache_dir=str(thumb_dir), api_token="t")
-    app._kickoff_working_copy_backfill()
-
-    _wait_for_backfill_terminal(app._job_runner)
-
-    db2 = Database(db_path)
-    rows = db2.conn.execute(
-        "SELECT id FROM job_history WHERE type='working_copy_backfill'"
-    ).fetchall()
-    assert rows == [], "ephemeral job must not persist to history"
+    runner.start("working_copy_backfill", work, ephemeral=True, pausable=True)
 
 
 def _wait_for_backfill_status(runner, statuses, timeout=30.0, poll=0.02):
@@ -1274,25 +1159,7 @@ def _prepare_backfill_app(tmp_path, monkeypatch, filenames):
     return app, vireo_dir, ids
 
 
-def test_startup_backfill_job_is_pausable(tmp_path, monkeypatch):
-    """The backfill must register as pausable.
-
-    ``JobRunner.pause_job`` refuses any job without this flag, and the jobs
-    page only renders Pause/Resume for ``job.pausable`` — so without it a
-    multi-day backfill on a large RAW library can only be cancelled, never
-    stood down and picked back up.
-    """
-    app, _vireo_dir, _ids = _prepare_backfill_app(
-        tmp_path, monkeypatch, ["big.jpg"],
-    )
-    app._kickoff_working_copy_backfill()
-
-    job = _wait_for_backfill_terminal(app._job_runner)
-    assert job["status"] == "completed", f"job: {job}"
-    assert job.get("pausable") is True
-
-
-def test_startup_backfill_pause_parks_between_rows_and_resumes(
+def test_backfill_pause_parks_between_rows_and_resumes(
     tmp_path, monkeypatch,
 ):
     """Pause parks the worker between rows; resume finishes the remaining work.
@@ -1329,7 +1196,7 @@ def test_startup_backfill_pause_parks_between_rows_and_resumes(
 
     monkeypatch.setattr(scanner, "extract_working_copy", gated_extract)
 
-    app._kickoff_working_copy_backfill()
+    _start_backfill(app)
 
     assert first_call_started.wait(timeout=30), "backfill never started extracting"
     job_id = [
@@ -1368,7 +1235,7 @@ def test_startup_backfill_pause_parks_between_rows_and_resumes(
         assert (vireo_dir / "working" / f"{pid}.jpg").exists()
 
 
-def test_startup_backfill_skips_row_when_id_reused_during_pause(
+def test_backfill_skips_row_when_id_reused_during_pause(
     tmp_path, monkeypatch,
 ):
     """A row whose photo id was reused during pause must not be extracted.
@@ -1412,7 +1279,7 @@ def test_startup_backfill_skips_row_when_id_reused_during_pause(
 
     monkeypatch.setattr(scanner, "extract_working_copy", gated_extract)
 
-    app._kickoff_working_copy_backfill()
+    _start_backfill(app)
 
     assert first_call_started.wait(timeout=30), "backfill never started extracting"
     job_id = [
@@ -1577,7 +1444,7 @@ def test_snapshot_revalidation_covers_relocation_repair_and_publish(
     db.conn.close()
 
 
-def test_startup_backfill_discards_orphan_when_id_reused_during_extraction(
+def test_backfill_discards_orphan_when_id_reused_during_extraction(
     tmp_path, monkeypatch,
 ):
     """A row whose id is reused *during* extraction must not leave an orphan.
@@ -1625,7 +1492,7 @@ def test_startup_backfill_discards_orphan_when_id_reused_during_extraction(
 
     monkeypatch.setattr(scanner, "extract_working_copy", gated_extract)
 
-    app._kickoff_working_copy_backfill()
+    _start_backfill(app)
 
     assert extract_started.wait(timeout=30), "extraction never started"
 
@@ -2735,7 +2602,7 @@ def test_extract_update_rejects_companion_swap_during_decode(
 
     monkeypatch.setattr(scanner, "extract_working_copy", gated_extract)
 
-    app._kickoff_working_copy_backfill()
+    _start_backfill(app)
     assert extract_started.wait(timeout=30), "extraction never started"
 
     from db import Database
@@ -2801,7 +2668,7 @@ def test_extract_update_rejects_folder_relocation_during_decode(
 
     monkeypatch.setattr(scanner, "extract_working_copy", gated_extract)
 
-    app._kickoff_working_copy_backfill()
+    _start_backfill(app)
     assert extract_started.wait(timeout=30), "extraction never started"
 
     from db import Database
@@ -2870,7 +2737,7 @@ def test_orphan_cleanup_preserves_replacement_publishers_bytes(
 
     monkeypatch.setattr(scanner, "extract_working_copy", gated_extract)
 
-    app._kickoff_working_copy_backfill()
+    _start_backfill(app)
     assert extract_started.wait(timeout=30), "extraction never started"
 
     from db import Database
@@ -3055,7 +2922,7 @@ def test_orphan_cleanup_preserves_racing_publisher_uncommitted_bytes(
 
     monkeypatch.setattr(scanner, "extract_working_copy", gated_extract)
 
-    app._kickoff_working_copy_backfill()
+    _start_backfill(app)
     assert extract_returned.wait(timeout=30), "extraction never returned"
 
     from db import Database
@@ -4738,7 +4605,7 @@ def test_success_update_rejects_stale_overwrite_before_commit(
 
     monkeypatch.setattr(scanner, "extract_working_copy", gated_extract)
 
-    app._kickoff_working_copy_backfill()
+    _start_backfill(app)
     assert extract_returned.wait(timeout=30), "extraction never returned"
 
     # Atomically replace ``wc_abs`` with a stale extractor's bytes.
@@ -4832,7 +4699,7 @@ def test_orphan_cleanup_unlinks_stale_bytes_over_replacement_row(
 
     monkeypatch.setattr(scanner, "extract_working_copy", gated_extract)
 
-    app._kickoff_working_copy_backfill()
+    _start_backfill(app)
     assert extract_returned.wait(timeout=30), "extraction never returned"
 
     # Simulate: id reuse (Row_B replaces Row_A) AND Row_B has
@@ -4946,7 +4813,7 @@ def test_success_update_rejects_publication_with_none_fingerprint(
         _scanner_mod, "extract_working_copy", none_fingerprint_extract,
     )
 
-    app._kickoff_working_copy_backfill()
+    _start_backfill(app)
     job = _wait_for_backfill_terminal(app._job_runner)
     assert job["status"] == "completed", f"job: {job}"
 

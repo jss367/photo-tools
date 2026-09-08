@@ -7,7 +7,7 @@ generated files leave first.
 
 An evicted row keeps ``working_copy_path`` NULL and records the source mtime in
 ``working_copy_evicted_mtime``.  The scanner uses that marker to distinguish a
-deliberately evicted copy from a missing copy that needs startup self-healing.
+deliberately evicted copy from a missing copy eligible for extraction.
 A source-file change makes the marker stale and allows extraction again.
 """
 

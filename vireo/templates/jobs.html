@@ -32,6 +32,8 @@
   color: var(--text-secondary);
   border-bottom: 1px solid var(--border-primary);
 }
+.jobs-awake-note summary { cursor: pointer; }
+.jobs-awake-note p { margin: 4px 0 0; }
 .jobs-filter-bar {
   padding: 8px 16px; display: flex; gap: 8px;
   border-bottom: 1px solid var(--border-subtle);
@@ -305,10 +307,10 @@
       </select>
     </div>
     <!-- Show when Vireo prevents idle sleep while jobs run (issue #1397). -->
-    <div class="jobs-awake-note" id="keepingAwakeNote" style="display:none;"
-         title="Keep your laptop open while jobs run">
-      Keeping awake
-    </div>
+    <details class="jobs-awake-note" id="keepingAwakeNote" style="display:none;">
+      <summary title="Keep your laptop open while jobs run">Keeping awake</summary>
+      <p>Keep your laptop open while jobs run</p>
+    </details>
     <div class="jobs-list-content" id="jobListContent">
       <div style="padding:24px;text-align:center;color:var(--text-ghost);font-size:13px;">Loading...</div>
     </div>

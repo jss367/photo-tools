@@ -18757,6 +18757,7 @@ def test_batch_accept_on_all_tags_full_selection_with_one_undo(app_and_db):
     assert statuses == {predicted: "accepted", existing: "accepted", other: "pending"}
     edits = [e for e in db.get_edit_history() if e["action_type"] == "prediction_accept"]
     assert len(edits) == 1
+    assert edits[0]["description"].startswith('Accepted prediction: added "Bald Eagle"')
     # Repeating the click must not create a second undo entry.
     assert client.post("/api/predictions/batch-accept", json=payload).json["accepted"] == 0
     db.undo_last_edit()
@@ -18780,6 +18781,7 @@ def test_batch_accept_on_all_without_acceptable_predictions(app_and_db):
     assert response.status_code == 200, response.get_data(as_text=True)
     assert {k["name"] for k in db.get_photo_keywords(photo)} == {"Bald Eagle", "Osprey"}
     assert db.get_predictions(photo_ids=[photo])[0]["status"] == "pending"
+    assert db.get_edit_history()[0]["description"] == 'Added species "Bald Eagle"'
     db.undo_last_edit()
     assert {k["name"] for k in db.get_photo_keywords(photo)} == {"Osprey"}
 

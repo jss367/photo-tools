@@ -16403,6 +16403,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     "new_value": str(keyword_id),
                 })
 
+        has_accepted_predictions = bool(items)
         if all_photo_ids is not None:
             if keyword_id is None:
                 keyword_id = db.add_keyword(expected_species, is_species=True, _commit=False)
@@ -16436,7 +16437,10 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         # together, so no reader can see accepted rows with no way back.
         if items:
             photo_count = len({item["photo_id"] for item in items})
-            desc = f'Accepted prediction: added "{species}"'
+            desc = (
+                f'Accepted prediction: added "{species}"' if has_accepted_predictions
+                else f'Added species "{species}"'
+            )
             if photo_count > 1:
                 desc += f" to {photo_count} photos"
             db.record_edit(

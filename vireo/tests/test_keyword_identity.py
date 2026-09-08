@@ -123,7 +123,7 @@ def test_location_reconciliation_preserves_provenance_and_import_path(catalog, n
     assert preview[0]['combined_count'] == 3
     reconcile_location(db, source, target)
     assert db.conn.execute('SELECT 1 FROM keywords WHERE id = ?', (source,)).fetchone() is None
-    assert db.add_keyword('Lake Hodges', parent_id=parent) == target
+    assert db.add_keyword('Lake Hodges', parent_id=parent, _resolve_alias=True) == target
     assert db.get_assigned_photo_location(photos[1])['place_id'] == 'test-place'
     assert db.conn.execute('SELECT source FROM photo_keywords WHERE photo_id = ? AND keyword_id = ?',
                            (photos[0], target)).fetchone()[0] == 'manual'
@@ -135,7 +135,7 @@ def test_location_reconciliation_preserves_provenance_and_import_path(catalog, n
     # Remember the resolution after reopening, not just within an import run.
     path = db.conn.execute('PRAGMA database_list').fetchone()['file']
     with Database(path) as reopened:
-        assert reopened.add_keyword('Lake Hodges', parent_id=parent) == target
+        assert reopened.add_keyword('Lake Hodges', parent_id=parent, _resolve_alias=True) == target
 
 
 def test_reconciliation_rejects_changed_or_out_of_workspace_candidates(catalog):
@@ -245,6 +245,22 @@ def test_rescanning_and_syncing_renamed_place_keep_confirmed_import_alias(catalo
     assert {k['id'] for k in db.get_photo_keywords(photos[0])} == {target}
 
 
+@pytest.mark.parametrize('nested', [False, True])
+def test_manual_keyword_addition_does_not_resolve_import_aliases(catalog, nested):
+    db, photos = catalog
+    source, target, parent = place_pair(db, nested=nested)
+    db.tag_photo(photos[0], source)
+    reconcile_location(db, source, target)
+    manual = db.add_keyword('Lake Hodges', parent_id=parent)
+    db.tag_photo(photos[1], manual)
+    assert manual != target
+    keyword = db.conn.execute('SELECT type, place_id FROM keywords WHERE id = ?', (manual,)).fetchone()
+    assert keyword['type'] == 'general'
+    assert keyword['place_id'] is None
+    assert db.get_assigned_photo_location(photos[1]) is None
+    assert db.add_keyword('Lake Hodges', parent_id=parent, _resolve_alias=True) == target
+
+
 def test_leaf_import_alias_does_not_reparent_new_subtrees(catalog):
     db, photos = catalog
     source, target, _ = place_pair(db)
@@ -267,7 +283,7 @@ def test_linking_a_place_to_an_existing_place_preserves_import_aliases(catalog):
     result = db.link_keyword_to_place(target, details)
     assert result == {'keyword_id': survivor, 'merged': True}
     assert db.conn.execute('SELECT keyword_id FROM keyword_import_aliases').fetchone()[0] == survivor
-    assert db.add_keyword('Lake Hodges', parent_id=parent) == survivor
+    assert db.add_keyword('Lake Hodges', parent_id=parent, _resolve_alias=True) == survivor
     assert {k['id'] for k in db.get_photo_keywords(photos[0])} == {survivor}
 
 

@@ -344,7 +344,7 @@ def _import_keywords_for_photo(db, photo_id, xmp_path_str):
             continue
         if key in existing_keys:
             continue
-        kid = db.add_keyword(kw)
+        kid = db.add_keyword(kw, _resolve_alias=True)
         # Same ambiguity as the hierarchical branch above.
         db.tag_photo(photo_id, kid, source=KEYWORD_SOURCE_UNKNOWN)
         existing_keys.add(key)

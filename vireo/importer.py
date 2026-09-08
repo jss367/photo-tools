@@ -201,7 +201,7 @@ def execute_import(
             for kw_name in kw_data["flat_keywords"]:
                 if not keyword_match_key(kw_name) or keyword_match_key(kw_name) in existing_keys:
                     continue
-                kid = db.add_keyword(kw_name)
+                kid = db.add_keyword(kw_name, _resolve_alias=True)
                 # Lightroom catalog metadata was explicitly authored outside
                 # Vireo. Keep that provenance on the association even when
                 # write_xmp=False leaves no sidecar or pending change.

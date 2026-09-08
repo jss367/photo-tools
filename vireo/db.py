@@ -11210,7 +11210,7 @@ class Database:
         )
 
     def add_keyword(self, name, parent_id=None, is_species=False, kw_type=None, _commit=True, source_taxon_id=None,
-                    _resolve_alias=True):
+                    _resolve_alias=False):
         """Insert a keyword. Returns existing id if duplicate (case-insensitive).
 
         If a keyword with the same name but different casing exists, reuses
@@ -11228,8 +11228,9 @@ class Database:
                      for committing the transaction).
             source_taxon_id: Explicit iNaturalist ID for a species keyword;
                      bypass common-name inference and reuse only that identity.
-            _resolve_alias: False while building an imported parent chain;
-                     a confirmed leaf alias must not relocate a new subtree.
+            _resolve_alias: Import callers opt in for leaf keywords only.
+                     Manual additions must not inherit imported place aliases,
+                     and a leaf alias must not relocate a new parent chain.
         """
         if kw_type is not None and kw_type not in KEYWORD_TYPES:
             raise ValueError(f"invalid keyword type: {kw_type!r}")

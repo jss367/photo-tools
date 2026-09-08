@@ -635,7 +635,10 @@ def sync_from_xmp(db, photo_ids):
                 aliases = aliases_by_key.get(kw_key, set())
                 if not aliases and kw_key in db_keywords_by_key:
                     continue
-                for kid in sorted(aliases) if aliases else [db.add_keyword(xmp_keywords_by_key[kw_key], _commit=False)]:
+                imported_ids = sorted(aliases) if aliases else [
+                    db.add_keyword(xmp_keywords_by_key[kw_key], _commit=False, _resolve_alias=True)
+                ]
+                for kid in imported_ids:
                     resolved_ids.add(kid)
                     # Reconciling from a sidecar cannot establish authorship.
                     db.tag_photo(

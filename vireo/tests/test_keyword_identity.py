@@ -80,6 +80,35 @@ def test_unproven_same_names_and_conflicting_source_taxa_stay_separate(catalog):
     assert len([k for k in db.get_dashboard_stats()['top_keywords'] if k['name'] == 'Springfield']) == 2
 
 
+def test_dashboard_uses_a_label_tagged_in_the_selected_date_range(catalog):
+    db, photos = catalog
+    root, leaf = species_pair(db)
+    db.tag_photo(photos[0], root)
+    db.tag_photo(photos[2], leaf)
+    entry, = db.get_dashboard_stats(date_from='2024-07-01')['top_keywords']
+    assert entry['name'] == 'Test Bird'
+    assert entry['id'] == leaf
+    assert entry['photo_count'] == 1
+
+
+def test_dashboard_does_not_borrow_species_labels_from_other_workspaces(catalog):
+    db, photos = catalog
+    workspace = db._ws_id()
+    root, leaf = species_pair(db)
+    db.tag_photo(photos[0], leaf)
+    other = db.create_workspace('Another vocabulary')
+    db.set_active_workspace(other)
+    folder = db.add_folder('/other-vocabulary', name='Other')
+    db.add_workspace_folder(other, folder)
+    photo = db.add_photo(folder_id=folder, filename='other.jpg', extension='.jpg', file_size=10, file_mtime=1)
+    db.tag_photo(photo, root)
+    db.set_active_workspace(workspace)
+    entry, = db.get_dashboard_stats()['top_keywords']
+    assert entry['id'] == leaf
+    assert entry['name'] == 'Test Bird'
+    assert entry['name'] == next(g for g in grouped_keywords(db) if g['identity'] == entry['identity'])['name']
+
+
 @pytest.mark.parametrize('nested', [False, True])
 def test_location_reconciliation_preserves_provenance_and_import_path(catalog, nested):
     db, photos = catalog

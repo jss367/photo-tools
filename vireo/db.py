@@ -8131,8 +8131,14 @@ class Database:
         # Share taxon/place identity with Keywords and Browse. Unresolved
         # same-name tags stay separate until their identity is established.
         top_keywords = self.conn.execute(
-            f"""WITH identified AS (
+            f"""WITH scoped_tags AS (
+                 SELECT pk.keyword_id, pk.photo_id FROM photo_keywords pk
+                 JOIN photos p ON p.id = pk.photo_id
+                 JOIN workspace_folders wf ON wf.folder_id = p.folder_id
+                 WHERE wf.workspace_id = ?{scope_sql}
+               ), identified AS (
                  SELECT k.*, {identity_sql()} AS identity FROM keywords k
+                 WHERE k.id IN (SELECT keyword_id FROM scoped_tags)
                ), canonical AS (
                  SELECT *, ROW_NUMBER() OVER (
                    PARTITION BY identity ORDER BY parent_id IS NOT NULL, id
@@ -8140,10 +8146,7 @@ class Database:
                ), counts AS (
                SELECT k.identity, COUNT(DISTINCT pk.photo_id) AS photo_count
                FROM identified k
-               JOIN photo_keywords pk ON pk.keyword_id = k.id
-               JOIN photos p ON p.id = pk.photo_id
-               JOIN workspace_folders wf ON wf.folder_id = p.folder_id
-               WHERE wf.workspace_id = ?{scope_sql}
+               JOIN scoped_tags pk ON pk.keyword_id = k.id
                GROUP BY k.identity
                )
                SELECT c.id, c.name, c.is_species, c.identity, counts.photo_count

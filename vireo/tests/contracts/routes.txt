@@ -73,6 +73,8 @@ GET          /api/jobs/history
 GET          /api/keywords
 GET          /api/keywords/all
 GET          /api/keywords/duplicates
+GET          /api/keywords/identities
+GET          /api/keywords/location-matches
 GET          /api/labels
 GET          /api/labels/observation-filters
 GET          /api/labels/search-places
@@ -306,6 +308,7 @@ POST         /api/jobs/verify-all-models
 POST         /api/jobs/verify-hashes
 POST         /api/keywords/<int:keyword_id>/link-place
 POST         /api/keywords/clean
+POST         /api/keywords/reconcile-location
 POST         /api/labels/active
 POST         /api/location-review/preview
 POST         /api/megadetector/delete

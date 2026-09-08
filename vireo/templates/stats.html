@@ -803,7 +803,8 @@ function renderClassificationInventory(data) {
   var body = document.getElementById('classInvBody');
   if (!data || !data.models || data.models.length === 0) {
     body.innerHTML = '<div style="color:var(--text-ghost);font-size:13px;">' +
-      'No classification models registered. <a href="/settings" style="color:var(--accent);">Settings</a></div>';
+      'No downloaded models or classification history in this workspace. ' +
+      '<a href="/settings" style="color:var(--accent);">Download a model in Settings</a></div>';
     return;
   }
   if (data.total_real_detections === 0) {

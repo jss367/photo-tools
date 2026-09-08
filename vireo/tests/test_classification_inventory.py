@@ -279,6 +279,62 @@ def _setup_labels_dir(tmp_path, monkeypatch, sets):
     return paths
 
 
+@pytest.fixture
+def downloaded_models(app_and_db, monkeypatch):
+    import models
+
+    registry = [dict(model, downloaded=True) for model in models.get_models()]
+    monkeypatch.setattr(models, "get_models", lambda: registry)
+
+
+@pytest.mark.parametrize(("downloaded", "history"), [
+    (False, None),
+    (False, "current"),
+    (False, "other"),
+    (True, None),
+])
+def test_endpoint_shows_only_downloaded_or_workspace_models(
+    app_and_db, tmp_path, monkeypatch, downloaded, history,
+):
+    from labels_fingerprint import compute_fingerprint
+
+    app, db = app_and_db
+    monkeypatch.setattr("models.get_models", lambda: [
+        {"id": "bioclip", "name": "BioCLIP", "model_type": "bioclip",
+         "downloaded": downloaded},
+        {"id": "unused", "name": "Unused", "model_type": "bioclip",
+         "downloaded": False},
+    ])
+    _setup_labels_dir(tmp_path, monkeypatch, [("birds", ["Robin"])])
+    ws_id = db._active_workspace_id
+    photo_id = db.conn.execute("SELECT id FROM photos LIMIT 1").fetchone()[0]
+    det = _add_detection(db, photo_id)
+    if history:
+        if history == "other":
+            _, photos = _seed_workspace(db, name="Other", folder_path="/photos/other", n_photos=1)
+            det = _add_detection(db, photos[0])
+            db.set_active_workspace(ws_id)
+        fp = compute_fingerprint(["Robin"])
+        _record_run(db, det, "BioCLIP", fp)
+        _add_prediction(db, det, "BioCLIP", fp, "Robin", 0.9)
+
+    response = app.test_client().get("/api/workspace/classification-inventory")
+    assert response.status_code == 200
+    body = response.get_json()
+    visible = downloaded or history == "current"
+    assert [m["name"] for m in body["models"]] == (["BioCLIP"] if visible else [])
+    if visible:
+        assert body["models"][0]["downloaded"] is downloaded
+        assert body["models"][0]["legacy"] is False
+    assert body["grand_total"] == {
+        "classified_dets": 1 if history == "current" else 0,
+        "pending_dets": 1 if downloaded else 0,
+        "coverage_pct": 100.0 if history == "current" else 0.0,
+        "total_predictions_rows": 1 if history == "current" else 0,
+    }
+
+
+@pytest.mark.usefixtures("downloaded_models")
 def test_endpoint_cross_product_includes_never_run(app_and_db, tmp_path, monkeypatch):
     from labels_fingerprint import compute_fingerprint  # noqa: F401
     app, db = app_and_db
@@ -298,7 +354,7 @@ def test_endpoint_cross_product_includes_never_run(app_and_db, tmp_path, monkeyp
     assert resp.status_code == 200
     body = resp.get_json()
 
-    # Cross-product: every (model × label-set) pair appears, each "never_run"
+    # Cross-product: every downloaded (model × label-set) pair appears.
     assert body["total_real_detections"] == 1
     assert len(body["models"]) >= 1
     seen_pairs = []
@@ -328,6 +384,7 @@ def test_endpoint_identifies_stale(app_and_db, tmp_path, monkeypatch):
     assert "obsolete_fp_xyz" in stale_fps
 
 
+@pytest.mark.usefixtures("downloaded_models")
 def test_endpoint_tol_only_for_supported_models(app_and_db, tmp_path, monkeypatch):
     app, db = app_and_db
     _setup_labels_dir(tmp_path, monkeypatch, [("birds", ["Robin"])])
@@ -344,6 +401,7 @@ def test_endpoint_tol_only_for_supported_models(app_and_db, tmp_path, monkeypatc
             assert tol_pairs == [], f"{m['name']} should not have a Tree of Life pair"
 
 
+@pytest.mark.usefixtures("downloaded_models")
 def test_endpoint_supports_tol_uses_capability_not_files_manifest(
     app_and_db, tmp_path, monkeypatch,
 ):
@@ -370,7 +428,7 @@ def test_endpoint_supports_tol_uses_capability_not_files_manifest(
         None,
     )
     assert bioclip_2_5 is not None, (
-        "bioclip-2.5 must appear in the inventory even before download"
+        "downloaded bioclip-2.5 must appear in the inventory"
     )
     assert bioclip_2_5["supports_tol"] is True, (
         "bioclip-2.5 supports Tree of Life via optional_files; the inventory "

@@ -274,6 +274,7 @@
   }
 
   function ruleLabel(rule) {
+    if (rule.field === 'keyword_identity') return 'Keyword · ' + (rule.label || 'Selected species or place');
     if (rule.field === 'photo_ids') {
       const n = Array.isArray(rule.value) ? rule.value.length : 0;
       return `${n} hand-picked photo${n === 1 ? '' : 's'}`;
@@ -501,6 +502,10 @@
 
   function applyLegacyParams(params) {
     const rules = [];
+    if (params.has('keyword_identity')) {
+      rules.push({field: 'keyword_identity', op: 'equals', value: params.get('keyword_identity'),
+                  label: params.get('keyword_label') || 'Selected species or place'});
+    }
     const ratingMin = params.get('rating_min');
     if (ratingMin) rules.push(makeRule('rating', '>=', Number(ratingMin)));
     const flag = params.get('flag');
@@ -898,6 +903,14 @@
           <button class="vf-text-btn" data-action="add-child" data-path="${path}" type="button">＋ Rule</button>
           <button class="vf-text-btn" data-action="add-subgroup" data-path="${path}" type="button">＋ Group</button>
         </div>
+      </div>`;
+    }
+    if (node.field === 'keyword_identity') {
+      // Chart links select a confirmed identity, which cannot be edited as
+      // free text. Keep its readable label and allow removing the constraint.
+      return `<div class="vf-rule-row vf-identity-row">
+        <span>${esc(ruleLabel(node))}</span>
+        <button class="vf-remove" data-action="remove" data-path="${path}" type="button" aria-label="Remove rule">×</button>
       </div>`;
     }
     const spec = fieldSpec(node.field) || { label: node.field, type: 'text', ops: ['is'] };

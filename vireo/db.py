@@ -10,6 +10,7 @@ import unicodedata
 import uuid
 from datetime import datetime
 
+from keyword_identity import identity_sql, resolve_import_alias
 from keyword_normalization import (
     keyword_match_key,
     normalize_keyword_display,
@@ -1443,6 +1444,11 @@ class Database:
         cur.execute("CREATE INDEX IF NOT EXISTS idx_keywords_source_taxon_id ON keywords(source_taxon_id)")
         if "place_id" not in kw_cols:
             cur.execute("ALTER TABLE keywords ADD COLUMN place_id TEXT")
+        cur.execute("""CREATE TABLE IF NOT EXISTS keyword_import_aliases (
+            path_key TEXT PRIMARY KEY,
+            path_json TEXT NOT NULL,
+            keyword_id INTEGER NOT NULL REFERENCES keywords(id) ON DELETE CASCADE
+        )""")
         cur.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_keywords_place_id "
             "ON keywords(place_id) WHERE place_id IS NOT NULL"
@@ -6725,8 +6731,9 @@ class Database:
         is unmounted (e.g. headline says 0 while charts list keywords).
         """
         return self.conn.execute(
-            """SELECT COUNT(DISTINCT pk.keyword_id)
+            f"""SELECT COUNT(DISTINCT ({identity_sql()}))
                FROM photo_keywords pk
+               JOIN keywords k ON k.id = pk.keyword_id
                JOIN photos p ON p.id = pk.photo_id
                JOIN workspace_folders wf ON wf.folder_id = p.folder_id
                WHERE wf.workspace_id = ?""",
@@ -8099,7 +8106,7 @@ class Database:
         overview = self.conn.execute(
             f"""SELECT COUNT(DISTINCT p.id) AS total_photos,
                        COUNT(DISTINCT p.folder_id) AS folder_count,
-                       COUNT(DISTINCT pk.keyword_id) AS keyword_count,
+                       COUNT(DISTINCT ({identity_sql()})) AS keyword_count,
                        COUNT(DISTINCT CASE
                          WHEN f.status IN ('ok', 'partial') THEN p.id END
                        ) AS accessible_photos,
@@ -8111,6 +8118,7 @@ class Database:
                   ON wf.folder_id = p.folder_id AND wf.workspace_id = ?
                 JOIN folders f ON f.id = p.folder_id
                 LEFT JOIN photo_keywords pk ON pk.photo_id = p.id
+                LEFT JOIN keywords k ON k.id = pk.keyword_id
                 WHERE 1=1{scope_sql}""",
             (ws, *scope_params),
         ).fetchone()
@@ -8120,15 +8128,30 @@ class Database:
         # on folder status. They read DB-resident metadata that doesn't depend
         # on disk access, so an unmounted drive shouldn't blank the charts —
         # the dashboard should still describe the full workspace inventory.
+        # Share taxon/place identity with Keywords and Browse. Unresolved
+        # same-name tags stay separate until their identity is established.
         top_keywords = self.conn.execute(
-            f"""SELECT k.name, k.is_species, COUNT(pk.photo_id) as photo_count
-               FROM keywords k
-               JOIN photo_keywords pk ON pk.keyword_id = k.id
-               JOIN photos p ON p.id = pk.photo_id
-               JOIN workspace_folders wf ON wf.folder_id = p.folder_id
-               WHERE wf.workspace_id = ?{scope_sql}
-               GROUP BY k.id
-               ORDER BY photo_count DESC
+            f"""WITH scoped_tags AS (
+                 SELECT pk.keyword_id, pk.photo_id FROM photo_keywords pk
+                 JOIN photos p ON p.id = pk.photo_id
+                 JOIN workspace_folders wf ON wf.folder_id = p.folder_id
+                 WHERE wf.workspace_id = ?{scope_sql}
+               ), identified AS (
+                 SELECT k.*, {identity_sql()} AS identity FROM keywords k
+                 WHERE k.id IN (SELECT keyword_id FROM scoped_tags)
+               ), canonical AS (
+                 SELECT *, ROW_NUMBER() OVER (
+                   PARTITION BY identity ORDER BY parent_id IS NOT NULL, id
+                 ) AS rn FROM identified
+               ), counts AS (
+               SELECT k.identity, COUNT(DISTINCT pk.photo_id) AS photo_count
+               FROM identified k
+               JOIN scoped_tags pk ON pk.keyword_id = k.id
+               GROUP BY k.identity
+               )
+               SELECT c.id, c.name, c.is_species, c.identity, counts.photo_count
+               FROM counts JOIN canonical c ON c.identity = counts.identity AND c.rn = 1
+               ORDER BY photo_count DESC, c.name, c.id
                LIMIT 30""",
             (ws, *scope_params),
         ).fetchall()
@@ -11186,7 +11209,8 @@ class Database:
             "(SELECT 1 FROM taxa WHERE inat_id = keywords.source_taxon_id)"
         )
 
-    def add_keyword(self, name, parent_id=None, is_species=False, kw_type=None, _commit=True, source_taxon_id=None):
+    def add_keyword(self, name, parent_id=None, is_species=False, kw_type=None, _commit=True, source_taxon_id=None,
+                    _resolve_alias=False):
         """Insert a keyword. Returns existing id if duplicate (case-insensitive).
 
         If a keyword with the same name but different casing exists, reuses
@@ -11204,6 +11228,9 @@ class Database:
                      for committing the transaction).
             source_taxon_id: Explicit iNaturalist ID for a species keyword;
                      bypass common-name inference and reuse only that identity.
+            _resolve_alias: Import callers opt in for leaf keywords only.
+                     Manual additions must not inherit imported place aliases,
+                     and a leaf alias must not relocate a new parent chain.
         """
         if kw_type is not None and kw_type not in KEYWORD_TYPES:
             raise ValueError(f"invalid keyword type: {kw_type!r}")
@@ -11220,6 +11247,10 @@ class Database:
         # still be tagged, synced to XMP, and reported in duplicate cleanup.
         if not name:
             raise ValueError("keyword name is empty after normalization")
+        if _resolve_alias and not is_species and source_taxon_id is None and kw_type in (None, 'location'):
+            resolved = resolve_import_alias(self, name, parent_id)
+            if resolved is not None:
+                return resolved
         # Reconcile is_species and kw_type to keep the legacy column coherent
         # with the type enum.
         if is_species and kw_type is not None and kw_type != 'taxonomy':
@@ -12272,6 +12303,12 @@ class Database:
                     self.conn.execute(
                         "DELETE FROM photo_keywords WHERE keyword_id = ?",
                         (keyword_id,),
+                    )
+                    # Preserve remembered import paths before the foreign-key
+                    # cascade deletes aliases of the absorbed place.
+                    self.conn.execute(
+                        'UPDATE keyword_import_aliases SET keyword_id = ? WHERE keyword_id = ?',
+                        (canonical_id, keyword_id),
                     )
                     # Delete the now-empty old keyword row.
                     self.conn.execute(
@@ -14214,6 +14251,10 @@ class Database:
         commits.
         """
         merged = 1
+        self.conn.execute(
+            'UPDATE keyword_import_aliases SET keyword_id = ? WHERE keyword_id = ?',
+            (dst_id, src_id),
+        )
         src = self.conn.execute(
             "SELECT name, type, is_species, latitude, longitude, taxon_id, "
             "place_id FROM keywords WHERE id = ?",
@@ -16904,13 +16945,14 @@ class Database:
         ws = self._ws_id()
         return self.conn.execute(
             """WITH RECURSIVE
-               ws_kw AS (
-                   SELECT DISTINCT pk.keyword_id AS id
+               ws_links AS (
+                   SELECT pk.keyword_id, pk.photo_id
                    FROM photo_keywords pk
                    JOIN photos p ON p.id = pk.photo_id
                    JOIN workspace_folders wf ON wf.folder_id = p.folder_id
                    WHERE wf.workspace_id = ?
                ),
+               ws_kw AS (SELECT DISTINCT keyword_id AS id FROM ws_links),
                ancestors AS (
                    SELECT id FROM ws_kw
                    UNION
@@ -16930,29 +16972,15 @@ class Database:
                SELECT k.id, k.name, k.parent_id, k.type, k.taxon_id,
                       k.latitude, k.longitude, k.place_id,
                       t.name AS taxon_name, t.common_name AS taxon_common_name,
-                      COUNT(DISTINCT ws_desc.photo_id) AS photo_count,
-                      COUNT(DISTINCT ws_direct.photo_id) AS direct_photo_count
+                      (SELECT COUNT(DISTINCT wl.photo_id) FROM descendants d
+                       JOIN ws_links wl ON wl.keyword_id = d.descendant_id
+                       WHERE d.ancestor_id = k.id) AS photo_count,
+                      (SELECT COUNT(*) FROM ws_links wl WHERE wl.keyword_id = k.id) AS direct_photo_count
                FROM keywords k
                JOIN ancestors a ON a.id = k.id
                LEFT JOIN taxa t ON t.id = k.taxon_id
-               LEFT JOIN (
-                   SELECT pk.keyword_id, pk.photo_id
-                   FROM photo_keywords pk
-                   JOIN photos p ON p.id = pk.photo_id
-                   JOIN workspace_folders wf ON wf.folder_id = p.folder_id
-                   WHERE wf.workspace_id = ?
-               ) ws_direct ON ws_direct.keyword_id = k.id
-               LEFT JOIN descendants d ON d.ancestor_id = k.id
-               LEFT JOIN (
-                   SELECT pk.keyword_id, pk.photo_id
-                   FROM photo_keywords pk
-                   JOIN photos p ON p.id = pk.photo_id
-                   JOIN workspace_folders wf ON wf.folder_id = p.folder_id
-                   WHERE wf.workspace_id = ?
-               ) ws_desc ON ws_desc.keyword_id = d.descendant_id
-               GROUP BY k.id
                ORDER BY k.name""",
-            (ws, ws, ws),
+            (ws,),
         ).fetchall()
 
     # -- Predictions --
@@ -22479,6 +22507,16 @@ class Database:
             field = rule["field"]
             op = rule.get("op", "")
             value = rule.get("value")
+
+            if field == "keyword_identity":
+                if op != 'equals' or not isinstance(value, str) or not value:
+                    raise ValueError('keyword_identity requires an equals rule with a nonempty identity')
+                return (
+                    'EXISTS (SELECT 1 FROM photo_keywords pki '
+                    'JOIN keywords ki ON ki.id = pki.keyword_id '
+                    f'WHERE pki.photo_id = p.id AND ({identity_sql("ki")}) = ?)',
+                    [value],
+                )
 
             if field == "all":
                 # Sentinel for defaults like "All Photos" — adds no condition,

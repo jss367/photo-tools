@@ -963,21 +963,21 @@ function renderSpecies(keywords) {
   var container = document.getElementById('speciesChart');
   if (species.length === 0) {
     container.innerHTML = '<span style="color:var(--text-ghost);font-size:13px;">No species classified yet. Run classification on the Classify page.</span>';
-    return;
+  } else {
+    var max = species[0].photo_count;
+    var html = '';
+    species.slice(0, 20).forEach(function(k) {
+      var pct = Math.round((k.photo_count / max) * 100);
+      var attrs = drillAttrs(keywordDrill(k), 'Browse photos tagged ' + k.name)
+        .replace('bar-row dashboard-drill', 'bar-row species-bar dashboard-drill');
+      html += '<div' + attrs + '>' +
+        '<span class="bar-label">' + escapeHtml(k.name) + '</span>' +
+        '<div class="bar-track"><div class="bar-fill" style="width:' + pct + '%"></div></div>' +
+        '<span class="bar-value">' + k.photo_count.toLocaleString() + '</span>' +
+      '</div>';
+    });
+    container.innerHTML = html;
   }
-  var max = species[0].photo_count;
-  var html = '';
-  species.slice(0, 20).forEach(function(k) {
-    var pct = Math.round((k.photo_count / max) * 100);
-    var attrs = drillAttrs({keyword: k.name}, 'Browse photos tagged ' + k.name)
-      .replace('bar-row dashboard-drill', 'bar-row species-bar dashboard-drill');
-    html += '<div' + attrs + '>' +
-      '<span class="bar-label">' + escapeHtml(k.name) + '</span>' +
-      '<div class="bar-track"><div class="bar-fill" style="width:' + pct + '%"></div></div>' +
-      '<span class="bar-value">' + k.photo_count.toLocaleString() + '</span>' +
-    '</div>';
-  });
-  container.innerHTML = html;
 
   // Render top non-species keywords in their own section
   var nonSpecies = keywords.filter(function(k) { return !k.is_species; }).slice(0, 10);
@@ -988,7 +988,7 @@ function renderSpecies(keywords) {
     var otherHtml = '';
     nonSpecies.forEach(function(k) {
       var pct = Math.round((k.photo_count / nonSpeciesMax) * 100);
-      otherHtml += '<div' + drillAttrs({keyword: k.name}, 'Browse photos tagged ' + k.name) + '>' +
+      otherHtml += '<div' + drillAttrs(keywordDrill(k), 'Browse photos tagged ' + k.name) + '>' +
         '<span class="bar-label">' + escapeHtml(k.name) + '</span>' +
         '<div class="bar-track"><div class="bar-fill" style="width:' + pct + '%;background:var(--text-ghost);"></div></div>' +
         '<span class="bar-value">' + k.photo_count.toLocaleString() + '</span>' +
@@ -999,6 +999,10 @@ function renderSpecies(keywords) {
   } else {
     otherSection.style.display = 'none';
   }
+}
+
+function keywordDrill(k) {
+  return {keyword_identity: k.identity, keyword_label: k.name};
 }
 
 function renderMonths(months) {

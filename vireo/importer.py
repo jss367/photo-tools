@@ -6,6 +6,7 @@ import sqlite3
 from pathlib import Path
 
 from catalog import read_catalog
+from keyword_identity import validate_import_locations
 from keyword_normalization import keyword_match_key, normalize_keyword_display
 from xmp import write_sidecar
 
@@ -177,28 +178,35 @@ def execute_import(
             # after this PR, and the surrounding try/except would otherwise
             # count the whole photo as failed rather than just dropping the
             # malformed keyword.
-            for kw_name in kw_data["flat_keywords"]:
-                if not keyword_match_key(kw_name):
-                    continue
-                kid = db.add_keyword(kw_name)
-                # Lightroom catalog metadata was explicitly authored outside
-                # Vireo. Keep that provenance on the association even when
-                # write_xmp=False leaves no sidecar or pending change.
-                db.tag_photo(photo["id"], kid, source="manual")
-
+            validate_import_locations(db, photo['id'], kw_data['flat_keywords'], kw_data['hierarchical_keywords'])
             # Import hierarchical keywords. Skip an entry whose chain
             # contains any segment that normalizes to `""` — the resulting
             # `add_keyword()` call would raise and the whole hierarchical
             # tree for this photo would be lost.
+            hierarchy_leaf_keys = set()
             for hier in kw_data["hierarchical_keywords"]:
                 parts = hier.split("|")
                 if any(not keyword_match_key(part) for part in parts):
                     continue
                 parent_id = None
-                for part in parts:
-                    kid = db.add_keyword(part, parent_id=parent_id)
+                for index, part in enumerate(parts):
+                    kid = db.add_keyword(part, parent_id=parent_id, _resolve_alias=index == len(parts) - 1)
                     parent_id = kid
                 db.tag_photo(photo["id"], parent_id, source="manual")
+                hierarchy_leaf_keys.add(keyword_match_key(parts[-1]))
+
+            # Hierarchical leaves already represent their flat spelling.
+            existing_keys = {keyword_match_key(k["name"])
+                             for k in db.get_photo_keywords(photo["id"])} | hierarchy_leaf_keys
+            for kw_name in kw_data["flat_keywords"]:
+                if not keyword_match_key(kw_name) or keyword_match_key(kw_name) in existing_keys:
+                    continue
+                kid = db.add_keyword(kw_name, _resolve_alias=True)
+                # Lightroom catalog metadata was explicitly authored outside
+                # Vireo. Keep that provenance on the association even when
+                # write_xmp=False leaves no sidecar or pending change.
+                db.tag_photo(photo["id"], kid, source="manual")
+                existing_keys.add(keyword_match_key(kw_name))
 
             # Write XMP if requested. Build normalized keyword sets so the
             # sidecar matches what we stored/tagged in the DB above:

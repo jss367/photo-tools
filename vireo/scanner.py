@@ -32,6 +32,7 @@ from image_loader import (
     safe_iter_dir,
     safe_scan_walk,
 )
+from keyword_identity import validate_import_locations
 from keyword_normalization import keyword_match_key
 from metadata import EXIF_SUMMARY_COLUMNS, exif_summary_columns, extract_metadata
 from PIL import Image
@@ -287,6 +288,12 @@ def _import_keywords_for_photo(db, photo_id, xmp_path_str):
     pending_hierarchical_removals = db.get_pending_keyword_removal_keys(
         photo_id, hierarchical=True,
     )
+    validate_import_locations(
+        db, photo_id,
+        [kw for kw in flat_keywords if keyword_match_key(kw) not in pending_flat_removals],
+        [hier for hier in hier_keywords
+         if not any(keyword_match_key(part) in pending_hierarchical_removals for part in hier.split('|'))],
+    )
 
     # Build hierarchy from lr:hierarchicalSubject
     # e.g., 'Birds|Raptors|Black kite' creates Birds -> Raptors -> Black kite
@@ -294,6 +301,7 @@ def _import_keywords_for_photo(db, photo_id, xmp_path_str):
     # normalizes to `""` (e.g. `"|Birds"` or `"Birds|'|Hawk"`). add_keyword()
     # raises ValueError on those, and letting it propagate would abort the
     # whole scan on a malformed sidecar entry instead of ignoring it.
+    hierarchy_leaf_keys = set()
     for hier in hier_keywords:
         parts = hier.split("|")
         if any(not keyword_match_key(part) for part in parts):
@@ -304,14 +312,15 @@ def _import_keywords_for_photo(db, photo_id, xmp_path_str):
         ):
             continue
         parent_id = None
-        for part in parts:
-            kid = db.add_keyword(part, parent_id=parent_id)
+        for index, part in enumerate(parts):
+            kid = db.add_keyword(part, parent_id=parent_id, _resolve_alias=index == len(parts) - 1)
             parent_id = kid
         # Tag with the leaf keyword. A sidecar term is genuinely ambiguous —
         # the user may have typed it in Lightroom, or Vireo may have written
         # it out itself — so this is one of the few writers that declines to
         # claim manual authorship.
         db.tag_photo(photo_id, parent_id, source=KEYWORD_SOURCE_UNKNOWN)
+        hierarchy_leaf_keys.add(keyword_match_key(parts[-1]))
 
     # Also add any flat keywords not already covered by hierarchy. Compare
     # via the normalized match key on both sides: DB names are stored in
@@ -323,7 +332,7 @@ def _import_keywords_for_photo(db, photo_id, xmp_path_str):
     # add_keyword() and abort the scan.
     existing_keys = {
         keyword_match_key(k["name"]) for k in db.get_photo_keywords(photo_id)
-    }
+    } | hierarchy_leaf_keys
     for kw in flat_keywords:
         key = keyword_match_key(kw)
         if not key:
@@ -335,7 +344,7 @@ def _import_keywords_for_photo(db, photo_id, xmp_path_str):
             continue
         if key in existing_keys:
             continue
-        kid = db.add_keyword(kw)
+        kid = db.add_keyword(kw, _resolve_alias=True)
         # Same ambiguity as the hierarchical branch above.
         db.tag_photo(photo_id, kid, source=KEYWORD_SOURCE_UNKNOWN)
         existing_keys.add(key)

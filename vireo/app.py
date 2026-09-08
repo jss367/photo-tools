@@ -3415,11 +3415,10 @@ def _enforce_preview_cache_quota_at_startup(app):
 
 
 def _enforce_working_copy_cache_quota_at_startup(app):
-    """Apply the persistent working-copy ceiling before startup backfill.
+    """Apply the persistent working-copy ceiling when the app starts.
 
-    Quota eviction records a source-mtime marker on each removed row. Running
-    this before the deferred backfill timer is what prevents startup from
-    immediately regenerating files that were deliberately removed.
+    Quota eviction records a source-mtime marker on each removed row so later
+    scans do not immediately regenerate files that were deliberately removed.
 
     Sweeps ``.<id>.render.*.jpg.tmp`` orphans in ``working/`` first so a
     process kill during a prior on-demand extraction does not permanently
@@ -4988,135 +4987,9 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
     # deleted photos don't reappear in the banner/modal.
     app._missing_originals_generation = {}
 
-    # Self-healing background backfill of missing working copies. RAW (and
-    # oversized JPEG) imports need a JPEG working copy at
-    # ``~/.vireo/working/{photo_id}.jpg`` so /photos/<id>/original can serve
-    # a static file without on-demand RAW decode (5-7s per file). The
-    # scan() path already extracts these inline for newly-discovered photos,
-    # but legacy rows (imported before the feature, or with a previous
-    # extraction failure that has since been fixed) carry NULL
-    # working_copy_path forever without this pass.
-    #
-    # Surfaced as an ephemeral JobRunner job so the bottom panel shows
-    # progress, but never written to job_history (it runs every startup —
-    # persisting would be noise). Skipped entirely when a fast EXISTS check
-    # confirms no candidates remain, so steady-state restarts pay nothing.
-    def _kickoff_working_copy_backfill():
-        from scanner import (
-            backfill_working_copies,
-            working_copy_backfill_candidate_count,
-        )
-
-        wcdb = None
-        try:
-            wcdb = Database(db_path)
-            # Defer to scanner's own predicate so the gate matches what
-            # ``_extract_working_copies`` will actually process. A naive
-            # ``working_copy_path IS NULL`` check would also fire on
-            # libraries of only small JPEGs (which the extractor
-            # intentionally skips), launching a no-op backfill on every
-            # restart.
-            candidate_count = working_copy_backfill_candidate_count(wcdb)
-        except Exception:
-            log.exception("Working-copy backfill: candidate check failed")
-            return
-        finally:
-            if wcdb is not None:
-                wcdb.close()
-        if candidate_count == 0:
-            log.debug("Working-copy backfill: no candidates, skipping")
-            return
-
-        vireo_dir = os.path.dirname(app.config["THUMB_CACHE_DIR"])
-        runner = app._job_runner
-
-        def work(job):
-            thread_db = Database(db_path)
-            try:
-                # Working-copy backfill is workspace-agnostic (photos are
-                # global), but the JobRunner path leans on having an active
-                # workspace for some bookkeeping. Mirror the active workspace
-                # of init_db so any incidental ws-scoped helpers stay valid.
-                active_ws = init_db._active_workspace_id
-                if active_ws is not None:
-                    thread_db.set_active_workspace(active_ws)
-
-                def progress_cb(current, total):
-                    job["progress"]["current"] = current
-                    job["progress"]["total"] = total
-                    runner.push_event(
-                        job["id"],
-                        "progress",
-                        {
-                            "current": current,
-                            "total": total,
-                            "phase": f"{current:,} / {total:,} working copies",
-                        },
-                    )
-
-                def status_cb(message, **_phase):
-                    runner.push_event(job["id"], "progress", {
-                        "phase": message,
-                        "current": job["progress"].get("current", 0),
-                        "total": job["progress"].get("total", 0),
-                    })
-
-                def cancel_check():
-                    return runner.is_cancelled(job["id"])
-
-                return backfill_working_copies(
-                    thread_db, vireo_dir,
-                    progress_callback=progress_cb,
-                    status_callback=status_cb,
-                    cancel_check=cancel_check,
-                )
-            finally:
-                thread_db.close()
-
-        try:
-            runner.start(
-                "working_copy_backfill", work,
-                ephemeral=True,
-                config={"trigger": "startup"},
-                # A library with tens of thousands of un-backfilled RAWs
-                # takes days of sequential decode, so the user needs a way
-                # to stand it down while they work without losing the
-                # progress made so far. ``cancel_check`` above already
-                # routes through ``runner.is_cancelled``, which parks on a
-                # pause request before reporting cancellation, and the
-                # extractor polls it at the top of each row — after that
-                # row's commit and before the next file read, so nothing
-                # is held while parked (no open write transaction, no
-                # publication guard, no in-flight extraction).
-                pausable=True,
-            )
-        except Exception:
-            log.exception("Failed to start working-copy backfill job")
-
-    # Expose the kickoff so tests can drive it synchronously without
-    # waiting on the Timer. Production wiring uses threading.Timer below;
-    # tests call ``app._kickoff_working_copy_backfill()`` directly and
-    # then block on the resulting JobRunner job.
-    app._kickoff_working_copy_backfill = _kickoff_working_copy_backfill
-
-    # Defer the kickoff slightly so the app finishes booting before the
-    # first DB-heavy background pass starts churning. Mirrors the folder
-    # health loop's grace period.
-    #
-    # Daemon=True so short-lived ``create_app`` callers (tests, scripts,
-    # one-shot tooling) don't get pinned waiting on the 5-second delay
-    # only to fire DB work after their real work is already done.
-    #
-    # Suppressed in tests via ``VIREO_DISABLE_STARTUP_BACKFILL_TIMERS``:
-    # otherwise a Timer scheduled by a fast-finishing test fires during a
-    # later test, runs a JobRunner thread against the now-stale tmp_path
-    # DB, and its ``image_loader.load_image`` call (via
-    # ``extract_working_copy``) is intercepted by the next test's
-    # monkeypatch of that same module attribute.
-    if not os.environ.get("VIREO_DISABLE_STARTUP_BACKFILL_TIMERS"):
-        _wc_backfill_timer = threading.Timer(5.0, _kickoff_working_copy_backfill)
-        _wc_backfill_timer.daemon = True
-        _wc_backfill_timer.start()
+    # Working copies are generated by imports, scans, and on-demand reads.
+    # Do not warm the library-wide cache at startup: it consumes disk and
+    # CPU for photos the user has not requested.
 
     # ----- thumb_path self-healing backfill -----
     # The dashboard's coverage card counts thumbnails by ``thumb_path IS NOT
@@ -5897,12 +5770,6 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         # Card cleanup reads only archive copies that match one card, but
         # those reads still hit the same NAS/SMB trees.
         "card-cleanup-verify",
-        # The startup working-copy backfill job walks the same source
-        # trees and additionally performs RAW decode + JPEG encode
-        # work per file, so overlapping it with an automatic Missing
-        # Originals scan can double the source-volume I/O on large
-        # legacy RAW libraries over NAS/SMB.
-        "working_copy_backfill",
     }
 
     def _utc_iso_now():

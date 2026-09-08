@@ -38,20 +38,11 @@ def _expanduser_prefers_test_home(monkeypatch):
 
 @pytest.fixture(autouse=True)
 def _disable_startup_backfill_timers(monkeypatch):
-    """Stop ``create_app``'s deferred working-copy / thumb-path backfill
-    Timers from firing during tests.
+    """Keep deferred startup maintenance from leaking into later tests.
 
-    Concrete failure this prevents: a fast-finishing test (e.g. a
-    synchronous ``/photos/<id>/preview`` request) returns in milliseconds,
-    but its app's 5/6-second Timer fires later — sometimes during a
-    completely unrelated next test — and runs the JobRunner backfill
-    thread against the now-stale tmp_path DB. The backfill's
-    ``extract_working_copy`` calls ``image_loader.load_image`` via the
-    module's global binding, so the *next* test's
-    ``monkeypatch.setattr(image_loader, "load_image", ...)`` intercepts
-    the call from the *previous* test's leaked job. Tests that exercise
-    the backfill paths still invoke ``app._kickoff_*_backfill()``
-    directly, so coverage is unaffected.
+    Thumbnail-path backfill and other startup tasks can otherwise run against
+    stale test databases after their owning test has finished. Tests for these
+    paths invoke their kickoff directly or explicitly enable startup timers.
     """
     monkeypatch.setenv("VIREO_DISABLE_STARTUP_BACKFILL_TIMERS", "1")
     monkeypatch.setenv("VIREO_DISABLE_BROWSER_AUTH", "1")

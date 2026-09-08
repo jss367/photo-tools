@@ -1190,11 +1190,8 @@ def _working_copy_candidate_predicate(wc_max_size, alias=""):
     extraction, plus its bind parameters.
 
     Mirrors the candidate criteria inside ``_extract_working_copies`` so the
-    startup self-healing gate and the backfill summary counts don't drift from
-    the extractor's actual SELECT — otherwise a library of only small JPEGs
-    (which the extractor intentionally skips) would still satisfy a naive
-    ``working_copy_path IS NULL`` check and trigger a no-op backfill on every
-    restart.
+    backfill summary counts match the extractor's actual SELECT, including
+    its exclusion of small JPEGs.
 
     Failure suppression has two escape hatches: a content change (mtime
     differs from the recorded ``working_copy_failed_mtime``) and a stale
@@ -1236,8 +1233,7 @@ def _working_copy_candidate_predicate(wc_max_size, alias=""):
 def working_copy_backfill_candidate_count(db):
     """Count photos that ``_extract_working_copies`` would actually process.
 
-    Used by the startup gate (skip the backfill job entirely when zero) and
-    by ``backfill_working_copies`` for accurate before/after reporting.
+    Used by ``backfill_working_copies`` for accurate before/after reporting.
     """
     import config as cfg
 
@@ -1385,7 +1381,7 @@ def _extract_working_copies(db, vireo_dir, progress_callback=None,
         return
 
     # Candidate criteria (NULL working_copy_path + RAW or oversized JPEG +
-    # not blocked by a stale failure marker) is shared with the startup gate
+    # not blocked by a stale failure marker) is shared with summary counts
     # via ``_working_copy_candidate_predicate`` so the two stay in sync.
     candidate_where, params = _working_copy_candidate_predicate(
         wc_max_size, alias="p"
@@ -2458,7 +2454,7 @@ def _extract_working_copies(db, vireo_dir, progress_callback=None,
             # decoding. Adopt the latest value before marking the remaining
             # rows as capacity-deferred; otherwise the settings handler can
             # clear old eviction markers and this stale batch can recreate
-            # them afterward, suppressing startup backfill indefinitely.
+            # them afterward, suppressing future extraction indefinitely.
             latest_quota_mb = _configured_quota_mb()
             if latest_quota_mb != wc_cache_max_mb:
                 wc_cache_max_mb = latest_quota_mb
@@ -2477,9 +2473,9 @@ def _extract_working_copies(db, vireo_dir, progress_callback=None,
                 wc_cache_max_mb, i, total,
             )
             # Mark the remaining candidates as capacity-deferred so the
-            # startup gate doesn't re-launch backfill on every restart
-            # while the quota is unchanged. Without this, the next launch
-            # would decode and write another quota-sized batch only to
+            # next explicit pass skips them while the quota is unchanged.
+            # Without this, the next pass would decode and write another
+            # quota-sized batch only to
             # evict the batch we just committed — and repeat indefinitely.
             # Reuse ``working_copy_evicted_mtime``: the settings write path
             # already clears this marker when the user raises the ceiling,
@@ -2490,7 +2486,7 @@ def _extract_working_copies(db, vireo_dir, progress_callback=None,
             # re-import reuse that id. Carry the source identity captured by
             # the candidate snapshot through both writes; an id-only UPDATE
             # would otherwise stamp the replacement row's current mtime as
-            # evicted and suppress its startup backfill.
+            # evicted and suppress its future extraction.
             # Full source-identity tuple, mirroring the success and failure
             # UPDATEs above: (folder_id, filename, companion_path, file_size,
             # file_mtime) plus a scalar ``(SELECT path FROM folders …)``.
@@ -2785,9 +2781,8 @@ def _extract_working_copies(db, vireo_dir, progress_callback=None,
                     # ``working_copy_path IS NULL`` with no marker —
                     # ``_evict_once``'s stale-tracked reconciliation
                     # deliberately clears the path so a lost DB
-                    # transition can regenerate — and the startup
-                    # gate's candidate count can never reach zero. The
-                    # backfill would then relaunch on every app start,
+                    # transition can regenerate. A later explicit pass
+                    # would select those same candidates again,
                     # re-decode the same lowest-priority rows, and
                     # trim them again: the exact "decode a quota-sized
                     # batch only to evict it, and repeat indefinitely"
@@ -2882,8 +2877,8 @@ def backfill_working_copies(db, vireo_dir, progress_callback=None,
     """Library-wide backfill of missing working copies.
 
     Convenience wrapper around ``_extract_working_copies`` with no folder
-    scope — used by the startup self-healing job to cover photos that
-    never went through ``scan(..., vireo_dir=...)`` (e.g. legacy rows from
+    scope, for explicit calls covering photos that never went through
+    ``scan(..., vireo_dir=...)`` (e.g. legacy rows from
     before working-copy generation existed) or whose previous extraction
     failed against an older mtime.
 

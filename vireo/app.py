@@ -11836,8 +11836,8 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
     def api_workspace_classification_inventory():
         """Per-(model × label-set) classification coverage for the active workspace.
 
-        Builds a cross-product of available classifier models × label sets on
-        disk, merges in per-pair counts from `classifier_runs`, identifies
+        Builds a cross-product of downloaded or previously used classifier
+        models × label sets on disk, merges in counts from `classifier_runs`, identifies
         stale rows (predictions whose fingerprint no longer matches any
         label file) and legacy rows (predictions from a model not in the
         current registry), and returns a structured payload for the
@@ -11896,10 +11896,9 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             deduped_by_fp.setdefault(ls["fingerprint"], ls)
         label_sets = list(deduped_by_fp.values())
 
-        # Available models: include all known classifier models even if not yet
-        # downloaded — gives the user visibility into "if you downloaded iNat21
-        # this would be N detections of work." Custom models registered without
-        # an explicit model_type default to bioclip (same as classify/pipeline).
+        # Keep the full registry for identifying legacy and stale results.
+        # Custom models without an explicit model_type default to bioclip
+        # (same as classify/pipeline).
         from models import supports_tree_of_life
         all_models = [
             m for m in get_models()
@@ -11908,9 +11907,14 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
 
         models_out = []
         seen_keys = set()  # (model_name, fingerprint) we've placed in models_out
+        used_model_names = {model_name for model_name, _fp in db_pairs}
 
         for m in all_models:
             model_name = m.get("name") or m.get("id")
+            # Uninstalled models with no history in this workspace are not
+            # pending work and should not inflate inventory coverage totals.
+            if not m.get("downloaded") and model_name not in used_model_names:
+                continue
             # Capability question — does this model TYPE ship ToL text
             # embeddings? Ask supports_tree_of_life(model_str), not the raw
             # `files` manifest: bioclip-2.5's ToL artifacts are declared

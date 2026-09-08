@@ -32,6 +32,8 @@
   color: var(--text-secondary);
   border-bottom: 1px solid var(--border-primary);
 }
+.jobs-awake-note summary { cursor: pointer; }
+.jobs-awake-note p { margin: 4px 0 0; }
 .jobs-filter-bar {
   padding: 8px 16px; display: flex; gap: 8px;
   border-bottom: 1px solid var(--border-subtle);
@@ -304,13 +306,11 @@
         <option value="failed">Failed</option>
       </select>
     </div>
-    <!-- Vireo overrides the system idle-sleep setting while jobs run
-         (issue #1397). Say so, and be specific about the limit: closing
-         the lid still sleeps the machine and will still kill the job. -->
-    <div class="jobs-awake-note" id="keepingAwakeNote" style="display:none;"
-         title="Long jobs die if the machine sleeps — a network share often does not survive it.">
-      Keeping this computer awake while jobs run. Closing the lid will still put it to sleep.
-    </div>
+    <!-- Show when Vireo prevents idle sleep while jobs run (issue #1397). -->
+    <details class="jobs-awake-note" id="keepingAwakeNote" style="display:none;">
+      <summary title="Keep your laptop open while jobs run">Keeping awake</summary>
+      <p>Keep your laptop open while jobs run</p>
+    </details>
     <div class="jobs-list-content" id="jobListContent">
       <div style="padding:24px;text-align:center;color:var(--text-ghost);font-size:13px;">Loading...</div>
     </div>

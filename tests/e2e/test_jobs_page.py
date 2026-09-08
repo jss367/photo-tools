@@ -1,6 +1,36 @@
 from playwright.sync_api import expect
 
 
+def test_keep_awake_reminder_opens_with_keyboard_and_click(live_server, page):
+    keeping_awake = True
+    page.route(
+        "**/api/jobs",
+        lambda route: route.fulfill(
+            json={"active": [], "keeping_awake": keeping_awake},
+        ),
+    )
+    page.route("**/api/jobs/history?*", lambda route: route.fulfill(json=[]))
+    page.goto(f"{live_server['url']}/jobs")
+
+    note = page.locator("#keepingAwakeNote")
+    summary = note.locator("summary")
+    reminder = note.get_by_text("Keep your laptop open while jobs run", exact=True)
+    expect(summary).to_be_visible()
+    expect(reminder).to_be_hidden()
+
+    summary.focus()
+    summary.press("Enter")
+    expect(reminder).to_be_visible()
+    summary.press("Space")
+    expect(reminder).to_be_hidden()
+    summary.click()
+    expect(reminder).to_be_visible()
+
+    keeping_awake = False
+    page.reload()
+    expect(note).to_be_hidden()
+
+
 def test_move_folder_job_shows_source_and_destination(live_server, page):
     job = {
         "id": "move-folder-route-test",

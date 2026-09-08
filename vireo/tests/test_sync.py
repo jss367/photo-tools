@@ -1207,7 +1207,7 @@ def test_sync_panel_does_not_report_zero_for_a_resultless_failure():
     """
     from pathlib import Path
 
-    panel = (Path(__file__).parents[1] / "templates/_sync_panel.html").read_text()
+    panel = (Path(__file__).parents[1] / "templates/_sync_panel.html").read_text(encoding="utf-8")
     handler = panel[panel.index("onComplete: function(event)"):]
     handler = handler[:handler.index("onError:")]
     assert "typeof result.synced === 'number'" in handler
@@ -1232,7 +1232,7 @@ def test_sync_panel_clears_stale_success_when_pending_remains():
     """
     from pathlib import Path
 
-    panel = (Path(__file__).parents[1] / "templates/_sync_panel.html").read_text()
+    panel = (Path(__file__).parents[1] / "templates/_sync_panel.html").read_text(encoding="utf-8")
 
     # The success branches (``Synced!`` / ``Synced N photos!`` /
     # ``Nothing to sync.``) mark the element as success.
@@ -1261,7 +1261,7 @@ def test_sync_panel_cancelled_summary_includes_failures():
     """
     from pathlib import Path
 
-    panel = (Path(__file__).parents[1] / "templates/_sync_panel.html").read_text()
+    panel = (Path(__file__).parents[1] / "templates/_sync_panel.html").read_text(encoding="utf-8")
     handler = panel[panel.index("onComplete: function(event)"):]
     handler = handler[:handler.index("onError:")]
 

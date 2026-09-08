@@ -880,7 +880,7 @@ def test_editor_keeps_the_canonical_spelling_while_stripping_variants(tmp_path):
     path.write_text(SAMPLE_XMP.replace(
         "<rdf:li>Bird</rdf:li>",
         "<rdf:li>Bird</rdf:li>\n          <rdf:li>‘Bird</rdf:li>",
-    ))
+    ), encoding="utf-8")
     editor = SidecarEditor(str(path))
     assert editor.remove_keywords({"Bird"}, hierarchical=False, keep_exact=True)
     editor.commit()

@@ -17704,16 +17704,17 @@ class _OfflineGate:
     """Stand-in for volume_reachability.get_shared(): every path is on an
     unreachable mount. Records what was asked so a test can assert the
     filesystem was never touched for it."""
-    def __init__(self):
+    def __init__(self, volume):
+        self.volume = volume
         self.asked = []
 
     def check(self, path):
         self.asked.append(path)
-        return "/Volumes/Archive", False
+        return self.volume, False
 
 
 def test_remote_target_test_reports_unreachable_archive_root_volume(
-    app_and_db, monkeypatch,
+    app_and_db, monkeypatch, tmp_path,
 ):
     """A root on a stale SMB/NFS share must not be os.path.isdir'd (that
     can hang a worker); the bounded reachability gate answers first and
@@ -17721,7 +17722,9 @@ def test_remote_target_test_reports_unreachable_archive_root_volume(
     import volume_reachability
     app, _ = app_and_db
     _fake_remote_probe(monkeypatch)
-    gate = _OfflineGate()
+    archive_root = str(tmp_path / "Archive" / "staging")
+    mount_path = str(tmp_path / "Photos")
+    gate = _OfflineGate(str(tmp_path / "Archive"))
     monkeypatch.setattr(volume_reachability, "get_shared", lambda: gate)
     calls = []
     real_isdir = os.path.isdir
@@ -17729,23 +17732,23 @@ def test_remote_target_test_reports_unreachable_archive_root_volume(
                         lambda p: calls.append(p) or real_isdir(p))
     resp = app.test_client().post(
         "/api/remote-targets/test",
-        json=_remote_target_body(local_archive_root="/Volumes/Archive/staging"))
+        json=_remote_target_body(local_archive_root=archive_root, mount_path=mount_path))
     res = resp.get_json()
     assert res["ok"] is True
     assert res["archive_root_volume_offline"] is True
     assert res["archive_root_present"] is None
     assert res["message"].startswith("Connection OK, but the volume")
-    assert "/Volumes/Archive/staging" in res["message"]
-    assert "/Volumes/Archive/staging" in gate.asked
-    assert "/Volumes/Archive/staging" not in calls
+    assert archive_root in res["message"]
+    assert archive_root in gate.asked
+    assert archive_root not in calls
     # The mount path goes through the same gate.
-    assert "/Volumes/Photos" in gate.asked
-    assert "/Volumes/Photos" not in calls
+    assert mount_path in gate.asked
+    assert mount_path not in calls
     assert res["mount_present"] is False
 
 
 def test_remote_targets_list_reports_unreachable_archive_root_volume(
-    app_and_db, monkeypatch,
+    app_and_db, monkeypatch, tmp_path,
 ):
     import config as cfg
     import move
@@ -17754,10 +17757,11 @@ def test_remote_targets_list_reports_unreachable_archive_root_volume(
     monkeypatch.setattr(move, "resolve_rsync_bin", lambda _: "/usr/bin/rsync")
     monkeypatch.setattr(move, "is_gnu_rsync", lambda _: True)
     monkeypatch.setattr(move, "resolve_ssh_bin", lambda _: "/usr/bin/ssh")
-    gate = _OfflineGate()
+    archive_root = str(tmp_path / "Archive" / "staging")
+    gate = _OfflineGate(str(tmp_path / "Archive"))
     monkeypatch.setattr(volume_reachability, "get_shared", lambda: gate)
     cfg.save({"remote_targets": [
-        _remote_target_body(id="a", local_archive_root="/Volumes/Archive/staging"),
+        _remote_target_body(id="a", local_archive_root=archive_root),
     ]})
     t = app.test_client().get("/api/remote-targets").get_json()["targets"][0]
     assert t["local_archive_root_present"] is None
@@ -17784,21 +17788,25 @@ def test_remote_targets_list_bounds_aggregate_probe_time(
     monkeypatch.setattr(move, "resolve_ssh_bin", lambda _: "/usr/bin/ssh")
     app.config["REMOTE_TARGET_PROBE_BUDGET_SECS"] = 0.4
     release = threading.Event()
+    dead_roots = {
+        str(tmp_path / "Dead1" / "a"): str(tmp_path / "Dead1"),
+        str(tmp_path / "Dead2" / "b"): str(tmp_path / "Dead2"),
+    }
 
     class Gate:
         def check(self, path):
-            if path.startswith("/Volumes/Dead"):
+            if path in dead_roots:
                 # A hung probe: far longer than the budget.
                 release.wait(5)
-                return "/Volumes/Dead", False
+                return dead_roots[path], False
             return None, True
 
     monkeypatch.setattr(volume_reachability, "get_shared", lambda: Gate())
     present = tmp_path / "present"
     present.mkdir()
     cfg.save({"remote_targets": [
-        _remote_target_body(id="dead1", local_archive_root="/Volumes/Dead1/a"),
-        _remote_target_body(id="dead2", local_archive_root="/Volumes/Dead2/b"),
+        _remote_target_body(id="dead1", local_archive_root=str(tmp_path / "Dead1" / "a")),
+        _remote_target_body(id="dead2", local_archive_root=str(tmp_path / "Dead2" / "b")),
         _remote_target_body(id="ok", local_archive_root=str(present)),
     ]})
     started = time.monotonic()

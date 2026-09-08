@@ -6421,6 +6421,53 @@ def test_import_can_add_structured_locations_from_each_photos_gps(
     assert location["keyword_location_name"] == "Central Park"
 
 
+@pytest.mark.parametrize("outcome", ["success", "error", "cancelled"])
+def test_import_in_place_closes_worker_database(
+    app_and_db, tmp_path, monkeypatch, outcome,
+):
+    import scanner
+
+    app, _ = app_and_db
+    client = app.test_client()
+    worker_databases = []
+    real_scan = scanner.scan
+
+    def scan(source, db, **kwargs):
+        # Retain the object so garbage collection cannot hide a missing close.
+        worker_databases.append(db)
+        if outcome == "cancelled":
+            monkeypatch.setattr(app._job_runner, "is_cancelled", lambda _job_id: True)
+            raise scanner.ScanCancelled()
+        return real_scan(source, db, **kwargs)
+
+    monkeypatch.setattr(scanner, "scan", scan)
+    if outcome == "error":
+        def fail_handoff(_job_id):
+            raise RuntimeError("handoff failed")
+
+        monkeypatch.setattr(app._job_runner, "begin_uncancellable", fail_handoff)
+
+    try:
+        response = client.post("/api/jobs/import-in-place", json={
+            "sources": [_import_card(tmp_path)],
+            "after_import": None,
+        })
+        assert response.status_code == 200, response.get_json()
+        job = wait_for_job_via_client(client, response.get_json()["job_id"])
+        if outcome == "success":
+            assert job["status"] == "completed", job
+            assert job["result"]["indexed"] == 1
+        elif outcome == "error":
+            assert job["status"] == "failed", job
+        else:
+            assert job["result"]["cancelled"] is True, job
+        assert worker_databases
+        assert all(db.conn is None for db in worker_databases)
+    finally:
+        for db in worker_databases:
+            db.close()
+
+
 def test_import_in_place_no_destination_required(app_and_db, tmp_path):
     app, db = app_and_db
     client = app.test_client()

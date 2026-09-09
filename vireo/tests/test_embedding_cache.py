@@ -703,3 +703,80 @@ def test_producer_pause_wakes_waiter_and_waiter_takes_over(tmp_path):
     assert waiter_computed.is_set()
     assert np.array_equal(value, _payload(value=2))
     assert not os.path.exists(cache.checkpoint_for(identity).path)
+
+
+def test_individual_labels_reuse_columns_in_new_order_and_isolate_models(tmp_path):
+    from embedding_cache import LabelEmbeddingCache
+
+    first = LabelEmbeddingCache(tmp_path, _identity(), embedding_dim=4)
+    original = np.arange(8, dtype=np.float32).reshape(4, 2)
+    first.seed(["bird", "cat"], original)
+    changed = LabelEmbeddingCache(tmp_path, _identity(["cat", "dog", "bird"]), embedding_dim=4)
+    calls = []
+
+    def encode(label):
+        calls.append(label)
+        return np.full(4, 99, dtype=np.float32)
+
+    result = np.stack([
+        changed.resolve(label, lambda label=label: encode(label)) for label in ["cat", "dog", "bird"]
+    ], axis=1)
+    assert calls == ["dog"]
+    np.testing.assert_array_equal(result[:, 0], original[:, 1])
+    np.testing.assert_array_equal(result[:, 2], original[:, 0])
+    assert LabelEmbeddingCache(tmp_path, _identity(suffix="b"), 4).read("bird") is None
+    assert LabelEmbeddingCache(tmp_path, _identity(), 5).read("cat") is None
+
+
+def test_overlapping_label_sets_share_one_inflight_label(tmp_path):
+    from embedding_cache import LabelEmbeddingCache
+
+    started, release = threading.Event(), threading.Event()
+    first = LabelEmbeddingCache(tmp_path, _identity(["bird"]), 4)
+    second = LabelEmbeddingCache(tmp_path, _identity(["cat", "bird"]), 4)
+    calls = []
+
+    def encode():
+        calls.append("bird")
+        started.set()
+        assert release.wait(3)
+        return np.ones(4, dtype=np.float32)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        a = pool.submit(first.resolve, "bird", encode)
+        assert started.wait(3)
+        b = pool.submit(second.resolve, "bird", encode)
+        release.set()
+        np.testing.assert_array_equal(a.result(3), b.result(3))
+    assert calls == ["bird"]
+
+
+def test_late_cache_miss_rechecks_after_another_producer_publishes(tmp_path, monkeypatch):
+    cache = EmbeddingCache(tmp_path)
+    read_missed, release = threading.Event(), threading.Event()
+    original_load = cache._load
+    calls = []
+
+    def delayed_load(*args, **kwargs):
+        if threading.current_thread().name.startswith("late") and not read_missed.is_set():
+            read_missed.set()
+            assert release.wait(3)
+            raise FileNotFoundError("read missed before publication")
+        return original_load(*args, **kwargs)
+
+    monkeypatch.setattr(cache, "_load", delayed_load)
+
+    def compute():
+        calls.append(True)
+        return _payload()
+
+    with ThreadPoolExecutor(max_workers=1, thread_name_prefix="late") as pool:
+        late = pool.submit(cache.get_or_compute, _identity(), compute)
+        try:
+            assert read_missed.wait(3)
+            early, _ = cache.get_or_compute(_identity(), compute)
+        finally:
+            release.set()
+        result, _ = late.result(3)
+    np.testing.assert_array_equal(result, early)
+    assert calls == [True]

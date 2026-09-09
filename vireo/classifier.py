@@ -227,7 +227,13 @@ def _embedding_is_cached(labels, model_str, model_dir=None):
         identity = _embedding_identity(labels, model_str, model_dir)
     except (OSError, ValueError):
         return False
-    return _embedding_cache_service().is_cached(identity, len(identity["labels"]))
+    from embedding_cache import LabelEmbeddingCache
+
+    cache = _embedding_cache_service()
+    if cache.is_cached(identity, len(identity["labels"])):
+        return True
+    individual = LabelEmbeddingCache(cache.cache_dir, identity)
+    return all(individual.read(label) is not None for label in identity["labels"])
 
 
 def _load_tokenizer(tokenizer_path):
@@ -352,6 +358,7 @@ def _compute_embeddings_with_progress(
     model_dir=None,
     pause_check=None,
     checkpoint=None,
+    label_cache=None,
 ):
     """Compute text embeddings for labels with progress logging.
 
@@ -372,6 +379,8 @@ def _compute_embeddings_with_progress(
         checkpoint: optional ``EmbeddingCheckpoint``; when given, resumes
             from its saved rows and persists progress periodically and on
             every pause/cancel unwind
+        label_cache: optional per-label cache, shared across label sets;
+            reused labels count as ready before estimating uncached work
 
     Returns:
         numpy float32 array of shape (embedding_dim, num_labels) --
@@ -387,11 +396,17 @@ def _compute_embeddings_with_progress(
             "Resuming label embeddings from checkpoint: %d/%d",
             len(all_features), total,
         )
-    else:
-        log.info("Computing label embeddings: 0/%d", total)
     start = len(all_features)
+    cached_features = {}
+    if label_cache is not None:
+        for i in range(start, total):
+            value = label_cache.read(labels[i])
+            if value is not None:
+                cached_features[i] = value
+    ready = start + len(cached_features)
+    log.info("Preparing species labels: %d/%d ready (%d reused)", ready, total, len(cached_features))
     if progress_callback:
-        progress_callback(start, total)
+        progress_callback(ready, total)
 
     def _persist():
         if checkpoint is not None and len(all_features) > start:
@@ -412,17 +427,22 @@ def _compute_embeddings_with_progress(
         if cancel_check and cancel_check():
             _persist()
             raise ClassificationCancelled("classification cancelled")
-        txts = [template(classname) for template in OPENAI_IMAGENET_TEMPLATE]
-        tokens = _tokenize(tokenizer, txts)
-        txt_features = _run_text_batched(
-            text_session, text_input_name, tokens, model_dir=model_dir
-        )
-        txt_features = txt_features.astype(np.float32)
-        # Normalize each template's output, then average
-        txt_features = _normalize(txt_features)
-        mean_feature = txt_features.mean(axis=0)
-        # Re-normalize the averaged feature
-        mean_feature = _normalize(mean_feature)
+        def encode_label(classname=classname):
+            txts = [template(classname) for template in OPENAI_IMAGENET_TEMPLATE]
+            tokens = _tokenize(tokenizer, txts)
+            txt_features = _run_text_batched(
+                text_session, text_input_name, tokens, model_dir=model_dir
+            ).astype(np.float32)
+            return _normalize(_normalize(txt_features).mean(axis=0))
+
+        if i in cached_features:
+            mean_feature = cached_features[i]
+        else:
+            mean_feature = (
+                label_cache.resolve(classname, encode_label, cancel_check=cancel_check)
+                if label_cache is not None else encode_label()
+            )
+            ready += 1
         all_features.append(mean_feature)
 
         done = i + 1
@@ -433,12 +453,12 @@ def _compute_embeddings_with_progress(
         ):
             _persist()
         if progress_callback:
-            progress_callback(done, total)
+            progress_callback(ready, total)
         if cancel_check and cancel_check():
             _persist()
             raise ClassificationCancelled("classification cancelled")
         if done % 50 == 0 or done == total:
-            log.info("Computing label embeddings: %d/%d", done, total)
+            log.info("Preparing species labels: %d/%d ready", ready, total)
 
     # Stack into (num_labels, embedding_dim) then transpose to (embedding_dim, num_labels)
     stacked = np.stack(all_features, axis=0)  # (num_labels, embedding_dim)
@@ -470,6 +490,7 @@ def _load_or_compute_label_embeddings(
     """
     from embedding_cache import (
         EmbeddingWaitCancelled,
+        LabelEmbeddingCache,
         canonicalize_labels,
     )
 
@@ -488,17 +509,27 @@ def _load_or_compute_label_embeddings(
 
     initial_identity = _embedding_identity(classes, model_str, model_dir)
     cache = _embedding_cache_service()
-    checkpoint = cache.checkpoint_for(initial_identity)
 
     def _compute():
         if pause_check and pause_check():
             raise ClassifierLoadPaused("classifier load paused")
         if cancel_check and cancel_check():
             raise ClassificationCancelled("classification cancelled")
+        label_cache = LabelEmbeddingCache(cache.cache_dir, initial_identity, embedding_dim)
+        reused = [label_cache.read(label) for label in classes]
+        if all(row is not None for row in reused):
+            if progress_callback:
+                progress_callback(len(classes), len(classes))
+            return np.stack(reused, axis=1)
         text_session = onnx_runtime.create_session_with_self_heal(
             text_encoder_path, redownload=redownload,
         )
         try:
+            # Self-healing can replace the encoder. Never mix rows or resume
+            # a checkpoint produced by the old encoder with the new weights.
+            actual_identity = _embedding_identity(classes, model_str, model_dir)
+            active_checkpoint = cache.checkpoint_for(actual_identity)
+            label_cache = LabelEmbeddingCache(cache.cache_dir, actual_identity, embedding_dim)
             text_input_name = text_session.get_inputs()[0].name
             tokenizer = _load_tokenizer(tokenizer_path)
             return _compute_embeddings_with_progress(
@@ -510,7 +541,8 @@ def _load_or_compute_label_embeddings(
                 cancel_check=cancel_check,
                 model_dir=model_dir,
                 pause_check=pause_check,
-                checkpoint=checkpoint,
+                checkpoint=active_checkpoint,
+                label_cache=label_cache,
             )
         finally:
             del text_session
@@ -527,6 +559,12 @@ def _load_or_compute_label_embeddings(
         )
     except EmbeddingWaitCancelled as exc:
         raise ClassificationCancelled("classification cancelled") from exc
+    # Import existing whole-set caches lazily. Their verified columns then
+    # survive additions, removals and reordering of the active label list.
+    try:
+        LabelEmbeddingCache(cache.cache_dir, actual_identity, embeddings.shape[0]).seed(classes, embeddings)
+    except (OSError, ValueError):
+        log.warning("Could not save reusable species labels", exc_info=True)
     return classes, embeddings, initial_identity, actual_identity
 
 

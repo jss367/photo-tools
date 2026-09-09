@@ -856,7 +856,7 @@
 
       // 8: Throughput + ETA for running steps
       if (isRunning && step.progress && step.progress.current > 0 &&
-          step.started_at && !importInPlacePhaseActive) {
+          step.started_at && !importInPlacePhaseActive && step.progress.unit !== 'labels') {
         if (job.type === 'import') {
           // Import's visible counter advances while a batch is prepared,
           // before its transfer and restricted catalog scan finish. Use the

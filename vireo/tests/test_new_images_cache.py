@@ -452,3 +452,63 @@ def test_partial_offline_results_expire_at_offline_retry_interval(monkeypatch):
     now[0] += NewImagesCache.PARTIAL_RESULT_TTL_SECONDS + 1
     assert cache.get("db", 1) is None, "partial result must expire early"
     assert cache.get("db", 2) == complete, "complete result keeps the normal TTL"
+
+
+def test_deferred_rerun_keeps_job_registration_and_progress():
+    cache = NewImagesCache()
+    entered, release, reran = threading.Event(), threading.Event(), threading.Event()
+    registrations, progress = [], []
+
+    def stale():
+        entered.set()
+        assert release.wait(3)
+        return {"new_count": 0}
+
+    def on_spawn(event):
+        registrations.append(event)
+        return lambda checked, found: progress.append((checked, found))
+
+    def fresh(progress_callback):
+        progress_callback(100, 4)
+        reran.set()
+        return {"new_count": 4}
+
+    cache.kickoff_compute(DB, 1, stale)
+    try:
+        assert entered.wait(3)
+        cache.invalidate_workspaces(DB, [1])
+        cache.kickoff_compute(DB, 1, fresh, on_spawn=on_spawn)
+    finally:
+        release.set()
+    assert reran.wait(3)
+    assert len(registrations) == 1
+    assert registrations[0].wait(3)
+    assert progress == [(100, 4)]
+
+
+def test_deferred_rerun_rechecks_foreground_work_before_starting():
+    cache = NewImagesCache()
+    entered, release, rerun_finished = threading.Event(), threading.Event(), threading.Event()
+    allowed = [True]
+    started = []
+
+    def stale():
+        entered.set()
+        assert release.wait(3)
+        return {"new_count": 0}
+
+    def can_start():
+        if not allowed[0]:
+            rerun_finished.set()
+        return allowed[0]
+
+    cache.kickoff_compute(DB, 1, stale)
+    try:
+        assert entered.wait(3)
+        cache.invalidate_workspaces(DB, [1])
+        cache.kickoff_compute(DB, 1, lambda: started.append(True), can_start=can_start)
+        allowed[0] = False
+    finally:
+        release.set()
+    assert rerun_finished.wait(3)
+    assert started == []

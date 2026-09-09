@@ -5738,6 +5738,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         "move-folder",
         "sync",
         "classify",
+        "precompute-embeddings",
         "cull",
         "develop",
         "extract-masks",
@@ -6195,8 +6196,8 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 work,
                 workspace_id=ws_id,
                 config={"scope": scope_label, "folder_id": folder_id},
-                ephemeral=True,
-                counts_for_badge=False,
+                ephemeral=False,
+                counts_for_badge=True,
             )
         except Exception:
             with app._missing_originals_lock:
@@ -15231,7 +15232,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         of the whole library. Memory cost is one path string per *new* file,
         which is small even for a full re-import.
 
-        ``on_spawn`` surfaces the walk as an ephemeral job in the bottom
+        ``on_spawn`` surfaces the walk as a recorded job in the bottom
         panel and mirrors its progress into ``app._new_images_walk_progress``
         so pending API responses can report live totals.
         """
@@ -15240,7 +15241,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
 
         db_path = db._db_path
         # Shared holder for the cache worker's exception (if any), read by
-        # the ephemeral job's work_fn after the cache event fires. Without
+        # the recorded job's work_fn after the cache event fires. Without
         # this, a walk that raises (e.g. unreadable volume, DB error) would
         # still mark the job ``completed`` while ``/api/.../new-images``
         # returns the error from ``get_recent_error`` — contradictory state
@@ -15268,7 +15269,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             finally:
                 wdb.close()
 
-        # Surface the walk as an ephemeral job so the user can see it in the
+        # Surface the walk as a recorded job so the user can see it in the
         # bottom panel rather than wondering why their workspace is silent.
         # ``on_spawn`` only fires when this kickoff actually starts a new
         # worker (cache truly cold) — cache hits and reuse of an in-flight
@@ -15313,8 +15314,8 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             job_id = runner.start(
                 "new_images_walk",
                 job_work_fn,
-                ephemeral=True,
-                counts_for_badge=False,
+                ephemeral=False,
+                counts_for_badge=True,
                 blocks_local_transitions=False,
                 workspace_id=ws_id,
                 config={"workspace_name": ws_name},
@@ -15367,6 +15368,15 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 return True
         return False
 
+    def _new_images_deferred_reason():
+        if _new_images_walk_blocked_by_move():
+            return "storage_move_active"
+        for job in app._job_runner.list_jobs():
+            if (job.get("status") in ("running", "pausing", "paused", "queued")
+                    and job.get("type") in _MISSING_ORIGINALS_HEAVY_JOB_TYPES - {"new_images_walk"}):
+                return "foreground_job_active"
+        return None
+
     @app.route("/api/workspaces/active/new-images")
     def api_workspace_new_images():
         db = _get_db()
@@ -15403,14 +15413,15 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 "error": recent_err,
             })
 
-        if _new_images_walk_blocked_by_move():
+        deferred_reason = _new_images_deferred_reason()
+        if deferred_reason and not cache.has_inflight(db_path, ws_id):
             return jsonify({
                 "workspace_id": ws_id,
                 "new_count": None,
                 "per_root": [],
                 "sample": [],
                 "pending": True,
-                "deferred_reason": "storage_move_active",
+                "deferred_reason": deferred_reason,
             })
 
         # Cache cold: run the filesystem walk in a background thread so the
@@ -15420,7 +15431,10 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         # observe a real count synchronously; longer walks return
         # ``pending: true`` and the front-end re-polls.
         compute, on_spawn, spawned = _new_images_walk_fns(db, ws_id)
-        event = cache.kickoff_compute(db_path, ws_id, compute, on_spawn=on_spawn)
+        event = cache.kickoff_compute(
+            db_path, ws_id, compute, on_spawn=on_spawn,
+            can_start=lambda: _new_images_deferred_reason() is None,
+        )
         if spawned() and event.wait(timeout=_NEW_IMAGES_SYNC_WAIT_SECS):
             cached = cache.get(db_path, ws_id)
             if cached is not None:
@@ -15523,7 +15537,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         # coalesce onto — a background walk. ``kickoff_compute`` reuses an
         # in-flight walk for the current generation, so repeated clicks and
         # poll loops can never stack walks or restart one mid-flight.
-        # ``on_spawn`` registers the same ephemeral bottom-panel job the
+        # ``on_spawn`` registers the same recorded bottom-panel job the
         # navbar probe gets, so a click-triggered walk is just as visible.
         compute, on_spawn, spawned = _new_images_walk_fns(db, ws_id)
         event = cache.kickoff_compute(db_path, ws_id, compute, on_spawn=on_spawn)
@@ -20602,6 +20616,21 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 size = os.path.getsize(fp)
                 total_size += size
                 entries.append({"file": f, "size": size})
+        # Reusable individual labels live below their encoder identity.
+        # Aggregate them instead of shipping thousands of filenames to Settings.
+        label_size = 0
+        label_count = 0
+        for root, _dirs, files in os.walk(os.path.join(CACHE_DIR, "labels")):
+            for name in files:
+                if name.endswith(".npy") and not name.endswith(CHECKPOINT_SUFFIX):
+                    try:
+                        label_size += os.path.getsize(os.path.join(root, name))
+                        label_count += 1
+                    except FileNotFoundError:
+                        pass  # a concurrent cache clear won
+        if label_count:
+            entries.append({"file": "Reusable species labels", "size": label_size, "label_count": label_count})
+            total_size += label_size
         return jsonify({"entries": entries, "total_size": total_size})
 
     @app.route("/api/embedding-matrix")

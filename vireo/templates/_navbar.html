@@ -13481,7 +13481,11 @@ async function checkNewImages(options) {
     // running in the background. The result will land in the cache shortly,
     // so re-poll soon instead of waiting for the next 60s tick.
     if (data && data.pending) {
-      _newImagesPendingTimer = setTimeout(checkNewImages, 3000);
+      if (data.deferred_reason) {
+        const stamp = document.getElementById('newImagesCheckedAt');
+        if (stamp) stamp.textContent = 'Check deferred until active processing finishes';
+      }
+      _newImagesPendingTimer = setTimeout(checkNewImages, data.deferred_reason ? 15000 : 3000);
       return;
     }
     // Persistent backend failure (unreachable volume, DB error). Don't

@@ -509,6 +509,50 @@ def _card_cleanup_scan(result: dict, config: dict) -> tuple[str, list[str]]:
     return summary, details
 
 
+def _staging_verify(result: dict, config: dict) -> tuple[str, list[str]]:
+    name = result.get("name") or "Staging folder"
+    files = _int(result, "file_count")
+    verified = _int(result, "verified")
+    unaccounted = _int(result, "unaccounted")
+    unreachable = _int(result, "unreachable")
+    status = result.get("status")
+    if status == "safe_to_delete":
+        summary = f"{name}: all {_n(files, 'file')} verified in the archive, safe to delete"
+    elif status == "needs_import":
+        summary = (
+            f"{name}: {_n(unaccounted, 'file')} not found in the archive, "
+            f"still needs importing ({verified:,} of {files:,} verified)"
+        )
+    elif status == "unreachable":
+        summary = (
+            f"{name}: {_n(unreachable, 'file')} could not be checked because the "
+            f"archive is unreachable ({verified:,} of {files:,} verified)"
+        )
+    else:
+        summary = f"{name}: {verified:,} of {_n(files, 'file')} verified"
+    if result.get("deleted"):
+        summary += ", folder deleted"
+    details = []
+    if result.get("source_root"):
+        details.append(f"Staging folder: {result['source_root']}")
+    if result.get("inferred_destination"):
+        details.append(f"Archive destination: {result['inferred_destination']}")
+    size = _human_bytes(result.get("bytes")) if _int(result, "bytes") else ""
+    if size:
+        details.append(f"Size: {size}")
+    problems = [
+        d for d in (result.get("details") or [])
+        if isinstance(d, dict) and d.get("status") in ("unaccounted", "unreachable")
+    ]
+    if problems:
+        details += _list_details(
+            [{"path": d.get("rel") or d.get("path"), "reason": d.get("reason") or d.get("status")}
+             for d in problems],
+            "Not verified:",
+        )
+    return summary, details
+
+
 def _sync(result: dict, config: dict) -> tuple[str, list[str]]:
     synced = _int(result, "synced")
     failed = _int(result, "failed")
@@ -579,6 +623,7 @@ _DESCRIBERS: dict[str, Callable[[dict, dict], tuple[str, list[str]]]] = {
     "sync": _sync,
     "verify-hashes": _verify_hashes,
     "card-cleanup-scan": _card_cleanup_scan,
+    "staging-verify": _staging_verify,
 }
 
 

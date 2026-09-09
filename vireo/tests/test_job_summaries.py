@@ -247,6 +247,29 @@ def test_card_cleanup_scan_surfaces_nested_totals():
     assert describe_result("card-cleanup-scan", {"cancelled": True})["summary"] == "Scan cancelled"
 
 
+def test_staging_verify_leads_with_the_verdict():
+    base = {"path": "/v/staging/abc", "source_root": "/v/staging/abc/files", "name": "abc",
+            "file_count": 40, "bytes": 2_000_000_000, "verified": 40, "unaccounted": 0,
+            "unreachable": 0, "details": [], "can_delete": True, "status": "safe_to_delete",
+            "inferred_destination": "/Volumes/Photography/2026-08-01"}
+    out = describe_result("staging-verify", base)
+    assert out["summary"] == "abc: all 40 files verified in the archive, safe to delete"
+    assert out["details"] == ["Staging folder: /v/staging/abc/files",
+                              "Archive destination: /Volumes/Photography/2026-08-01",
+                              "Size: 1.9 GB"]
+
+    needs = dict(base, verified=38, unaccounted=2, can_delete=False, status="needs_import",
+                 details=[{"path": "/v/staging/abc/files/a.NEF", "rel": "a.NEF", "status": "unaccounted"},
+                          {"path": "/v/staging/abc/files/b.NEF", "rel": "b.NEF", "status": "verified"}])
+    out = describe_result("staging-verify", needs)
+    assert out["summary"] == "abc: 2 files not found in the archive, still needs importing (38 of 40 verified)"
+    assert out["details"][-2:] == ["Not verified:", "a.NEF: unaccounted"]
+
+    unreachable = dict(base, verified=0, unreachable=40, can_delete=False, status="unreachable")
+    out = describe_result("staging-verify", unreachable)
+    assert out["summary"].startswith("abc: 40 files could not be checked because the archive is unreachable")
+
+
 def test_generic_hides_ids():
     out = describe_result("import-in-place", {"discovered": 3, "indexed": 3,
                                               "process_job_id": "pipeline-1"})

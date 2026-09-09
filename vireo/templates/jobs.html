@@ -770,8 +770,19 @@
         var allScalar = value.every(function(v) { return v === null || typeof v !== 'object'; });
         if (allScalar && value.length <= 5) {
           lines.push(key + ': ' + (value.length ? value.join(', ') : 'none'));
+        } else if (allScalar) {
+          lines.push(key + ': ' + value.length.toLocaleString() + ' items');
         } else {
+          // Arrays of objects are usually per-item failure records (e.g.
+          // sync's result.failures: photo + reason). Show each entry so the
+          // user can see which photos failed and why; cap the list.
           lines.push(key + ': ' + value.length.toLocaleString() + (value.length === 1 ? ' item' : ' items'));
+          value.slice(0, 10).forEach(function(item) {
+            lines.push('  ' + (item && typeof item === 'object' ? JSON.stringify(item) : String(item)));
+          });
+          if (value.length > 10) {
+            lines.push('  and ' + (value.length - 10).toLocaleString() + ' more');
+          }
         }
       } else if (typeof value === 'object') {
         lines.push(key + ': ' + JSON.stringify(value));

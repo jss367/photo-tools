@@ -6195,7 +6195,11 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 "missing_originals_scan",
                 work,
                 workspace_id=ws_id,
-                config={"scope": scope_label, "folder_id": folder_id},
+                config={
+                    "scope": scope_label,
+                    "folder_id": folder_id,
+                    "automatic": bool(automatic),
+                },
                 ephemeral=False,
                 counts_for_badge=True,
             )
@@ -15212,9 +15216,14 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
     # threshold so a normal cold probe never logs as a slow request.
     _NEW_IMAGES_SYNC_WAIT_SECS = 0.4
 
-    def _new_images_walk_fns(db, ws_id):
+    def _new_images_walk_fns(db, ws_id, *, automatic):
         """Return ``(compute, on_spawn, spawned)`` for a transparent background
         new-images walk, shared by the navbar probe and the snapshot POST.
+
+        ``automatic`` marks the recorded job as a background probe so
+        history retention can spare it from evicting user-initiated jobs
+        (see ``_persist_job``). Navbar polls set True; explicit user
+        actions (snapshot POST, manual banner recheck) set False.
 
         ``spawned()`` reports whether the most recent ``kickoff_compute`` that
         received this ``on_spawn`` actually started a worker. Only that
@@ -15318,7 +15327,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 counts_for_badge=True,
                 blocks_local_transitions=False,
                 workspace_id=ws_id,
-                config={"workspace_name": ws_name},
+                config={"workspace_name": ws_name, "automatic": automatic},
             )
 
             def progress_callback(files_checked, new_found):
@@ -15437,7 +15446,9 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         # libraries (and the test suite's tmp_path filesystems) still
         # observe a real count synchronously; longer walks return
         # ``pending: true`` and the front-end re-polls.
-        compute, on_spawn, spawned = _new_images_walk_fns(db, ws_id)
+        compute, on_spawn, spawned = _new_images_walk_fns(
+            db, ws_id, automatic=not manual_recheck,
+        )
         event = cache.kickoff_compute(
             db_path, ws_id, compute, on_spawn=on_spawn,
             can_start=None if manual_recheck else (lambda: _new_images_deferred_reason() is None),
@@ -15533,10 +15544,11 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         if recent_err is not None:
             return jsonify({"error": recent_err}), 500
 
-        if _new_images_walk_blocked_by_move():
+        deferred_reason = _new_images_deferred_reason()
+        if deferred_reason is not None and not cache.has_inflight(db_path, ws_id):
             return jsonify({
                 "pending": True,
-                "deferred_reason": "storage_move_active",
+                "deferred_reason": deferred_reason,
                 **_new_images_walk_progress_fields(db_path, ws_id),
             }), 202
 
@@ -15546,8 +15558,17 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         # poll loops can never stack walks or restart one mid-flight.
         # ``on_spawn`` registers the same recorded bottom-panel job the
         # navbar probe gets, so a click-triggered walk is just as visible.
-        compute, on_spawn, spawned = _new_images_walk_fns(db, ws_id)
-        event = cache.kickoff_compute(db_path, ws_id, compute, on_spawn=on_spawn)
+        # ``can_start`` re-checks the deferral gate right before spawning so
+        # a heavy foreground job that arrives after the pre-check above still
+        # blocks compute — otherwise a snapshot click could race a pipeline
+        # into contention on the same volume/DB.
+        compute, on_spawn, spawned = _new_images_walk_fns(
+            db, ws_id, automatic=False,
+        )
+        event = cache.kickoff_compute(
+            db_path, ws_id, compute, on_spawn=on_spawn,
+            can_start=lambda: _new_images_deferred_reason() is None,
+        )
         if spawned() and event.wait(timeout=_NEW_IMAGES_SYNC_WAIT_SECS):
             cached = cache.get(db_path, ws_id)
             if cached is not None and cached.get("sample_complete"):

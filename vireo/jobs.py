@@ -37,6 +37,18 @@ _NO_SLEEP_ASSERTION_JOB_TYPES = frozenset({
 # How long to keep completed/failed jobs in memory before eviction (seconds)
 _JOB_RETENTION_SECS = 3600  # 1 hour
 
+# Per-workspace history retention: user-initiated (foreground) jobs get the
+# main cap, and automatic background probes (navbar new-images poll, missing-
+# originals refresh) get their own smaller cap. Without the split, a 30-min
+# probe cadence running on an idle workspace fills the 100-row cap in about
+# a day and evicts every pipeline/import row the user actually cares about.
+_JOB_HISTORY_FOREGROUND_RETENTION = 100
+_JOB_HISTORY_BACKGROUND_PROBE_RETENTION = 25
+# Job types that record automatic probe runs with ``config.automatic = True``.
+# Only those runs count against the background-probe quota; the same types
+# invoked by a user click stay in the foreground bucket.
+_BACKGROUND_PROBE_JOB_TYPES = ("new_images_walk", "missing_originals_scan")
+
 _PROMOTION_RETRY_DELAY_SECS = 0.1
 # How often live jobs checkpoint their step tree and progress into
 # job_history. A crash or kill (the desktop app quits Flask without a
@@ -1273,25 +1285,77 @@ class JobRunner:
                 )
                 ws_id = job.get("workspace_id")
                 if ws_id is not None:
-                    # Retention: keep the 100 most-recent TERMINAL rows
-                    # per workspace. Excluding non-terminal rows is
-                    # load-bearing: a queued pipeline waiting behind a
-                    # busy slot can sit in the table for a long time;
-                    # if its row got pruned by an unrelated job
-                    # completing, the next promotion attempt would see
-                    # rowcount==0 on its conditional UPDATE and treat
-                    # that as a cancel, silently dropping the run.
+                    # Retention: keep the most-recent TERMINAL rows per
+                    # workspace, split into two independent quotas.
+                    # Excluding non-terminal rows is load-bearing: a
+                    # queued pipeline waiting behind a busy slot can sit
+                    # in the table for a long time; if its row got pruned
+                    # by an unrelated job completing, the next promotion
+                    # attempt would see rowcount==0 on its conditional
+                    # UPDATE and treat that as a cancel, silently
+                    # dropping the run.
+                    #
+                    # Automatic background probes (see
+                    # ``_BACKGROUND_PROBE_JOB_TYPES``) fire on a schedule
+                    # and would otherwise dominate the cap on idle
+                    # workspaces — a 30-min cadence produces roughly 48
+                    # rows/day per probe, evicting all user-initiated
+                    # pipeline and import history within a day. Give
+                    # them their own smaller quota so they stay visible
+                    # for transparency without crowding out user work.
+                    probe_types = _BACKGROUND_PROBE_JOB_TYPES
+                    probe_type_placeholders = ",".join(["?"] * len(probe_types))
+                    # Foreground bucket: any terminal row that isn't an
+                    # ``automatic=true`` probe. json_extract returns 1
+                    # for JSON true and NULL for a missing key. The
+                    # ``IS 1`` (not ``= 1``) form treats NULL as "not
+                    # true" instead of NULL, so legacy rows without the
+                    # marker (older rows, non-probe jobs, probe rows
+                    # from before this quota split) stay in this bucket
+                    # rather than leaking past both DELETEs.
                     conn.execute(
-                        """DELETE FROM job_history
-                           WHERE workspace_id = ?
-                             AND status IN ('completed', 'failed', 'cancelled')
-                             AND id NOT IN (
-                               SELECT id FROM job_history
-                               WHERE workspace_id = ?
-                                 AND status IN ('completed', 'failed', 'cancelled')
-                               ORDER BY started_at DESC LIMIT 100
-                           )""",
-                        (ws_id, ws_id),
+                        f"""DELETE FROM job_history
+                            WHERE workspace_id = ?
+                              AND status IN ('completed', 'failed', 'cancelled')
+                              AND NOT (
+                                type IN ({probe_type_placeholders})
+                                AND json_extract(config, '$.automatic') IS 1
+                              )
+                              AND id NOT IN (
+                                SELECT id FROM job_history
+                                WHERE workspace_id = ?
+                                  AND status IN ('completed', 'failed', 'cancelled')
+                                  AND NOT (
+                                    type IN ({probe_type_placeholders})
+                                    AND json_extract(config, '$.automatic') IS 1
+                                  )
+                                ORDER BY started_at DESC LIMIT ?
+                            )""",
+                        (
+                            ws_id, *probe_types, ws_id, *probe_types,
+                            _JOB_HISTORY_FOREGROUND_RETENTION,
+                        ),
+                    )
+                    # Background-probe bucket: only ``automatic=true``
+                    # runs of the probe types compete for this quota.
+                    conn.execute(
+                        f"""DELETE FROM job_history
+                            WHERE workspace_id = ?
+                              AND status IN ('completed', 'failed', 'cancelled')
+                              AND type IN ({probe_type_placeholders})
+                              AND json_extract(config, '$.automatic') IS 1
+                              AND id NOT IN (
+                                SELECT id FROM job_history
+                                WHERE workspace_id = ?
+                                  AND status IN ('completed', 'failed', 'cancelled')
+                                  AND type IN ({probe_type_placeholders})
+                                  AND json_extract(config, '$.automatic') IS 1
+                                ORDER BY started_at DESC LIMIT ?
+                            )""",
+                        (
+                            ws_id, *probe_types, ws_id, *probe_types,
+                            _JOB_HISTORY_BACKGROUND_PROBE_RETENTION,
+                        ),
                     )
                 conn.commit()
                 return

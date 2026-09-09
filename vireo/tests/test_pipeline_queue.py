@@ -1046,6 +1046,177 @@ def test_retention_does_not_prune_queued_row_under_load(tmp_path):
         db.close()
 
 
+def test_retention_splits_background_probes_from_foreground(tmp_path):
+    """Codex P2 regression: automatic navbar new-images walks and
+    missing-originals scans recur roughly every 30 minutes on an idle
+    workspace (~48 rows/day per probe). Under a single 100-row cap they
+    would evict every user-initiated import/pipeline row inside a day.
+
+    ``_persist_job`` now applies two independent per-workspace quotas:
+    a foreground quota for user-initiated jobs (and non-probe types) and
+    a smaller background-probe quota for probe rows marked
+    ``config.automatic = True``. Probe overflow must not touch the
+    foreground bucket.
+    """
+    import json
+    import sqlite3
+
+    from jobs import (
+        _JOB_HISTORY_BACKGROUND_PROBE_RETENTION,
+        _JOB_HISTORY_FOREGROUND_RETENTION,
+    )
+
+    runner, db = _make_runner_with_db(tmp_path)
+    try:
+        ws = db._active_workspace_id
+        db_path = str(tmp_path / "test.db")
+
+        # Seed a modest set of user-initiated foreground rows well below
+        # the foreground cap. These represent pipeline/import history the
+        # user cares about — none must be pruned by probe overflow.
+        conn = sqlite3.connect(db_path)
+        try:
+            for i in range(30):
+                conn.execute(
+                    "INSERT OR REPLACE INTO job_history "
+                    "(id, type, status, started_at, finished_at, duration, "
+                    " error_count, config, workspace_id) "
+                    "VALUES (?, 'pipeline', 'completed', ?, ?, 1.0, 0, ?, ?)",
+                    (
+                        f"pipeline-user-{i:03d}",
+                        f"2020-01-01T00:00:{i:02d}",
+                        f"2020-01-01T00:00:{i:02d}",
+                        json.dumps({"whatever": True}),
+                        ws,
+                    ),
+                )
+
+            # Seed more automatic probe rows than the probe quota so the
+            # newest DELETE actually prunes some. Timestamps live in the
+            # far future so ORDER BY started_at DESC is unambiguous.
+            probe_over = _JOB_HISTORY_BACKGROUND_PROBE_RETENTION + 15
+            for i in range(probe_over):
+                conn.execute(
+                    "INSERT OR REPLACE INTO job_history "
+                    "(id, type, status, started_at, finished_at, duration, "
+                    " error_count, config, workspace_id) "
+                    "VALUES (?, 'new_images_walk', 'completed', ?, ?, 0.5, 0, ?, ?)",
+                    (
+                        f"probe-{i:03d}",
+                        f"2099-01-01T00:{i:02d}:00",
+                        f"2099-01-01T00:{i:02d}:00",
+                        json.dumps({"automatic": True, "workspace_name": "x"}),
+                        ws,
+                    ),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+
+        # Trigger _persist_job's retention by completing one job through
+        # the runner (non-pipeline types persist immediately on finish).
+        trigger_id = runner.start(
+            "scan", lambda job: None, workspace_id=ws,
+        )
+        wait_for_job_via_runner(runner, trigger_id)
+
+        # Foreground user rows survive intact — none evicted by probe churn.
+        user_rows = db.conn.execute(
+            "SELECT id FROM job_history "
+            "WHERE workspace_id = ? AND id LIKE 'pipeline-user-%'",
+            (ws,),
+        ).fetchall()
+        assert len(user_rows) == 30, (
+            f"foreground user history was evicted by probe overflow: "
+            f"got {len(user_rows)}, expected 30"
+        )
+
+        # Probe bucket capped at its own quota.
+        probe_rows = db.conn.execute(
+            "SELECT id FROM job_history "
+            "WHERE workspace_id = ? AND type = 'new_images_walk'",
+            (ws,),
+        ).fetchall()
+        assert len(probe_rows) == _JOB_HISTORY_BACKGROUND_PROBE_RETENTION, (
+            f"probe bucket must cap at {_JOB_HISTORY_BACKGROUND_PROBE_RETENTION}, "
+            f"got {len(probe_rows)}"
+        )
+
+        # Foreground cap is still 100 — this loop confirms nothing about the
+        # split broke the pre-existing foreground protection.
+        assert _JOB_HISTORY_FOREGROUND_RETENTION == 100
+    finally:
+        db.close()
+
+
+def test_retention_treats_manual_probe_runs_as_foreground(tmp_path):
+    """A user-initiated snapshot POST fires the same ``new_images_walk``
+    job type as the automatic navbar poll, but carries
+    ``config.automatic = False``. The retention split must key on the
+    marker, not the type — otherwise a click-triggered walk would be
+    pruned as a background probe even though it is exactly the user
+    action that surfaced the banner.
+    """
+    import json
+    import sqlite3
+
+    from jobs import _JOB_HISTORY_BACKGROUND_PROBE_RETENTION
+
+    runner, db = _make_runner_with_db(tmp_path)
+    try:
+        ws = db._active_workspace_id
+        db_path = str(tmp_path / "test.db")
+
+        conn = sqlite3.connect(db_path)
+        try:
+            # One click-triggered walk (automatic=False) — must survive.
+            conn.execute(
+                "INSERT OR REPLACE INTO job_history "
+                "(id, type, status, started_at, finished_at, duration, "
+                " error_count, config, workspace_id) "
+                "VALUES (?, 'new_images_walk', 'completed', ?, ?, 0.5, 0, ?, ?)",
+                (
+                    "walk-manual",
+                    "2020-01-01T00:00:00",
+                    "2020-01-01T00:00:00",
+                    json.dumps({"automatic": False, "workspace_name": "x"}),
+                    ws,
+                ),
+            )
+            # Enough automatic probe rows to push the probe bucket over its cap.
+            for i in range(_JOB_HISTORY_BACKGROUND_PROBE_RETENTION + 5):
+                conn.execute(
+                    "INSERT OR REPLACE INTO job_history "
+                    "(id, type, status, started_at, finished_at, duration, "
+                    " error_count, config, workspace_id) "
+                    "VALUES (?, 'new_images_walk', 'completed', ?, ?, 0.5, 0, ?, ?)",
+                    (
+                        f"walk-auto-{i:03d}",
+                        f"2099-01-01T00:{i:02d}:00",
+                        f"2099-01-01T00:{i:02d}:00",
+                        json.dumps({"automatic": True, "workspace_name": "x"}),
+                        ws,
+                    ),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+
+        trigger_id = runner.start(
+            "scan", lambda job: None, workspace_id=ws,
+        )
+        wait_for_job_via_runner(runner, trigger_id)
+
+        row = db.conn.execute(
+            "SELECT id FROM job_history WHERE id = 'walk-manual'"
+        ).fetchone()
+        assert row is not None, (
+            "manual (automatic=False) walk was pruned as a background probe"
+        )
+    finally:
+        db.close()
+
+
 def test_get_history_excludes_queued_rows(tmp_path):
     """Codex P2 regression: queued pipeline rows live in job_history
     immediately on enqueue, but they're LIVE state, not history. The

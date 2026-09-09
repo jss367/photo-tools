@@ -22,6 +22,7 @@ MAX_DETAIL_ITEMS = 10
 _SKIPPED_KEYS = {
     "ok", "summary", "photo_ids", "failed_photo_ids", "stages", "duration",
     "collection_id", "workspace_id", "mode", "cancelled", "root_folder_id",
+    "interrupted", "last_progress_at", "checkpoint_at",
 }
 
 
@@ -562,10 +563,11 @@ def describe_result(job_type: str, result: Any, config: dict | None = None) -> d
     payload = {k: v for k, v in result.items() if k != "error"}
     if isinstance(explicit, str) and explicit.strip():
         summary, details = explicit.strip(), []
-    elif not payload:
-        # ``{"error": ...}`` alone: nothing happened worth describing, and
-        # running a describer over an empty dict would invent "0 photos
-        # classified" or "Download complete" next to the failure.
+    elif error_text and not any(k not in _SKIPPED_KEYS for k in payload):
+        # ``{"error": ...}`` alone (or only bookkeeping such as the
+        # startup sweep's ``interrupted`` stamp): nothing happened worth
+        # describing, and running a describer over it would invent "0
+        # photos classified" or "Download complete" next to the failure.
         summary, details = "", []
     else:
         describer = _DESCRIBERS.get(job_type)

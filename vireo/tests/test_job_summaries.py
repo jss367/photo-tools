@@ -246,6 +246,8 @@ def test_legacy_history_summaries_are_recomputed(tmp_path):
          "142 folders", "{}"),
         ("authored", "move-folder", '{"moved": 0, "summary": "Move failed — rsync timed out"}',
          '[]', "Move failed — rsync timed out", "{}"),
+        ("interrupted", "scan", '{"error": "Interrupted by Vireo restart", "interrupted": true, "last_progress_at": "2026-01-01T00:03:00"}',
+         '[]', "Interrupted by Vireo restart at 1,234 of 5,000", "{}"),
     ]
     for i, (jid, jtype, result, tree, summary, config) in enumerate(rows):
         db.conn.execute(
@@ -262,6 +264,8 @@ def test_legacy_history_summaries_are_recomputed(tmp_path):
     assert by_id["legacy"]["summary"] == "28 photos removed from Vireo, 28 files moved to Trash"
     assert by_id["steps"]["summary"] == "142 folders"
     assert by_id["authored"]["summary"] == "Move failed — rsync timed out"
+    assert by_id["interrupted"]["summary"] == "Interrupted by Vireo restart at 1,234 of 5,000"
+    assert by_id["interrupted"]["result_details"] == []
 
 
 def test_runner_history_and_snapshot_carry_prose(tmp_path):

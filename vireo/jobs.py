@@ -38,6 +38,23 @@ _NO_SLEEP_ASSERTION_JOB_TYPES = frozenset({
 _JOB_RETENTION_SECS = 3600  # 1 hour
 
 _PROMOTION_RETRY_DELAY_SECS = 0.1
+# How often live jobs checkpoint their step tree and progress into
+# job_history. A crash or kill (the desktop app quits Flask without a
+# graceful shutdown) never reaches _persist_job, so without checkpoints
+# the startup sweep can only say "interrupted" — not what got done.
+CHECKPOINT_INTERVAL_SECS = 2.0
+INTERRUPTED_BY_RESTART = "Interrupted by Vireo restart"
+_LIVE_STATUSES = ("running", "pausing", "paused")
+
+
+def _load_json(blob):
+    """Decode a job_history JSON column, tolerating NULL and junk."""
+    if not blob or not isinstance(blob, str):
+        return None
+    try:
+        return json.loads(blob)
+    except (json.JSONDecodeError, TypeError):
+        return None
 
 
 class _TrackedJobThread(threading.Thread):
@@ -112,6 +129,12 @@ class JobRunner:
         # millisecond don't collide on the PRIMARY KEY.
         self._enqueue_counter = 0
         self._promotion_retry_scheduled = False
+        # Periodic checkpointing of live jobs into job_history. Started
+        # lazily by the first persisted job and exits on its own once no
+        # persisted job is live, so idle runners (and the thousands the
+        # test suite creates) own no thread.
+        self._checkpoint_thread = None
+        self._checkpoint_wakeup = threading.Event()
         # Worker ownership is explicit.  Daemon threads alone are not a
         # lifecycle: short-lived create_app() callers (especially tests) must
         # be able to cancel and join their work before tearing down databases
@@ -186,6 +209,12 @@ class JobRunner:
                     self._pause_requested.discard(job_id)
             # A paused worker must wake before it can observe cancellation.
             self._pause_condition.notify_all()
+            checkpoint_thread = self._checkpoint_thread
+        # The checkpoint thread exits on its next wake once it sees
+        # _shutting_down; wake it now so it doesn't hold the deadline.
+        self._checkpoint_wakeup.set()
+        if checkpoint_thread is not None and checkpoint_thread.is_alive():
+            checkpoint_thread.join(timeout=max(0.0, deadline - time.monotonic()))
 
         # Queued jobs have persisted state to transition as well as in-memory
         # contexts to remove. Do that outside the runner lock, bounding each
@@ -273,6 +302,9 @@ class JobRunner:
         for column, definition in (
             ("resource_wait_seconds", "REAL DEFAULT 0"),
             ("resource_wait_count", "INTEGER DEFAULT 0"),
+            # Last checkpointed job["progress"] (plus checkpoint_at) for
+            # live rows; the startup sweep folds it into interrupted rows.
+            ("progress", "TEXT"),
         ):
             try:
                 db.conn.execute(f"SELECT {column} FROM job_history LIMIT 0")
@@ -292,27 +324,249 @@ class JobRunner:
         mark them ``'failed'`` too so they don't linger forever waiting
         for a slot.
 
+        Running rows carry whatever the checkpoint thread last wrote
+        (step tree, progress, partial result). Keep all of it: the user
+        wants to know what the job got done before the restart, not just
+        that it was interrupted. Steps still marked running are flipped
+        to failed with the interruption as their error; completed steps
+        keep their summaries; the checkpoint time becomes ``finished_at``
+        (the last moment the job was known to be alive) and is exposed as
+        ``result.last_progress_at`` so the UI can say when progress was
+        last recorded — or that none was.
+
         Future PR: rebuild work closures from the ``config`` blob on
-        startup so queued runs survive restart. For this PR we just
-        clear the rot.
+        startup so queued runs survive restart.
         """
         now = datetime.now().isoformat()
-        msg = "Interrupted by Vireo restart"
-        for status in ("running", "queued"):
-            rows = db.conn.execute(
-                "SELECT id FROM job_history WHERE status = ?", (status,),
-            ).fetchall()
-            if not rows:
-                continue
-            payload = json.dumps({"error": msg})
-            for row in rows:
-                db.conn.execute(
-                    "UPDATE job_history "
-                    "SET status='failed', finished_at=?, result=?, error_count=1 "
-                    "WHERE id = ?",
-                    (now, payload, row["id"]),
-                )
+        msg = INTERRUPTED_BY_RESTART
+        rows = db.conn.execute(
+            "SELECT id, status, result, tree, progress, error_count "
+            "FROM job_history WHERE status IN ('running', 'queued')",
+        ).fetchall()
+        for row in rows:
+            was_queued = row["status"] == "queued"
+            result = _load_json(row["result"])
+            if not isinstance(result, dict):
+                result = {}
+            tree = _load_json(row["tree"])
+            if not isinstance(tree, list):
+                tree = []
+            progress = _load_json(row["progress"])
+            if not isinstance(progress, dict):
+                progress = {}
+            last_progress_at = progress.pop("checkpoint_at", None)
+            for step in tree:
+                if isinstance(step, dict) and step.get("status") == "running":
+                    step["status"] = "failed"
+                    step["error"] = step.get("error") or msg
+                    step["error_count"] = max(
+                        int(step.get("error_count") or 0), 1,
+                    )
+            result.update({
+                "error": msg,
+                "interrupted": True,
+                "last_progress_at": last_progress_at,
+            })
+            db.conn.execute(
+                "UPDATE job_history "
+                "SET status='failed', finished_at=?, result=?, error_count=?, "
+                "    tree=?, summary=?, progress=? "
+                "WHERE id = ?",
+                (
+                    last_progress_at or now,
+                    json.dumps(result, default=str),
+                    int(row["error_count"] or 0) + 1,
+                    json.dumps(tree) if tree else row["tree"],
+                    self._interrupted_summary(msg, was_queued, tree, progress),
+                    json.dumps(progress, default=str) if progress else None,
+                    row["id"],
+                ),
+            )
         db.conn.commit()
+
+    @staticmethod
+    def _interrupted_summary(msg, was_queued, tree, progress):
+        """One-line history summary for a job the restart cut short."""
+        if was_queued:
+            return f"{msg} before it started"
+        if tree:
+            done = sum(
+                1 for s in tree
+                if isinstance(s, dict) and s.get("status") == "completed"
+            )
+            noun = "step" if len(tree) == 1 else "steps"
+            return f"{msg} after {done} of {len(tree)} {noun}"
+        current = progress.get("current") or 0
+        total = progress.get("total") or 0
+        if isinstance(current, (int, float)) and isinstance(total, (int, float)):
+            if total:
+                return f"{msg} at {int(current):,} of {int(total):,}"
+            if current:
+                return f"{msg} at {int(current):,}"
+        return msg
+
+    # ------------------------------------------------------------------
+    # Live checkpoints
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _insert_running_row(conn, job):
+        """Insert the job's history row as running, if it has none yet.
+
+        ``OR IGNORE`` so a pipeline promoted from ``queued`` (whose row
+        already exists) and a job whose final row already landed are
+        both left alone.
+        """
+        conn.execute(
+            "INSERT OR IGNORE INTO job_history "
+            "(id, type, status, started_at, config, workspace_id, error_count) "
+            "VALUES (?, ?, 'running', ?, ?, ?, 0)",
+            (
+                job["id"],
+                job["type"],
+                job["started_at"],
+                json.dumps(job.get("config") or {}, default=str),
+                job.get("workspace_id"),
+            ),
+        )
+
+    def _record_job_started(self, job):
+        """Write the running row before any work happens.
+
+        Bookkeeping must never break the job: lock contention is logged
+        and skipped (the checkpoint thread retries the insert on its next
+        tick).
+        """
+        import sqlite3
+
+        conn = None
+        try:
+            conn = sqlite3.connect(self._db_path, timeout=5)
+            self._insert_running_row(conn, job)
+            conn.commit()
+        except sqlite3.Error as exc:
+            log.warning(
+                "Could not record start of job %s in history: %s",
+                job["id"], exc,
+            )
+        finally:
+            if conn is not None:
+                conn.close()
+
+    def _live_persisted_jobs_locked(self):
+        """Jobs worth checkpointing. Must be called with self._lock held."""
+        return [
+            j for j in self._jobs.values()
+            if j["status"] in _LIVE_STATUSES
+            and not j.get("ephemeral")
+            and not j.get("_persisted")
+        ]
+
+    def _ensure_checkpoint_thread(self):
+        """Start the checkpoint thread unless one is already running."""
+        if not self._db_path:
+            return
+        with self._lock:
+            if self._shutting_down:
+                return
+            thread = self._checkpoint_thread
+            if thread is not None and thread.is_alive():
+                return
+            self._checkpoint_wakeup.clear()
+            thread = threading.Thread(
+                target=self._checkpoint_loop,
+                daemon=True,
+                name="vireo-job-checkpoints",
+            )
+            self._checkpoint_thread = thread
+            thread.start()
+
+    def _checkpoint_loop(self):
+        while True:
+            self._checkpoint_wakeup.wait(CHECKPOINT_INTERVAL_SECS)
+            with self._lock:
+                if self._shutting_down or not self._live_persisted_jobs_locked():
+                    # Nothing left to checkpoint; the next persisted job
+                    # start spawns a fresh thread.
+                    self._checkpoint_thread = None
+                    return
+            try:
+                self.checkpoint_live_jobs()
+            except Exception:
+                log.exception("Job checkpoint failed")
+
+    def checkpoint_live_jobs(self):
+        """Persist a snapshot of every live, non-ephemeral job.
+
+        Writes the step tree, progress, partial result and elapsed time
+        onto the job's ``running`` history row so a crash leaves a record
+        of what the job got done. Returns the number of rows updated.
+        Public so tests (and callers that just did something worth
+        recording) can checkpoint deterministically instead of waiting
+        for the timer.
+        """
+        if not self._db_path:
+            return 0
+        with self._lock:
+            snapshots = [
+                self._snapshot_job(j)
+                for j in self._live_persisted_jobs_locked()
+            ]
+        if not snapshots:
+            return 0
+        return self._write_checkpoints(snapshots)
+
+    def _write_checkpoints(self, snapshots):
+        """Write checkpoint snapshots in one transaction.
+
+        The UPDATE is guarded by ``status='running'`` so a checkpoint that
+        races the final ``_persist_job`` write can never revert a terminal
+        row back to running. Lock contention (a worker mid-transaction on
+        its own connection) is skipped, not waited out: the next tick
+        tries again.
+        """
+        import sqlite3
+
+        now_iso = datetime.now().isoformat()
+        now = time.time()
+        conn = None
+        try:
+            conn = sqlite3.connect(self._db_path, timeout=5)
+            written = 0
+            for job in snapshots:
+                progress = dict(job.get("progress") or {})
+                progress["checkpoint_at"] = now_iso
+                elapsed = now - (job.get("_start_time") or now)
+                result = job.get("result")
+                self._insert_running_row(conn, job)
+                cur = conn.execute(
+                    "UPDATE job_history "
+                    "SET duration=?, result=?, error_count=?, tree=?, "
+                    "    summary=?, progress=?, resource_wait_seconds=?, "
+                    "    resource_wait_count=? "
+                    "WHERE id = ? AND status = 'running'",
+                    (
+                        round(elapsed, 1),
+                        json.dumps(result, default=str)
+                        if result is not None else None,
+                        len(job.get("errors") or []),
+                        json.dumps(job.get("steps") or [], default=str),
+                        self._build_summary(job),
+                        json.dumps(progress, default=str),
+                        job.get("resource_wait_seconds", 0.0),
+                        job.get("resource_wait_count", 0),
+                        job["id"],
+                    ),
+                )
+                written += cur.rowcount
+            conn.commit()
+            return written
+        except sqlite3.OperationalError as exc:
+            log.debug("Skipped job checkpoint: %s", exc)
+            return 0
+        finally:
+            if conn is not None:
+                conn.close()
 
     def enqueue_pipeline(self, work_fn, config=None, workspace_id=None,
                          runtime_warning=None):
@@ -815,6 +1069,11 @@ class JobRunner:
 
     def _run_job(self, job, work_fn):
         start_time = time.time()
+        if self._db_path and not job.get("ephemeral"):
+            # Row exists from the first moment so a kill at any point
+            # leaves a history entry; checkpoints then keep it current.
+            self._record_job_started(job)
+            self._ensure_checkpoint_thread()
         holds_sleep_assertion = self._blocks_sleep(job)
         if holds_sleep_assertion:
             # Acquired before the work starts and released in the outer
@@ -1162,7 +1421,12 @@ class JobRunner:
         from_steps = any(
             isinstance(s, dict) and s.get("summary") for s in steps
         )
-        authored = isinstance(result, dict) and bool(result.get("summary"))
+        # Interrupted rows get a summary from the startup sweep that says
+        # how far the job got; that beats the plain error text the
+        # describer would produce, so treat it as authored too.
+        authored = isinstance(result, dict) and bool(
+            result.get("summary") or result.get("interrupted")
+        )
         if described["summary"] and not (from_steps or authored) or not job.get("summary"):
             job["summary"] = described["summary"]
         job["result_details"] = described["details"]
@@ -1231,7 +1495,7 @@ class JobRunner:
             result = []
             for r in rows:
                 d = dict(r)
-                for field in ("tree", "result", "config"):
+                for field in ("tree", "result", "config", "progress"):
                     if d.get(field) and isinstance(d[field], str):
                         try:
                             d[field] = json.loads(d[field])

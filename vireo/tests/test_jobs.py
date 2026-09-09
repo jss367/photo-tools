@@ -500,16 +500,13 @@ def test_job_result_ok_false_persists_failed_with_error_count(tmp_path):
 
     job_id = runner.start('move-folder', work)
 
-    row = None
-    deadline = time.monotonic() + 5.0
-    while time.monotonic() < deadline:
-        row = db.conn.execute(
-            "SELECT status, error_count, summary FROM job_history WHERE id = ?",
-            (job_id,),
-        ).fetchone()
-        if row is not None:
-            break
-        time.sleep(0.05)
+    # The row exists as ``running`` from job start; wait for the final
+    # write rather than for the row to appear.
+    wait_for_job_via_runner(runner, job_id, wait_for_history=True)
+    row = db.conn.execute(
+        "SELECT status, error_count, summary FROM job_history WHERE id = ?",
+        (job_id,),
+    ).fetchone()
     assert row is not None
     assert row["status"] == "failed"
     assert row["error_count"] == 2, f"expected error_count=2, got {row['error_count']}"
@@ -584,15 +581,12 @@ def test_failed_job_history_falls_back_when_no_structured_result(tmp_path):
 
     job_id = runner.start('test', failing_work)
 
-    row = None
-    deadline = time.monotonic() + 5.0
-    while time.monotonic() < deadline:
-        row = db.conn.execute(
-            "SELECT result FROM job_history WHERE id = ?", (job_id,)
-        ).fetchone()
-        if row is not None:
-            break
-        time.sleep(0.05)
+    # The row exists as ``running`` from job start; wait for the final
+    # write rather than for the row to appear.
+    wait_for_job_via_runner(runner, job_id, wait_for_history=True)
+    row = db.conn.execute(
+        "SELECT result FROM job_history WHERE id = ?", (job_id,)
+    ).fetchone()
     assert row is not None
     stored = _json.loads(row["result"])
     assert stored == {"error": "boom"}
@@ -1223,3 +1217,268 @@ def test_push_event_mirrors_progress_onto_job(tmp_path):
     assert "steps" not in j["progress"]
 
     gate.set()
+
+
+def _history_row(db, job_id):
+    return db.conn.execute(
+        "SELECT * FROM job_history WHERE id = ?", (job_id,),
+    ).fetchone()
+
+
+def test_running_job_has_history_row_and_checkpoint_records_work(tmp_path):
+    """A live job gets a ``running`` row the moment it starts, and
+    ``checkpoint_live_jobs`` writes its step tree, progress and elapsed
+    time onto that row. This is what the startup sweep has to work with
+    after a crash, so it must reflect what the job actually got done.
+    """
+    import json
+
+    from db import Database
+    from jobs import JobRunner
+
+    db = Database(str(tmp_path / "test.db"))
+    runner = JobRunner(db=db)
+    started = threading.Event()
+    release = threading.Event()
+
+    def work(job):
+        runner.set_steps(job["id"], [
+            {"id": "scan", "label": "Scan"},
+            {"id": "classify", "label": "Classify"},
+        ])
+        runner.update_step(job["id"], "scan", status="running")
+        runner.update_step(
+            job["id"], "scan", status="completed", summary="Scanned 120 files",
+        )
+        runner.update_step(
+            job["id"], "classify", status="running",
+            progress={"current": 40, "total": 120},
+        )
+        runner.push_event(job["id"], "progress", {
+            "current": 40, "total": 120, "current_file": "IMG_0040.jpg",
+        })
+        started.set()
+        release.wait(timeout=5)
+        return {"classified": 120}
+
+    job_id = runner.start("pipeline", work, config={"root": "/photos"})
+    assert started.wait(timeout=5)
+
+    row = _history_row(db, job_id)
+    assert row is not None and row["status"] == "running", (
+        "row must exist from job start, not only at completion"
+    )
+
+    assert runner.checkpoint_live_jobs() == 1
+    row = _history_row(db, job_id)
+    assert row["status"] == "running"
+    tree = json.loads(row["tree"])
+    assert [s["status"] for s in tree] == ["completed", "running"]
+    assert tree[0]["summary"] == "Scanned 120 files"
+    assert tree[1]["progress"] == {"current": 40, "total": 120}
+    progress = json.loads(row["progress"])
+    assert progress["current"] == 40 and progress["total"] == 120
+    assert progress["current_file"] == "IMG_0040.jpg"
+    assert progress["checkpoint_at"]
+    assert row["duration"] is not None and row["duration"] >= 0
+    assert row["summary"] == "Scanned 120 files"
+
+    # A checkpointed-but-live row must not leak into history listings.
+    assert all(h["id"] != job_id for h in runner.get_history(db, limit=10))
+
+    release.set()
+    wait_for_job_via_runner(runner, job_id, wait_for_history=True)
+    row = _history_row(db, job_id)
+    assert row["status"] == "completed"
+    assert json.loads(row["result"]) == {"classified": 120}
+    assert row["progress"] is None, "final persist replaces the checkpoint row"
+
+    # A late checkpoint racing the final write must not resurrect the row.
+    snapshot = runner.get(job_id)
+    snapshot["status"] = "running"
+    assert runner._write_checkpoints([snapshot]) == 0
+    assert _history_row(db, job_id)["status"] == "completed"
+    assert runner.shutdown(timeout=5)
+
+
+def test_ephemeral_job_is_never_checkpointed(tmp_path):
+    from db import Database
+    from jobs import JobRunner
+
+    db = Database(str(tmp_path / "test.db"))
+    runner = JobRunner(db=db)
+    release = threading.Event()
+    started = threading.Event()
+
+    def work(job):
+        started.set()
+        release.wait(timeout=5)
+        return {}
+
+    job_id = runner.start("walk", work, ephemeral=True)
+    assert started.wait(timeout=5)
+    assert runner.checkpoint_live_jobs() == 0
+    assert _history_row(db, job_id) is None
+    release.set()
+    wait_for_job_via_runner(runner, job_id, wait_for_history=True)
+    assert _history_row(db, job_id) is None
+
+
+def test_checkpoint_thread_runs_on_timer_and_exits_when_idle(tmp_path, monkeypatch):
+    import json
+
+    import jobs as jobs_module
+    from db import Database
+    from jobs import JobRunner
+
+    monkeypatch.setattr(jobs_module, "CHECKPOINT_INTERVAL_SECS", 0.05)
+    db = Database(str(tmp_path / "test.db"))
+    runner = JobRunner(db=db)
+    assert runner._checkpoint_thread is None
+    release = threading.Event()
+
+    def work(job):
+        runner.push_event(job["id"], "progress", {"current": 7, "total": 9})
+        release.wait(timeout=5)
+        return {}
+
+    job_id = runner.start("scan", work)
+    deadline = time.time() + 5
+    while time.time() < deadline:
+        row = _history_row(db, job_id)
+        # The first tick can land before the worker pushed progress;
+        # keep polling until a checkpoint carries the pushed count.
+        if row is not None and row["progress"] and (
+            json.loads(row["progress"]).get("current") == 7
+        ):
+            break
+        time.sleep(0.02)
+    else:
+        pytest.fail("checkpoint thread never wrote progress")
+    thread = runner._checkpoint_thread
+    assert thread is not None and thread.is_alive()
+
+    release.set()
+    wait_for_job_via_runner(runner, job_id, wait_for_history=True)
+    deadline = time.time() + 5
+    while runner._checkpoint_thread is not None and time.time() < deadline:
+        time.sleep(0.02)
+    assert runner._checkpoint_thread is None, (
+        "checkpoint thread should exit once no persisted job is live"
+    )
+
+
+def test_startup_sweep_keeps_checkpointed_work_on_interrupted_rows(tmp_path):
+    """Rows the restart orphaned must say what got done, not just that
+    they were interrupted: completed steps keep their summaries, the
+    running step is failed with the interruption as its error, the
+    checkpoint time becomes finished_at / result.last_progress_at, and
+    the one-line summary counts the finished work.
+    """
+    import json
+
+    from db import Database
+    from jobs import INTERRUPTED_BY_RESTART, JobRunner
+
+    db_path = str(tmp_path / "test.db")
+    first_db = Database(db_path)
+    JobRunner(db=first_db)  # ensures schema
+    tree = [
+        {"id": "scan", "label": "Scan", "status": "completed",
+         "summary": "Scanned 120 files", "error": None, "error_count": 0,
+         "progress": {"current": 120, "total": 120}},
+        {"id": "classify", "label": "Classify", "status": "running",
+         "summary": None, "error": None, "error_count": 0,
+         "progress": {"current": 40, "total": 120}},
+        {"id": "embed", "label": "Embed", "status": "pending",
+         "summary": None, "error": None, "error_count": 0,
+         "progress": {"current": 0, "total": 0}},
+    ]
+    first_db.conn.execute(
+        "INSERT INTO job_history (id, type, status, started_at, duration, "
+        " error_count, tree, progress, result, workspace_id) "
+        "VALUES ('pipeline-crashed', 'pipeline', 'running', "
+        " '2026-09-08T10:00:00', 95.5, 0, ?, ?, NULL, 1)",
+        (
+            json.dumps(tree),
+            json.dumps({
+                "current": 40, "total": 120, "current_file": "IMG_0040.jpg",
+                "checkpoint_at": "2026-09-08T10:01:35",
+            }),
+        ),
+    )
+    first_db.conn.execute(
+        "INSERT INTO job_history (id, type, status, started_at, error_count, "
+        " progress, workspace_id) "
+        "VALUES ('scan-crashed', 'scan', 'running', '2026-09-08T10:00:00', 0, "
+        " ?, 1)",
+        (json.dumps({"current": 1234, "total": 5000,
+                     "checkpoint_at": "2026-09-08T10:02:00"}),),
+    )
+    first_db.conn.execute(
+        "INSERT INTO job_history (id, type, status, started_at, error_count, "
+        " workspace_id) "
+        "VALUES ('scan-blind', 'scan', 'running', '2026-09-08T10:00:00', 0, 1)"
+    )
+    first_db.conn.execute(
+        "INSERT INTO job_history (id, type, status, started_at, error_count, "
+        " workspace_id) "
+        "VALUES ('pipeline-queued', 'pipeline', 'queued', "
+        " '2026-09-08T10:00:00', 0, 1)"
+    )
+    first_db.conn.commit()
+    first_db.close()
+
+    db = Database(db_path)
+    try:
+        runner = JobRunner(db=db)
+        rows = {
+            r["id"]: dict(r) for r in db.conn.execute(
+                "SELECT * FROM job_history"
+            )
+        }
+        assert {r["status"] for r in rows.values()} == {"failed"}
+
+        crashed = rows["pipeline-crashed"]
+        result = json.loads(crashed["result"])
+        assert result["error"] == INTERRUPTED_BY_RESTART
+        assert result["interrupted"] is True
+        assert result["last_progress_at"] == "2026-09-08T10:01:35"
+        assert crashed["finished_at"] == "2026-09-08T10:01:35"
+        assert crashed["duration"] == 95.5
+        assert crashed["error_count"] == 1
+        swept_tree = json.loads(crashed["tree"])
+        assert swept_tree[0]["status"] == "completed"
+        assert swept_tree[0]["summary"] == "Scanned 120 files"
+        assert swept_tree[1]["status"] == "failed"
+        assert swept_tree[1]["error"] == INTERRUPTED_BY_RESTART
+        assert swept_tree[1]["progress"] == {"current": 40, "total": 120}
+        assert swept_tree[2]["status"] == "pending"
+        assert crashed["summary"] == (
+            f"{INTERRUPTED_BY_RESTART} after 1 of 3 steps"
+        )
+        progress = json.loads(crashed["progress"])
+        assert progress["current"] == 40
+        assert "checkpoint_at" not in progress
+
+        scan = rows["scan-crashed"]
+        assert scan["summary"] == f"{INTERRUPTED_BY_RESTART} at 1,234 of 5,000"
+        assert scan["finished_at"] == "2026-09-08T10:02:00"
+
+        blind = rows["scan-blind"]
+        assert blind["summary"] == INTERRUPTED_BY_RESTART
+        assert json.loads(blind["result"])["last_progress_at"] is None
+        assert blind["finished_at"] > "2026-09-08T10:02:00"
+
+        queued = rows["pipeline-queued"]
+        assert queued["summary"] == f"{INTERRUPTED_BY_RESTART} before it started"
+        assert queued["tree"] is None
+
+        # The history API hands the parsed progress and tree to the page.
+        db.set_active_workspace(1)
+        history = {h["id"]: h for h in runner.get_history(db, limit=10)}
+        assert history["pipeline-crashed"]["progress"]["current"] == 40
+        assert history["pipeline-crashed"]["tree"][0]["status"] == "completed"
+        assert history["pipeline-crashed"]["result"]["interrupted"] is True
+    finally:
+        db.close()

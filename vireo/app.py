@@ -15368,9 +15368,11 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 return True
         return False
 
-    def _new_images_deferred_reason():
+    def _new_images_deferred_reason(*, manual=False):
         if _new_images_walk_blocked_by_move():
             return "storage_move_active"
+        if manual:
+            return None
         for job in app._job_runner.list_jobs():
             if (job.get("status") in ("running", "pausing", "paused", "queued")
                     and job.get("type") in _MISSING_ORIGINALS_HEAVY_JOB_TYPES - {"new_images_walk"}):
@@ -15420,7 +15422,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 "error": recent_err,
             })
 
-        deferred_reason = None if manual_recheck else _new_images_deferred_reason()
+        deferred_reason = _new_images_deferred_reason(manual=manual_recheck)
         if deferred_reason and not cache.has_inflight(db_path, ws_id):
             return jsonify({
                 "workspace_id": ws_id,
@@ -15440,7 +15442,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         compute, on_spawn, spawned = _new_images_walk_fns(db, ws_id)
         event = cache.kickoff_compute(
             db_path, ws_id, compute, on_spawn=on_spawn,
-            can_start=None if manual_recheck else (lambda: _new_images_deferred_reason() is None),
+            can_start=lambda: _new_images_deferred_reason(manual=manual_recheck) is None,
         )
         if spawned() and event.wait(timeout=_NEW_IMAGES_SYNC_WAIT_SECS):
             cached = cache.get(db_path, ws_id)
@@ -15547,7 +15549,10 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         # ``on_spawn`` registers the same recorded bottom-panel job the
         # navbar probe gets, so a click-triggered walk is just as visible.
         compute, on_spawn, spawned = _new_images_walk_fns(db, ws_id)
-        event = cache.kickoff_compute(db_path, ws_id, compute, on_spawn=on_spawn)
+        event = cache.kickoff_compute(
+            db_path, ws_id, compute, on_spawn=on_spawn,
+            can_start=lambda: _new_images_deferred_reason(manual=True) is None,
+        )
         if spawned() and event.wait(timeout=_NEW_IMAGES_SYNC_WAIT_SECS):
             cached = cache.get(db_path, ws_id)
             if cached is not None and cached.get("sample_complete"):

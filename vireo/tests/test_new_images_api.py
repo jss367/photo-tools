@@ -130,9 +130,9 @@ def test_api_new_images_returns_pending_when_walk_is_slow(app_and_db, monkeypatc
         release.set()
 
 
-def test_api_new_images_defers_walk_during_folder_move(app_and_db):
-    """The automatic navbar probe must not walk the NAS while rsync is moving
-    a folder on the same library."""
+@pytest.mark.parametrize("query", ["", "?manual_recheck=1"])
+def test_api_new_images_defers_walk_during_folder_move(app_and_db, query):
+    """Automatic and manual checks wait while rsync moves the library."""
     import threading
     import time
 
@@ -149,7 +149,7 @@ def test_api_new_images_defers_walk_during_folder_move(app_and_db):
     )
     client = app.test_client()
     try:
-        resp = client.get("/api/workspaces/active/new-images")
+        resp = client.get("/api/workspaces/active/new-images" + query)
         assert resp.status_code == 200
         data = resp.get_json()
         assert data["pending"] is True
@@ -1684,7 +1684,8 @@ def test_automatic_discovery_defers_to_processing_then_recovers(app_and_db, job_
     assert response.get("new_count") == 1 or response.get("pending")
 
 
-def test_manual_recheck_bypasses_foreground_job_deferral(app_and_db):
+@pytest.mark.parametrize("snapshot", [False, True])
+def test_manual_recheck_bypasses_foreground_job_deferral(app_and_db, snapshot):
     """A recheck triggered by the user's "Check again" click must bypass the
     foreground-job deferral. Without this, a click during a long pipeline
     job would leave the button stuck on "Checking..." for the rest of the
@@ -1706,14 +1707,16 @@ def test_manual_recheck_bypasses_foreground_job_deferral(app_and_db):
         deferred = client.get("/api/workspaces/active/new-images").get_json()
         assert deferred["deferred_reason"] == "foreground_job_active"
         # With manual_recheck=1 the deferral is bypassed and the walk runs.
-        url = "/api/workspaces/active/new-images?manual_recheck=1"
-        response = client.get(url).get_json()
+        url = ("/api/workspaces/active/new-images/snapshot" if snapshot
+               else "/api/workspaces/active/new-images?manual_recheck=1")
+        request_check = client.post if snapshot else client.get
+        response = request_check(url).get_json()
         deadline = time.monotonic() + 3
         while response.get("pending") and time.monotonic() < deadline:
             time.sleep(0.05)
-            response = client.get(url).get_json()
+            response = request_check(url).get_json()
         assert "deferred_reason" not in response
-        assert response.get("new_count") == 1
+        assert response.get("file_count" if snapshot else "new_count") == 1
     finally:
         release.set()
         deadline = time.monotonic() + 3

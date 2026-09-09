@@ -13491,7 +13491,11 @@ async function checkNewImages(options) {
     if (data && data.pending) {
       if (data.deferred_reason) {
         const stamp = document.getElementById('newImagesCheckedAt');
-        if (stamp) stamp.textContent = 'Check deferred until active processing finishes';
+        if (stamp) {
+          stamp.textContent = data.deferred_reason === 'storage_move_active'
+            ? 'Check deferred until the storage move finishes'
+            : 'Check deferred until active processing finishes';
+        }
       }
       _newImagesPendingTimer = setTimeout(checkNewImages, data.deferred_reason ? 15000 : 3000);
       return;

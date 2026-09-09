@@ -177,6 +177,31 @@ def test_capture_time_reports_skipped():
     assert out["details"] == ["Failed:", "a.NEF: locked"]
 
 
+def test_verify_hashes_reports_every_problem_count():
+    out = describe_result("verify-hashes", {
+        "checked": 100, "ok": 95, "baselined": 3, "modified": 0, "corrupt": 0,
+        "unreadable": 1, "missing": 1, "cancelled": False,
+    })
+    assert out["summary"] == "100 files checked: 95 unchanged, 3 newly baselined, 1 unreadable, 1 missing"
+    out = describe_result("verify-hashes", {
+        "checked": 10, "ok": 10, "baselined": 0, "modified": 0, "corrupt": 0,
+        "unreadable": 0, "missing": 0, "cancelled": True,
+    })
+    assert out["summary"] == "10 files checked before cancel: 10 unchanged"
+    out = describe_result("verify-hashes", {"checked": 0, "ok": 0, "cancelled": False})
+    assert out["summary"] == "0 files checked"
+
+
+def test_generic_orders_nonzero_counts_before_zero_ones():
+    out = describe_result("some-audit", {
+        "checked": 100, "ok": 95, "baselined": 0, "modified": 0, "corrupt": 0,
+        "unreadable": 1, "missing": 1,
+    })
+    assert out["summary"] == "Checked: 100, Ok: 95, Unreadable: 1, Missing: 1"
+    # A boolean ok is still treated as bookkeeping.
+    assert describe_result("x", {"ok": True, "count": 2})["summary"] == "Count: 2"
+
+
 def test_generic_hides_ids():
     out = describe_result("import-in-place", {"discovered": 3, "indexed": 3,
                                               "process_job_id": "pipeline-1"})

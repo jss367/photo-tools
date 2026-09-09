@@ -444,6 +444,30 @@ def _scan(result: dict, config: dict) -> tuple[str, list[str]]:
     return _n(_int(result, "photos_indexed"), "photo") + " indexed", []
 
 
+def _verify_hashes(result: dict, config: dict) -> tuple[str, list[str]]:
+    checked = _int(result, "checked")
+    summary = _n(checked, "file") + " checked"
+    if result.get("cancelled"):
+        summary += " before cancel"
+    parts = []
+    if _int(result, "ok"):
+        parts.append(f"{_int(result, 'ok'):,} unchanged")
+    if _int(result, "baselined"):
+        parts.append(f"{_int(result, 'baselined'):,} newly baselined")
+    problems = [
+        ("modified", "modified"), ("corrupt", "corrupt"),
+        ("unreadable", "unreadable"), ("missing", "missing"),
+    ]
+    for key, label in problems:
+        if _int(result, key):
+            parts.append(f"{_int(result, key):,} {label}")
+    if parts:
+        summary += ": " + ", ".join(parts)
+    elif checked:
+        summary += ", no problems found"
+    return summary, []
+
+
 def _sync(result: dict, config: dict) -> tuple[str, list[str]]:
     synced = _int(result, "synced")
     failed = _int(result, "failed")
@@ -512,15 +536,21 @@ _DESCRIBERS: dict[str, Callable[[dict, dict], tuple[str, list[str]]]] = {
     "precompute-embeddings": _precompute_embeddings,
     "scan": _scan,
     "sync": _sync,
+    "verify-hashes": _verify_hashes,
 }
 
 
 def _generic(result: dict, config: dict) -> tuple[str, list[str]]:
     """Spell out scalar fields; count list fields and list their entries."""
     parts = []
+    zero_parts = []
     details: list[str] = []
     for key, value in result.items():
-        if key in _SKIPPED_KEYS or key == "error":
+        if key == "error":
+            continue
+        if key == "ok" and not isinstance(value, bool):
+            pass  # a numeric "ok" is a count worth showing
+        elif key in _SKIPPED_KEYS:
             continue
         if key.endswith("_id") or key.endswith("_ids"):
             continue
@@ -537,7 +567,14 @@ def _generic(result: dict, config: dict) -> tuple[str, list[str]]:
             continue
         if value is None or value == "":
             continue
-        parts.append(f"{_humanize_key(key)}: {_format_scalar(value)}")
+        text = f"{_humanize_key(key)}: {_format_scalar(value)}"
+        # Zero counts go last so the cap below never hides a nonzero
+        # problem count behind a run of "Modified: 0, Corrupt: 0".
+        if isinstance(value, (int, float)) and not isinstance(value, bool) and value == 0:
+            zero_parts.append(text)
+        else:
+            parts.append(text)
+    parts += zero_parts
     if not parts and result.get("ok") is True:
         return "Completed", details
     return ", ".join(parts[:4]), details

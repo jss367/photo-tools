@@ -567,6 +567,8 @@
       elapsed = formatElapsed((Date.now() - new Date(job.started_at).getTime()) / 1000);
     } else if (job.duration != null) {
       elapsed = formatElapsed(job.duration);
+    } else if (job.result && job.result.interrupted && !job.result.last_progress_at) {
+      elapsed = 'unknown (no progress recorded before the restart)';
     } else if (job.started_at && job.finished_at) {
       elapsed = formatElapsed((new Date(job.finished_at).getTime() - new Date(job.started_at).getTime()) / 1000);
     }
@@ -666,6 +668,14 @@
       html += '<div class="job-pause-banner">' + esc(pauseReason) + '</div>';
     }
 
+    // Interrupted-by-restart banner. The startup sweep keeps whatever
+    // the checkpoint thread last recorded (step tree, progress) and
+    // stamps result.interrupted; say plainly what was recorded and when,
+    // instead of leaving the user with a bare error string.
+    if (!isLive && job.result && job.result.interrupted) {
+      html += '<div class="job-pause-banner">' + esc(interruptedText(job)) + '</div>';
+    }
+
     // Steps
     var steps = job.steps || job.tree || [];
     if (steps.length > 0) {
@@ -689,13 +699,21 @@
     } else if (!isLive) {
       // Fallback for completed/failed jobs without steps — show result/error
       html += '<div class="job-tree"><div style="padding:8px;font-size:13px;color:var(--text-muted);">';
-      if (job.error) {
-        html += '<div style="color:var(--danger);font-weight:500;">Error: ' + esc(job.error) + '</div>';
+      // History rows carry the failure in result.error (the persisted
+      // payload), not job.error; the old code fell through to a raw
+      // JSON dump of {"error": ...} for every step-less failed job.
+      var resultError = job.error || (job.result && job.result.error);
+      if (job.result && job.result.interrupted && resultError === job.result.error) {
+        resultError = null;  // the banner above already says it
       }
-      if (job.result) {
-        html += '<div>' + esc(typeof job.result === 'string' ? job.result : JSON.stringify(job.result)) + '</div>';
+      if (resultError) {
+        html += '<div style="color:var(--danger);font-weight:500;">Error: ' + esc(resultError) + '</div>';
       }
-      if (!job.error && !job.result) {
+      var resultLines = resultDetailLines(job.result);
+      resultLines.forEach(function(line) {
+        html += '<div>' + esc(line) + '</div>';
+      });
+      if (!resultError && resultLines.length === 0 && !(job.result && job.result.interrupted)) {
         html += '<div>No details available</div>';
       }
       html += '</div></div>';
@@ -703,6 +721,65 @@
 
     html += '</div>';
     return html;
+  }
+
+  // Plain-language account of a job the restart cut short: how far it
+  // got (steps finished, or the last recorded count) and when that was
+  // last recorded. Never claims more than the checkpoint actually saw.
+  function interruptedText(job) {
+    var parts = ['Interrupted by Vireo restart.'];
+    var steps = job.steps || job.tree || [];
+    var progress = job.progress || {};
+    if (steps.length > 0) {
+      var done = steps.filter(function(s) { return s.status === 'completed'; }).length;
+      parts.push(done + ' of ' + steps.length + (steps.length === 1 ? ' step' : ' steps') +
+        ' finished before the restart.');
+    } else if (typeof progress.current === 'number' && progress.current > 0) {
+      var got = 'Got through ' + progress.current.toLocaleString();
+      if (progress.total > 0) got += ' of ' + progress.total.toLocaleString();
+      if (progress.phase) got += ' (' + progress.phase + ')';
+      parts.push(got + '.');
+    }
+    if (progress.current_file) {
+      parts.push('Last file: ' + progress.current_file + '.');
+    }
+    if (job.result.last_progress_at) {
+      parts.push('Last progress was recorded at ' +
+        new Date(job.result.last_progress_at).toLocaleString() + '.');
+    } else {
+      parts.push('No progress was recorded before the restart.');
+    }
+    return parts.join(' ');
+  }
+
+  // "key: value" lines for a finished job's result, in place of a raw
+  // JSON dump. Keys the interruption bookkeeping adds (and the error,
+  // which renders on its own line) are skipped; nested objects stay as
+  // compact JSON so nothing is hidden.
+  function resultDetailLines(result) {
+    if (result === null || result === undefined) return [];
+    if (typeof result !== 'object') return [String(result)];
+    var lines = [];
+    Object.keys(result).forEach(function(key) {
+      if (key === 'error' || key === 'interrupted' || key === 'last_progress_at') return;
+      var value = result[key];
+      if (value === null || value === undefined) return;
+      if (Array.isArray(value)) {
+        var allScalar = value.every(function(v) { return v === null || typeof v !== 'object'; });
+        if (allScalar && value.length <= 5) {
+          lines.push(key + ': ' + (value.length ? value.join(', ') : 'none'));
+        } else {
+          lines.push(key + ': ' + value.length.toLocaleString() + (value.length === 1 ? ' item' : ' items'));
+        }
+      } else if (typeof value === 'object') {
+        lines.push(key + ': ' + JSON.stringify(value));
+      } else if (typeof value === 'number') {
+        lines.push(key + ': ' + value.toLocaleString());
+      } else {
+        lines.push(key + ': ' + String(value));
+      }
+    });
+    return lines;
   }
 
   function renderRichStep(step, job, isLive) {

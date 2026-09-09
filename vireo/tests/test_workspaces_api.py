@@ -28,6 +28,27 @@ def test_get_active_workspace(app_and_db):
     assert isinstance(data["folders"], list)
 
 
+def test_active_workspace_identity_skips_folder_counts(app_and_db, monkeypatch):
+    """Navigation can identify the selected workspace without counting photos."""
+    from db import Database
+
+    app, _db = app_and_db
+    client = app.test_client()
+    ws_id = client.post("/api/workspaces", json={"name": "Field Work"}).get_json()["id"]
+    assert client.post(f"/api/workspaces/{ws_id}/activate").status_code == 200
+
+    def fail_folder_lookup(*args, **kwargs):
+        raise AssertionError("Workspace identity must not load folder photo counts")
+
+    monkeypatch.setattr(Database, "get_workspace_folder_roots", fail_folder_lookup)
+    resp = client.get("/api/workspaces/active?include_folders=0")
+    assert resp.status_code == 200
+    data = resp.get_json()
+    assert data["id"] == ws_id
+    assert data["name"] == "Field Work"
+    assert "folders" not in data
+
+
 def test_create_workspace(app_and_db):
     """POST /api/workspaces with name creates a new workspace."""
     app, _db = app_and_db

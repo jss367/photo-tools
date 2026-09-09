@@ -14601,7 +14601,10 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         if not ws:
             return json_error("No active workspace", 404)
         result = dict(ws)
-        result["folders"] = [dict(f) for f in db.get_workspace_folder_roots(ws["id"])]
+        # Navigation only needs workspace identity. Folder photo counts can
+        # take seconds on large libraries and must not delay the switcher.
+        if request.args.get("include_folders") != "0":
+            result["folders"] = [dict(f) for f in db.get_workspace_folder_roots(ws["id"])]
         return jsonify(result)
 
     def _validate_workspace_config_overrides(overrides, db):

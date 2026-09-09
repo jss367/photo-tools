@@ -2087,7 +2087,7 @@ input[type=text], input[type=date], select, .path-input, .text-input, .model-sel
   <a class="brand" href="/browse"><img src="/static/favicon.png" alt="" style="height:22px;width:22px;vertical-align:middle;margin-right:6px;border-radius:4px;">Vireo</a>
   <div class="ws-dropdown" id="wsDropdown">
     <button class="ws-current" onclick="toggleWsDropdown()" id="wsCurrentBtn" data-testid="workspace-dropdown">
-      <span id="wsCurrentName">Default</span>
+      <span id="wsCurrentName">Workspace</span>
       <span class="ws-arrow">&#9662;</span>
     </button>
     <div class="ws-menu" id="wsMenu">
@@ -3706,7 +3706,7 @@ window.NAV_ALL_PAGES = [
 
 /* ---------- Load active workspace name ---------- */
 (function() {
-  fetch('/api/workspaces/active')
+  fetch('/api/workspaces/active?include_folders=0')
     .then(function(r) { return r.ok ? r.json() : null; })
     .then(function(ws) {
       if (ws && ws.name) {
@@ -3814,11 +3814,9 @@ function renderWorkspaceMenu(workspaces, activeId) {
 async function loadWorkspaceMenu() {
   var generation = ++_wsMenuLoadGeneration;
 
-  // The active-workspace endpoint also loads folder roots and their photo
-  // counts, so it can be much slower than the lightweight workspace list.
-  // Start it in parallel, but never make the names wait for it. Once it
-  // arrives, re-render only to add the current-workspace checkmark.
-  var activePromise = safeFetch('/api/workspaces/active', {}, { toast: false })
+  // Skip folder photo counts for navigation. Load identity in parallel so
+  // the workspace names remain usable even if this request is delayed.
+  var activePromise = safeFetch('/api/workspaces/active?include_folders=0', {}, { toast: false })
     .catch(function(e) {
       console.error('Failed to load active workspace', e);
       return null;
@@ -3861,7 +3859,7 @@ async function switchWorkspace(wsId, wsName) {
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({ current_path: window.location.pathname })
     });
-    document.getElementById('wsCurrentBtn').firstChild.textContent = wsName + ' ';
+    document.getElementById('wsCurrentName').textContent = wsName;
     document.getElementById('wsMenu').classList.remove('open');
     _wsDropdownOpen = false;
     document.removeEventListener('click', closeWsDropdownOutside);

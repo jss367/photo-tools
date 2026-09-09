@@ -112,15 +112,16 @@ def test_workspace_dropdown_shows_current(live_server, page):
 
 
 def test_workspace_dropdown_does_not_wait_for_active_workspace(live_server, page):
-    """Workspace names render while the heavier active lookup is pending."""
+    """Workspace names remain usable even when the identity lookup is pending."""
     url = live_server["url"]
     held_active_requests = []
 
     def hold_active_request(route):
         held_active_requests.append(route)
 
-    page.route("**/api/workspaces/active", hold_active_request)
+    page.route("**/api/workspaces/active?include_folders=0", hold_active_request)
     page.goto(f"{url}/browse")
+    expect(page.locator("#wsCurrentName")).to_have_text("Workspace")
     page.click("[data-testid='workspace-dropdown']")
 
     # The active-workspace response is still paused, but the lightweight
@@ -132,6 +133,30 @@ def test_workspace_dropdown_does_not_wait_for_active_workspace(live_server, page
 
     for route in held_active_requests:
         route.abort()
+
+
+def test_workspace_name_and_switch_skip_slow_folder_counts(live_server, page):
+    """Slow full-workspace requests cannot leave navigation saying Default."""
+    url = live_server["url"]
+    db = live_server["db"]
+    field_id = next(ws["id"] for ws in db.get_workspaces() if ws["name"] == "Field Work")
+    assert page.request.post(f"{url}/api/workspaces/{field_id}/activate").ok
+    held_requests = []
+    page.route("**/api/workspaces/active", lambda route: held_requests.append(route))
+
+    try:
+        page.goto(f"{url}/browse")
+        expect(page.locator("#wsCurrentName")).to_have_text("Field Work", timeout=1500)
+        page.click("[data-testid='workspace-dropdown']")
+        expect(page.locator(".ws-menu-item.active")).to_contain_text("Field Work", timeout=1500)
+        with page.expect_navigation():
+            page.locator(".ws-menu-item", has_text="Default").click()
+        expect(page.locator("#wsCurrentName")).to_have_text("Default", timeout=1500)
+        page.goto(f"{url}/pipeline")
+        expect(page.locator("#wsCurrentName")).to_have_text("Default", timeout=1500)
+    finally:
+        for route in held_requests:
+            route.abort()
 
 
 def test_workspace_switch(live_server, page):

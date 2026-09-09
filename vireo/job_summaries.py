@@ -295,11 +295,16 @@ def _prepare_full_resolution(result: dict, config: dict) -> tuple[str, list[str]
 
 
 def _verify_models(result: dict, config: dict) -> tuple[str, list[str]]:
-    verified = _int(result, "verified")
+    # The producer's ``verified`` is the number of models *checked*; the
+    # ``ok`` list holds the ones that actually passed.
+    ok = result.get("ok")
     failed = result.get("failed") or []
-    summary = _n(verified, "model") + " verified"
+    checked = _int(result, "verified")
+    passed = len(ok) if isinstance(ok, list) else max(checked - len(failed), 0)
     if isinstance(failed, list) and failed:
-        summary += f", {len(failed):,} failed"
+        summary = f"{passed:,} of {_n(checked or passed + len(failed), 'model')} verified, {len(failed):,} failed"
+    else:
+        summary = _n(passed, "model") + " verified"
     return summary, _list_details(failed, "Failed verification:")
 
 
@@ -509,6 +514,65 @@ def _card_cleanup_scan(result: dict, config: dict) -> tuple[str, list[str]]:
     return summary, details
 
 
+def _card_cleanup_verify(result: dict, config: dict) -> tuple[str, list[str]]:
+    total = _int(result, "hashes_total")
+    processed = _int(result, "hashes_processed")
+    verified = _int(result, "verified")
+    modified = _int(result, "modified")
+    corrupt = _int(result, "corrupt")
+    unreadable = _int(result, "unreadable")
+    if result.get("cancelled"):
+        summary = f"Cancelled after {processed:,} of {_n(total, 'archive copy', 'archive copies')} checked"
+    else:
+        summary = f"{verified:,} of {_n(total or processed, 'archive copy', 'archive copies')} verified"
+    problems = []
+    if modified:
+        problems.append(f"{modified:,} modified")
+    if corrupt:
+        problems.append(f"{corrupt:,} corrupt")
+    if unreadable:
+        problems.append(f"{unreadable:,} unreadable")
+    if problems:
+        summary += ", " + ", ".join(problems)
+    details = []
+    unblocked = _int(result, "unblocked_files")
+    if unblocked:
+        line = _n(unblocked, "card file") + " now cleared for deletion"
+        if _int(result, "unblocked_bytes"):
+            line += f" ({_human_bytes(result['unblocked_bytes'])})"
+        details.append(line)
+    if result.get("cancelled") and _int(result, "remaining"):
+        details.append(_n(_int(result, "remaining"), "archive copy", "archive copies") + " not yet checked")
+    return summary, details
+
+
+def _card_cleanup_delete(result: dict, config: dict) -> tuple[str, list[str]]:
+    deleted = _int(result, "deleted")
+    skipped_list = result.get("skipped") or []
+    failed_list = result.get("failed") or []
+    skipped_total = _int(result, "skipped_total") if "skipped_total" in result else len(skipped_list)
+    failed_total = _int(result, "failed_total") if "failed_total" in result else len(failed_list)
+    summary = _n(deleted, "card file") + " deleted"
+    if _int(result, "deleted_bytes"):
+        summary += f" ({_human_bytes(result['deleted_bytes'])} freed)"
+    if skipped_total:
+        summary += f", {skipped_total:,} skipped"
+    if failed_total:
+        summary += f", {failed_total:,} failed"
+    if result.get("cancelled"):
+        summary += f", cancelled with {_int(result, 'remaining'):,} left"
+    details = []
+    for label, items, total in (("Failed:", failed_list, failed_total),
+                                ("Skipped:", skipped_list, skipped_total)):
+        if not isinstance(items, list) or not items:
+            continue
+        heading = label
+        if total > len(items):
+            heading = f"{label[:-1]} (showing {len(items):,} of {total:,}):"
+        details += _list_details(items, heading)
+    return summary, details
+
+
 def _staging_verify(result: dict, config: dict) -> tuple[str, list[str]]:
     name = result.get("name") or "Staging folder"
     files = _int(result, "file_count")
@@ -624,6 +688,8 @@ _DESCRIBERS: dict[str, Callable[[dict, dict], tuple[str, list[str]]]] = {
     "verify-hashes": _verify_hashes,
     "card-cleanup-scan": _card_cleanup_scan,
     "staging-verify": _staging_verify,
+    "card-cleanup-verify": _card_cleanup_verify,
+    "card-cleanup-delete": _card_cleanup_delete,
 }
 
 
@@ -643,14 +709,23 @@ def _generic(result: dict, config: dict) -> tuple[str, list[str]]:
             continue
         if isinstance(value, dict):
             continue
+        if key.endswith("_total") and isinstance(result.get(key[:-6]), list):
+            continue  # folded into the list it counts, below
         if isinstance(value, list):
-            if not value:
+            # Producers that sample a long list keep the exact count in
+            # ``<key>_total``; report that, and say the entries are a sample.
+            total = result.get(f"{key}_total")
+            count = int(total) if isinstance(total, (int, float)) and not isinstance(total, bool) else len(value)
+            if not value and not count:
                 continue
             noun = _humanize_key(key).lower()
-            if len(value) == 1 and noun.endswith("s"):
+            if count == 1 and noun.endswith("s"):
                 noun = noun[:-1]
-            parts.append(f"{len(value):,} {noun}")
-            details += _list_details(value, f"{len(value):,} {noun}:")
+            parts.append(f"{count:,} {noun}")
+            heading = f"{count:,} {noun}:"
+            if count > len(value):
+                heading = f"{count:,} {noun} (showing {len(value):,}):"
+            details += _list_details(value, heading)
             continue
         if value is None or value == "":
             continue

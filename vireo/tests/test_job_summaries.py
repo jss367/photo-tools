@@ -70,6 +70,8 @@ def test_known_shapes_from_history():
             "151 of 151 full-resolution files ready (151 copied, 2.8 GB)",
         ("verify-models", '{"verified": 0, "failed": [], "ok": []}'):
             "0 models verified",
+        ("verify-models", '{"verified": 5, "failed": ["a", "b"], "ok": ["c", "d", "e"]}'):
+            "3 of 5 models verified, 2 failed",
         ("fetch-labels", '{"species_count": 10440, "labels_file": "/tmp/labels.txt"}'):
             "10,440 species labels fetched",
         ("regroup", '{"total_photos": 930, "encounter_count": 29, "burst_count": 368, "keep_count": 108, "review_count": 518, "reject_count": 304, "rarity_protected": 31}'):
@@ -268,6 +270,41 @@ def test_staging_verify_leads_with_the_verdict():
     unreachable = dict(base, verified=0, unreachable=40, can_delete=False, status="unreachable")
     out = describe_result("staging-verify", unreachable)
     assert out["summary"].startswith("abc: 40 files could not be checked because the archive is unreachable")
+
+
+def test_card_cleanup_verify_names_every_problem():
+    out = describe_result("card-cleanup-verify", {
+        "hashes_total": 120, "hashes_processed": 120, "archive_files_read": 118,
+        "verified": 115, "modified": 2, "corrupt": 3, "unreadable": 0,
+        "cancelled": False, "remaining": 0, "unblocked_files": 400, "unblocked_bytes": 5_000_000_000,
+    })
+    assert out["summary"] == "115 of 120 archive copies verified, 2 modified, 3 corrupt"
+    assert out["details"] == ["400 card files now cleared for deletion (4.7 GB)"]
+    out = describe_result("card-cleanup-verify", {
+        "hashes_total": 120, "hashes_processed": 40, "verified": 40, "modified": 0,
+        "corrupt": 0, "unreadable": 0, "cancelled": True, "remaining": 80,
+    })
+    assert out["summary"] == "Cancelled after 40 of 120 archive copies checked"
+    assert out["details"] == ["80 archive copies not yet checked"]
+
+
+def test_card_cleanup_delete_uses_exact_totals_for_sampled_lists():
+    skipped = [{"path": f"/card/{i}.NEF", "reason": "changed since scan"} for i in range(500)]
+    out = describe_result("card-cleanup-delete", {
+        "deleted": 1200, "deleted_bytes": 30_000_000_000,
+        "skipped": skipped, "failed": [{"path": "/card/x.NEF", "error": "EACCES"}],
+        "skipped_total": 990, "failed_total": 1,
+    })
+    assert out["summary"] == "1,200 card files deleted (27.9 GB freed), 990 skipped, 1 failed"
+    assert out["details"][0] == "Failed:"
+    assert out["details"][1] == "/card/x.NEF: EACCES"
+    assert out["details"][2] == "Skipped (showing 500 of 990):"
+    assert out["details"][-1] == "and 490 more"
+
+    # Unknown job types get the same exact-total treatment from the fallback.
+    out = describe_result("some-bulk-job", {"done": 3, "skipped": skipped[:2], "skipped_total": 900})
+    assert out["summary"] == "Done: 3, 900 skipped"
+    assert out["details"][0] == "900 skipped (showing 2):"
 
 
 def test_generic_hides_ids():

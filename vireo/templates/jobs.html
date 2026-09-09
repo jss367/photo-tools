@@ -734,7 +734,9 @@
       var done = steps.filter(function(s) { return s.status === 'completed'; }).length;
       parts.push(done + ' of ' + steps.length + (steps.length === 1 ? ' step' : ' steps') +
         ' finished before the restart.');
-    } else if (typeof progress.current === 'number' && progress.current > 0) {
+    } else if (typeof progress.current === 'number' &&
+               (progress.current > 0 || progress.total > 0)) {
+      // "0 of N" is worth saying: it tells the user nothing was done.
       var got = 'Got through ' + progress.current.toLocaleString();
       if (progress.total > 0) got += ' of ' + progress.total.toLocaleString();
       if (progress.phase) got += ' (' + progress.phase + ')';

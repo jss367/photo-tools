@@ -1138,7 +1138,13 @@ class JobRunner:
         The Jobs page shows these instead of the raw result dict, so a
         finished job reads as "28 photos removed from Vireo, 28 files
         moved to Trash" rather than ``{"deleted": 28, "trashed": 28, ...}``.
-        An existing non-empty ``summary`` (from the history row) wins.
+
+        A stored ``summary`` is kept only when it came from step summaries
+        or from the job itself (``result["summary"]``). Anything else was
+        generated from the result dict, and history rows written before
+        the prose describer exist still carry the old ``ok: True,
+        deleted: 28`` form, so those are recomputed from the result here
+        instead of requiring a backfill.
         """
         result = job.get("result")
         if isinstance(result, str):
@@ -1147,7 +1153,17 @@ class JobRunner:
             except (json.JSONDecodeError, TypeError):
                 result = None
         described = describe_result(job.get("type") or "", result, job.get("config"))
-        if not job.get("summary"):
+        steps = job.get("steps") or job.get("tree") or []
+        if isinstance(steps, str):
+            try:
+                steps = json.loads(steps)
+            except (json.JSONDecodeError, TypeError):
+                steps = []
+        from_steps = any(
+            isinstance(s, dict) and s.get("summary") for s in steps
+        )
+        authored = isinstance(result, dict) and bool(result.get("summary"))
+        if described["summary"] and not (from_steps or authored) or not job.get("summary"):
             job["summary"] = described["summary"]
         job["result_details"] = described["details"]
         if described["error"] and not job.get("error"):

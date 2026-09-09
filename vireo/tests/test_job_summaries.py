@@ -178,6 +178,44 @@ def test_non_dict_results():
     assert describe_result("x", 5)["summary"] == ""
 
 
+def test_legacy_history_summaries_are_recomputed(tmp_path):
+    """Rows written before the prose describer carry ``ok: True, deleted:
+    28`` summaries; reading them back must yield prose. Step-derived and
+    job-authored summaries are left alone."""
+    from db import Database
+    from jobs import JobRunner
+
+    db = Database(str(tmp_path / "test.db"))
+    ws_id = db.ensure_default_workspace()
+    db.set_active_workspace(ws_id)
+    runner = JobRunner(db=db)
+
+    rows = [
+        ("legacy", "batch-delete", '{"ok": true, "deleted": 28, "trashed": 28, "trash_failed": [], "failed_photo_ids": []}',
+         '[]', "ok: True, deleted: 28, trashed: 28", '{"mode": "disk"}'),
+        ("steps", "scan", '{"photos_indexed": 5}',
+         '[{"id": "scan", "label": "Scan", "status": "completed", "summary": "142 folders"}]',
+         "142 folders", "{}"),
+        ("authored", "move-folder", '{"moved": 0, "summary": "Move failed — rsync timed out"}',
+         '[]', "Move failed — rsync timed out", "{}"),
+    ]
+    for i, (jid, jtype, result, tree, summary, config) in enumerate(rows):
+        db.conn.execute(
+            """INSERT INTO job_history
+               (id, type, status, started_at, finished_at, duration,
+                result, error_count, config, workspace_id, tree, summary)
+               VALUES (?, ?, 'completed', ?, ?, 1.0, ?, 0, ?, ?, ?, ?)""",
+            (jid, jtype, f"2026-01-01T00:0{i}:00", f"2026-01-01T00:0{i}:01",
+             result, config, ws_id, tree, summary),
+        )
+    db.conn.commit()
+
+    by_id = {r["id"]: r for r in runner.get_history(db, limit=10)}
+    assert by_id["legacy"]["summary"] == "28 photos removed from Vireo, 28 files moved to Trash"
+    assert by_id["steps"]["summary"] == "142 folders"
+    assert by_id["authored"]["summary"] == "Move failed — rsync timed out"
+
+
 def test_runner_history_and_snapshot_carry_prose(tmp_path):
     """Both the history row and the in-memory snapshot expose summary and
     result_details, so the Jobs page never has to render the raw dict."""

@@ -210,6 +210,9 @@
 }
 .tree-repair-item { padding: 2px 0; }
 .tree-step-summary { font-size: 12px; color: var(--text-muted); }
+.job-result-summary { color: var(--text-primary, inherit); font-weight: 500; }
+.job-result-details { margin-top: 6px; font-size: 12px; }
+.job-result-detail-line { padding: 2px 0; overflow-wrap: anywhere; }
 .tree-step-progress-text {
   font-size: 12px; color: var(--text-muted); font-variant-numeric: tabular-nums;
 }
@@ -687,15 +690,30 @@
       if (job.progress.current_file) html += '<div style="margin-top:4px;">' + esc(job.progress.current_file) + '</div>';
       html += '</div></div>';
     } else if (!isLive) {
-      // Fallback for completed/failed jobs without steps — show result/error
+      // Fallback for completed/failed jobs without steps. The server
+      // turns the raw result dict into prose (``summary`` plus
+      // ``result_details`` lines, see job_summaries.py) so the user never
+      // sees ``{"deleted": 28, "trashed": 28, ...}``.
       html += '<div class="job-tree"><div style="padding:8px;font-size:13px;color:var(--text-muted);">';
-      if (job.error) {
-        html += '<div style="color:var(--danger);font-weight:500;">Error: ' + esc(job.error) + '</div>';
+      var resultError = job.error || (job.result && typeof job.result === 'object' && job.result.error) || '';
+      if (resultError) {
+        html += '<div style="color:var(--danger);font-weight:500;">Error: ' + esc(resultError) + '</div>';
       }
-      if (job.result) {
-        html += '<div>' + esc(typeof job.result === 'string' ? job.result : JSON.stringify(job.result)) + '</div>';
+      var resultSummary = job.summary || '';
+      // Job-authored summaries often wrap the error ("Move failed — <error>");
+      // don't print the same message twice.
+      if (resultSummary && !(resultError && resultSummary.indexOf(resultError) !== -1)) {
+        html += '<div class="job-result-summary">' + esc(resultSummary) + '</div>';
       }
-      if (!job.error && !job.result) {
+      var resultDetails = Array.isArray(job.result_details) ? job.result_details : [];
+      if (resultDetails.length > 0) {
+        html += '<div class="job-result-details">';
+        resultDetails.forEach(function(line) {
+          html += '<div class="job-result-detail-line">' + esc(line) + '</div>';
+        });
+        html += '</div>';
+      }
+      if (!resultError && !resultSummary && resultDetails.length === 0) {
         html += '<div>No details available</div>';
       }
       html += '</div></div>';

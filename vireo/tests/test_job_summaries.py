@@ -1,0 +1,209 @@
+"""Human-readable job result text (job_summaries.describe_result)."""
+
+import json
+
+from job_summaries import describe_result
+
+
+def test_batch_delete_trash_mode_reads_as_prose():
+    result = {"deleted": 28, "failed_photo_ids": [], "ok": True,
+              "trash_failed": [], "trashed": 28}
+    out = describe_result("batch-delete", result, {"mode": "disk"})
+    assert out["summary"] == "28 photos removed from Vireo, 28 files moved to Trash"
+    assert out["details"] == []
+    assert out["error"] is None
+    assert "{" not in out["summary"]
+    assert "ok" not in out["summary"]
+
+
+def test_batch_delete_vireo_only_mode():
+    out = describe_result(
+        "batch-delete",
+        {"ok": True, "deleted": 1, "trashed": 0, "trash_failed": [], "failed_photo_ids": []},
+        {"mode": "vireo"},
+    )
+    assert out["summary"] == "1 photo removed from Vireo, files kept on disk"
+
+
+def test_batch_delete_lists_trash_failures_and_permanent_wording():
+    result = {
+        "ok": True, "deleted": 0, "trashed": 0,
+        "trash_failed": [
+            {"path": "/Volumes/P/DSC_6827.NEF", "error": "Finder Trash timed out after 30s", "photo_id": 1},
+            {"path": "/Volumes/P/DSC_6828.NEF"},
+        ],
+        "failed_photo_ids": [1, 2],
+    }
+    out = describe_result("batch-delete", result, {"mode": "disk"})
+    assert out["summary"] == "Nothing deleted, 2 photos failed"
+    assert out["details"][0] == "2 files could not be moved to Trash:"
+    assert out["details"][1] == "/Volumes/P/DSC_6827.NEF: Finder Trash timed out after 30s"
+    assert out["details"][2] == "/Volumes/P/DSC_6828.NEF"
+
+    permanent = describe_result(
+        "batch-delete", {"ok": True, "deleted": 0, "trashed": 3, "trash_failed": []},
+        {"mode": "disk_permanent"},
+    )
+    assert permanent["summary"] == "3 files deleted permanently"
+
+
+def test_detail_lists_are_capped():
+    errors = [f"file{i}.NEF: source file missing" for i in range(25)]
+    out = describe_result("export", {"exported": 5, "errors": errors, "destination": "/out"})
+    assert out["summary"] == "5 photos exported to /out, 25 errors"
+    assert out["details"][0] == "25 errors:"
+    assert len(out["details"]) == 12  # heading + 10 items + "and 15 more"
+    assert out["details"][-1] == "and 15 more"
+
+
+def test_known_shapes_from_history():
+    cases = {
+        ("thumbnails", '{"generated": 644, "skipped": 930, "failed": 0}'):
+            "644 thumbnails generated, 930 already up to date",
+        ("previews", '{"generated": 0, "skipped": 1574, "total": 1574}'):
+            "0 previews generated, 1,574 already up to date",
+        ("classify", '{"classified": 7, "groups": 1, "failed": 0, "total": 7}'):
+            "7 of 7 photos classified in 1 group",
+        ("cull", '{"total_photos": 1574, "suggested_keepers": 852, "suggested_rejects": 722, "species_count": 151}'):
+            "1,574 photos reviewed: 852 suggested keepers, 722 suggested rejects across 151 species",
+        ("prepare-full-resolution", '{"ok": true, "ready": 151, "copied": 151, "reused": 0, "failed": 0, "total": 151, "bytes": 2995224419, "errors": []}'):
+            "151 of 151 full-resolution files ready (151 copied, 2.8 GB)",
+        ("verify-models", '{"verified": 0, "failed": [], "ok": []}'):
+            "0 models verified",
+        ("fetch-labels", '{"species_count": 10440, "labels_file": "/tmp/labels.txt"}'):
+            "10,440 species labels fetched",
+        ("regroup", '{"total_photos": 930, "encounter_count": 29, "burst_count": 368, "keep_count": 108, "review_count": 518, "reject_count": 304, "rarity_protected": 31}'):
+            "930 photos grouped into 29 encounters and 368 bursts",
+        ("sharpness", '{"scored_count": 537, "group_count": 48, "auto_flagged": 48}'):
+            "537 photos scored for sharpness in 48 groups, 48 auto-flagged",
+        ("download-vit-s14", '{"status": "downloaded", "model_id": "vit-s14"}'):
+            "Model vit-s14 downloaded",
+        ("ingest", '{"copied": 1406, "skipped_duplicate": 0, "failed": 0, "total": 1406}'):
+            "1,406 photos imported",
+        ("capture-time", '{"updated": 1, "failed": 0, "failures": [], "shift_minutes": -180, "shifts_vary": false}'):
+            "1 photo updated, capture time shifted -3 hours",
+        ("develop", '{"developed": 0, "errors": 1, "total": 1}'):
+            "0 of 1 photo developed, 1 error",
+        ("duplicate-scan", '{"proposals": [{"status": "resolved"}, {"status": "pending"}]}'):
+            "2 duplicate groups found, 1 resolved",
+        ("publish-site", '{"destination": "/Volumes/Lexar/Pictures", "data_files": ["a"], "exported_images": 5656, "errors": ["x: missing"]}'):
+            "5,656 images published to /Volumes/Lexar/Pictures, 1 error",
+    }
+    for (job_type, raw), expected in cases.items():
+        out = describe_result(job_type, json.loads(raw))
+        assert out["summary"] == expected, (job_type, out["summary"])
+
+
+def test_regroup_and_fetch_labels_details():
+    out = describe_result("regroup", {"total_photos": 10, "encounter_count": 2, "burst_count": 3,
+                                      "keep_count": 4, "review_count": 5, "reject_count": 1,
+                                      "rarity_protected": 2})
+    assert out["details"] == ["4 keep, 5 review, 1 reject", "2 photos protected as rare species"]
+    out = describe_result("fetch-labels", {"species_count": 3, "labels_file": "/x/y.txt"})
+    assert out["details"] == ["Saved to /x/y.txt"]
+
+
+def test_explicit_summary_wins():
+    out = describe_result("work-locally-folder-sync",
+                          {"summary": "10 published, 0 deleted", "folders": [{"ok": True}]})
+    assert out["summary"] == "10 published, 0 deleted"
+    assert out["details"] == []
+
+
+def test_error_only_result_surfaces_error():
+    out = describe_result("sync", {"error": "No module named 'xmp_writer'"})
+    assert out["error"] == "No module named 'xmp_writer'"
+    assert out["summary"] == "No module named 'xmp_writer'"
+    assert out["details"] == []
+
+    # A failed download must not invent "Download complete" next to the error.
+    out = describe_result("download-vit-b14", {"error": "Connection reset by peer"})
+    assert out["summary"] == "Connection reset by peer"
+    assert out["details"] == []
+
+    # Job-authored summaries survive alongside the error.
+    out = describe_result("move-folder", {"moved": 0, "errors": ["rsync stalled"],
+                                          "summary": "Move failed — rsync stalled",
+                                          "error": "rsync stalled"})
+    assert out["summary"] == "Move failed — rsync stalled"
+    assert out["error"] == "rsync stalled"
+
+
+def test_generic_hides_ids():
+    out = describe_result("import-in-place", {"discovered": 3, "indexed": 3,
+                                              "process_job_id": "pipeline-1"})
+    assert out["summary"] == "Discovered: 3, Indexed: 3"
+
+
+def test_generic_fallback_humanizes_unknown_shapes():
+    out = describe_result("some-new-job", {
+        "ok": True, "photos_indexed": 200, "skipped_files": ["a.jpg", "b.jpg"],
+        "nested": {"x": 1}, "label": "", "ratio": 0.5,
+    })
+    assert out["summary"] == "Photos indexed: 200, 2 skipped files, Ratio: 0.5"
+    assert out["details"] == ["2 skipped files:", "a.jpg", "b.jpg"]
+    assert "ok" not in out["summary"].lower().split(",")[0]
+
+    # Opaque records get counted, never dumped field by field.
+    out = describe_result("work-locally-folder-stage",
+                          {"folders": [{"ok": True, "root_folder_id": 144, "files": 3275}]})
+    assert out["summary"] == "1 folder"
+    assert out["details"] == []
+
+    assert describe_result("download-taxonomy", {"ok": True})["summary"] == "Taxonomy downloaded"
+    assert describe_result("download-model", {"model_id": "bioclip-2", "weights_path": "hf-hub:x"})["summary"] == "Model bioclip-2 downloaded"
+    assert describe_result("scan", {"photos_indexed": 1639})["summary"] == "1,639 photos indexed"
+    assert describe_result("sync", {"synced": 101, "failed": 0, "failures": []})["summary"] == "101 photos synced"
+    assert describe_result("precompute-embeddings", {"labels": 532, "model": "BioCLIP-2.5"})["summary"] == "532 label embeddings precomputed with BioCLIP-2.5"
+
+
+def test_failed_job_leads_with_error_and_keeps_partial_progress():
+    out = describe_result("classify", {"classified": 344, "total": 548, "failed": 0,
+                                       "error": "name 'Image' is not defined"})
+    assert out["summary"] == "name 'Image' is not defined"
+    assert out["error"] == "name 'Image' is not defined"
+    assert out["details"][0] == "344 of 548 photos classified"
+
+    out = describe_result("pipeline", {"stages": {}, "duration": 89.2, "collection_id": 31,
+                                       "errors": ["[model_loader] Fatal: incomplete"],
+                                       "error": "[model_loader] Fatal: incomplete"})
+    assert out["summary"] == "[model_loader] Fatal: incomplete"
+    assert "Duration" not in " ".join(out["details"])
+    assert out["details"] == ["1 error", "1 error:", "[model_loader] Fatal: incomplete"]
+
+
+def test_non_dict_results():
+    assert describe_result("x", None) == {"summary": "", "details": [], "error": None}
+    assert describe_result("x", "done")["summary"] == "done"
+    assert describe_result("x", 5)["summary"] == ""
+
+
+def test_runner_history_and_snapshot_carry_prose(tmp_path):
+    """Both the history row and the in-memory snapshot expose summary and
+    result_details, so the Jobs page never has to render the raw dict."""
+    from db import Database
+    from jobs import JobRunner
+    from tests.test_jobs import wait_for_job_via_runner
+
+    db = Database(str(tmp_path / "test.db"))
+    ws_id = db.ensure_default_workspace()
+    db.set_active_workspace(ws_id)
+    runner = JobRunner(db=db)
+
+    def work(job):
+        return {"ok": True, "deleted": 2, "trashed": 2,
+                "trash_failed": [{"path": "/p/a.NEF", "error": "busy"}],
+                "failed_photo_ids": [9]}
+
+    job_id = runner.start("batch-delete", work, workspace_id=ws_id,
+                          config={"mode": "disk"})
+    wait_for_job_via_runner(runner, job_id, wait_for_history=True)
+
+    snap = runner.get(job_id)
+    assert snap["summary"] == "2 photos removed from Vireo, 2 files moved to Trash, 1 photo failed"
+    assert snap["result_details"] == ["1 file could not be moved to Trash:", "/p/a.NEF: busy"]
+
+    row = runner.get_history(db, limit=1)[0]
+    assert row["summary"] == snap["summary"]
+    assert row["result_details"] == snap["result_details"]
+    assert "{" not in row["summary"]

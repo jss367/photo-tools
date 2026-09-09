@@ -199,6 +199,53 @@ def _load_labels(
     return labels, use_tol
 
 
+def _reuse_saved_label_embeddings(db, model_str, model_dir, labels, cancel_check=None):
+    """Recover columns from older set caches using verified source lists.
+
+    Older manifests omit the actual label order. Saved lists and run
+    provenance are only candidates: their complete ordered cache key must
+    match an existing payload before any column can be reused.
+    """
+    from classifier import _embedding_cache_service, _embedding_identity
+    from embedding_cache import LabelEmbeddingCache, canonicalize_labels, identity_digest
+
+    cache = _embedding_cache_service()
+    if not os.path.isdir(cache.cache_dir):
+        return
+    candidates = {name for name in os.listdir(cache.cache_dir) if name.endswith(".npy")}
+    if not candidates:
+        return
+    try:
+        identity = _embedding_identity(labels, model_str, model_dir)
+    except (OSError, ValueError):
+        return  # normal model loading will report missing/invalid artifacts
+    saved = get_saved_labels()
+    by_file = {s["labels_file"]: s for s in saved if s.get("labels_file")}
+    groups = [[path] for path in by_file]
+    if db is not None:
+        groups.extend(row["sources"] for row in db.get_labels_fingerprints() if row.get("sources"))
+    checked = set()
+    for sources in groups:
+        if cancel_check and cancel_check():
+            raise ClassificationCancelled("classification cancelled")
+        try:
+            sets = [by_file.get(path, {"labels_file": path}) for path in sources]
+            variants = [load_merged_labels(sets)]
+            if len(sources) == 1:
+                variants.append(read_label_file(sources[0]))
+            for variant in variants:
+                candidate = {**identity, "labels": canonicalize_labels(variant)}
+                digest = identity_digest(candidate)
+                if digest in checked or f"{digest}.npy" not in candidates:
+                    continue
+                checked.add(digest)
+                value = cache._load(digest, len(candidate["labels"]))
+                LabelEmbeddingCache(cache.cache_dir, candidate, value.shape[0]).seed(candidate["labels"], value)
+                log.info("Reused %d species labels from an existing set cache", len(candidate["labels"]))
+        except (EOFError, OSError, ValueError):
+            log.debug("Could not reuse a previous species label set", exc_info=True)
+
+
 def _record_labels_fingerprint(
     db, fingerprint, labels, sources, full_fingerprint=None,
 ):
@@ -3170,6 +3217,8 @@ def run_classify_job(
             def _construct_classifier():
                 if _factory_cancel_check():
                     raise ClassificationCancelled("classification cancelled")
+                if not use_tol:
+                    _reuse_saved_label_embeddings(thread_db, model_str, weights_path, labels, _factory_cancel_check)
                 return Classifier(
                     labels=None if use_tol else labels,
                     model_str=model_str,

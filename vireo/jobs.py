@@ -1273,26 +1273,31 @@ class JobRunner:
                 )
                 ws_id = job.get("workspace_id")
                 if ws_id is not None:
-                    # Retention: keep the 100 most-recent TERMINAL rows
-                    # per workspace. Excluding non-terminal rows is
+                    # Keep separate 100-row terminal histories for discovery
+                    # probes and other jobs, so periodic checks cannot evict
+                    # the user's pipeline/import history. Non-terminal rows
+                    # stay outside both quotas. Excluding these rows is
                     # load-bearing: a queued pipeline waiting behind a
                     # busy slot can sit in the table for a long time;
                     # if its row got pruned by an unrelated job
                     # completing, the next promotion attempt would see
                     # rowcount==0 on its conditional UPDATE and treat
                     # that as a cancel, silently dropping the run.
-                    conn.execute(
-                        """DELETE FROM job_history
+                    for discovery in (False, True):
+                        conn.execute(
+                            """DELETE FROM job_history
                            WHERE workspace_id = ?
                              AND status IN ('completed', 'failed', 'cancelled')
+                             AND (type IN ('new_images_walk', 'missing_originals_scan')) = ?
                              AND id NOT IN (
                                SELECT id FROM job_history
                                WHERE workspace_id = ?
                                  AND status IN ('completed', 'failed', 'cancelled')
+                                 AND (type IN ('new_images_walk', 'missing_originals_scan')) = ?
                                ORDER BY started_at DESC LIMIT 100
                            )""",
-                        (ws_id, ws_id),
-                    )
+                            (ws_id, discovery, ws_id, discovery),
+                        )
                 conn.commit()
                 return
             except sqlite3.OperationalError:

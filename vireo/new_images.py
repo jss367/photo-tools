@@ -668,7 +668,10 @@ class NewImagesCache:
     # on the same schedule it is re-probed.
     PARTIAL_RESULT_TTL_SECONDS = 30
 
-    def __init__(self, ttl_seconds=300):
+    # Full-library walks can take minutes on network storage. Automatic
+    # refreshes share the missing-originals check's half-hour cadence;
+    # imports/scans and explicit rechecks still invalidate immediately.
+    def __init__(self, ttl_seconds=1800):
         self._ttl = ttl_seconds
         # key=(db_path, workspace_id) -> (result_dict, set_at_monotonic)
         self._entries = {}
@@ -679,7 +682,7 @@ class NewImagesCache:
         # generation kickoffs queue a rerun token rather than spawning a
         # parallel walk (see ``_rerun_pending``).
         self._inflight = {}
-        # key=(db_path, workspace_id) -> compute_fn for a deferred rerun. Set
+        # key=(db_path, workspace_id) -> (compute_fn, on_spawn, can_start) for a rerun. Set
         # when a kickoff arrives during an in-flight stale-generation compute:
         # rather than fan out a second concurrent ``os.walk`` (a real risk on
         # the scan path where ``invalidate_workspaces`` fires per discovered
@@ -771,7 +774,7 @@ class NewImagesCache:
                 return None
             return err_msg
 
-    def kickoff_compute(self, db_path, workspace_id, compute_fn, on_spawn=None):
+    def kickoff_compute(self, db_path, workspace_id, compute_fn, on_spawn=None, can_start=None):
         """Ensure a background compute is running for ``(db_path, workspace_id)``.
 
         If a recent compute failed (within ``ERROR_BACKOFF_SECONDS``), no new
@@ -813,7 +816,18 @@ class NewImagesCache:
         The generation snapshot is taken inside the lock at kickoff time so a
         concurrent invalidation can still drop the stale write — same race
         protection as :meth:`get_new_images_for_workspace`.
+
+        ``can_start`` optionally defers automatic work while foreground jobs
+        are active. It is rechecked for deferred reruns, which retain their
+        ``on_spawn`` registration and progress callback.
         """
+        # Automatic discovery yields to foreground work, including reruns
+        # requested while an earlier generation was still walking. Polling
+        # will retry once the foreground job finishes.
+        if can_start is not None and not can_start():
+            done = threading.Event()
+            done.set()
+            return done
         key = (db_path, workspace_id)
         with self._lock:
             # Race guard: a worker finishing between the caller's
@@ -875,7 +889,7 @@ class NewImagesCache:
                     # Last writer wins — multiple kickoffs collapse to one
                     # rerun, so a burst of polls during scan-time invalidation
                     # storms can't queue a backlog of walks.
-                    self._rerun_pending[key] = compute_fn
+                    self._rerun_pending[key] = (compute_fn, on_spawn, can_start)
                 return existing_event
             event = threading.Event()
             self._inflight[key] = (event, generation)
@@ -941,7 +955,11 @@ class NewImagesCache:
                     # each rerun consumes its token and a new one is only
                     # added by another stale-generation kickoff arriving
                     # during the next worker.
-                    self.kickoff_compute(db_path, workspace_id, rerun_fn)
+                    compute_again, spawn_again, start_again = rerun_fn
+                    self.kickoff_compute(
+                        db_path, workspace_id, compute_again,
+                        on_spawn=spawn_again, can_start=start_again,
+                    )
 
         threading.Thread(
             target=worker, daemon=True, name="new-images-compute",

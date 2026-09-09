@@ -3058,6 +3058,9 @@ def test_pipeline_loops_over_multiple_models(tmp_path, monkeypatch):
     class FakeClassifier:
         def __init__(self, *args, **kwargs):
             construction_calls.append(kwargs)
+            kwargs["embedding_progress_callback"](0, 10)
+            kwargs["embedding_progress_callback"](7, 10)
+            kwargs["embedding_progress_callback"](10, 10)
 
         def encode_image(self, *args, **kwargs):
             import numpy as np
@@ -3081,6 +3084,10 @@ def test_pipeline_loops_over_multiple_models(tmp_path, monkeypatch):
         f"Expected Classifier() to be constructed {len(model_ids)} times "
         f"(one per model_id), got {len(construction_calls)}"
     )
+    for step in ("model_loader", f"classify:{model_ids[1]}"):
+        updates = [kw for _, sid, kw in runner.step_updates if sid == step]
+        assert any(kw.get("progress") == {"current": 7, "total": 10, "unit": "labels"} for kw in updates)
+        assert any("7 / 10 labels ready" in kw.get("current_file", "") for kw in updates)
     # model_loader must record completion with a summary naming each model.
     model_loader_summaries = [
         kwargs.get("summary", "")

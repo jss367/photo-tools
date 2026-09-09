@@ -959,6 +959,30 @@ class TestEmbeddingPrecompute:
             assert count_again == 2
             assert create_session.call_count == 1
 
+            tokenizer.encode_batch.reset_mock()
+            progress = []
+            count_extended = precompute_label_embeddings(
+                ["cat", "dog", "bird"],
+                model_str="ViT-B-16", pretrained_str=str(model_dir),
+                progress_callback=lambda current, total: progress.append((current, total)),
+            )
+            assert count_extended == 3
+            assert create_session.call_count == 2
+            # Only the new species goes through the text encoder. Existing
+            # labels remain reusable even in a different order.
+            assert tokenizer.encode_batch.call_count == 1
+            assert all("dog" in text for text in tokenizer.encode_batch.call_args.args[0])
+            assert progress[0] == (2, 3), "cached labels should be counted before estimating uncached work"
+            assert progress[-1] == (3, 3)
+
+            from classifier import _embedding_is_cached
+            assert _embedding_is_cached(["dog", "cat"], "ViT-B-16", str(model_dir))
+
+            precompute_label_embeddings(
+                ["dog", "cat"], model_str="ViT-B-16", pretrained_str=str(model_dir),
+            )
+            assert create_session.call_count == 2, "a cached subset must not load the text encoder"
+
 
 class TestGpuLockScope:
     """Regression: the GPU semaphore must wrap only the image-encoder
@@ -1059,3 +1083,33 @@ class TestGpuLockScope:
         assert snapshots["during_run"] == baseline, (
             "CPU-only image session must not take the GPU semaphore"
         )
+
+
+@pytest.mark.parametrize("source_changed", [False, True])
+def test_upgrade_reuses_legacy_set_only_with_exact_label_identity(tmp_path, monkeypatch, source_changed):
+    from types import SimpleNamespace
+
+    import classifier
+    import classify_job
+    from embedding_cache import LabelEmbeddingCache
+
+    model_dir = _make_model_dir(tmp_path)
+    monkeypatch.setattr(classifier, "CACHE_DIR", str(tmp_path / "cache"))
+    identity = classifier._embedding_identity(["bird", "cat"], "ViT-B-16", str(model_dir))
+    cache = classifier._embedding_cache_service()
+    payload = np.arange(1024, dtype=np.float32).reshape(512, 2)
+    cache.get_or_compute(identity, lambda: payload)
+    source = tmp_path / "region.txt"
+    source.write_text("bird\n" + ("dog\n" if source_changed else "cat\n"))
+    # Older caches have no label list in their manifest. Reconstruct a
+    # candidate from the catalog's recorded source files, then verify its key.
+    db = SimpleNamespace(get_labels_fingerprints=lambda: [{"sources": [str(source)]}])
+    monkeypatch.setattr(classify_job, "get_saved_labels", lambda: [])
+    classify_job._reuse_saved_label_embeddings(db, "ViT-B-16", str(model_dir), ["bird", "cat", "dog"])
+    individual = LabelEmbeddingCache(cache.cache_dir, identity, 512)
+    if source_changed:
+        assert individual.read("bird") is None
+    else:
+        np.testing.assert_array_equal(individual.read("bird"), payload[:, 0])
+        np.testing.assert_array_equal(individual.read("cat"), payload[:, 1])
+    assert individual.read("dog") is None

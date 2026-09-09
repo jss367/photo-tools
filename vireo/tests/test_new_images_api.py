@@ -130,9 +130,9 @@ def test_api_new_images_returns_pending_when_walk_is_slow(app_and_db, monkeypatc
         release.set()
 
 
-def test_api_new_images_defers_walk_during_folder_move(app_and_db):
-    """The automatic navbar probe must not walk the NAS while rsync is moving
-    a folder on the same library."""
+@pytest.mark.parametrize("query", ["", "?manual_recheck=1"])
+def test_api_new_images_defers_walk_during_folder_move(app_and_db, query):
+    """Automatic and manual checks wait while rsync moves the library."""
     import threading
     import time
 
@@ -149,7 +149,7 @@ def test_api_new_images_defers_walk_during_folder_move(app_and_db):
     )
     client = app.test_client()
     try:
-        resp = client.get("/api/workspaces/active/new-images")
+        resp = client.get("/api/workspaces/active/new-images" + query)
         assert resp.status_code == 200
         data = resp.get_json()
         assert data["pending"] is True
@@ -322,11 +322,10 @@ def test_api_new_images_returns_error_when_compute_fails(app_and_db, monkeypatch
     assert data["workspace_id"] == ws_id
 
 
-def test_api_new_images_registers_ephemeral_job_on_cache_cold(app_and_db, monkeypatch):
+def test_api_new_images_records_job_and_history_on_cache_cold(app_and_db, monkeypatch):
     """When the new-images walk has to actually run (cache cold, no error
-    backoff), an ephemeral ``new_images_walk`` job appears in the active jobs
-    list while it runs, and is *not* persisted to job_history when it
-    finishes. This is the transparency hook: the user can see the walk
+    backoff), a ``new_images_walk`` job appears in the active jobs
+    list while it runs, and is persisted to job_history when it finishes. This is the transparency hook: the user can see the walk
     happening in the bottom panel rather than the silent background thread.
     """
     import threading
@@ -356,7 +355,7 @@ def test_api_new_images_registers_ephemeral_job_on_cache_cold(app_and_db, monkey
     try:
         resp = client.get("/api/workspaces/active/new-images")
         assert resp.status_code == 200
-        # While the walk is blocked, /api/jobs must show our ephemeral job.
+        # While the walk is blocked, /api/jobs must show our discovery job.
         deadline = time.monotonic() + 2.0
         walk_jobs = []
         while time.monotonic() < deadline:
@@ -375,14 +374,14 @@ def test_api_new_images_registers_ephemeral_job_on_cache_cold(app_and_db, monkey
         job = walk_jobs[0]
         assert job["status"] == "running"
         assert job["workspace_id"] == ws_id
-        assert job["counts_for_badge"] is False
+        assert job["counts_for_badge"] is True
         assert job["blocks_local_transitions"] is False
         # Job is tied to the workspace via config.workspace_name for the UI label.
         assert "workspace_name" in job["config"]
     finally:
         release.set()
 
-    # After the walk finishes, no row was written to job_history — ephemeral.
+    # After the walk finishes, its work remains visible in job history.
     deadline = time.monotonic() + 2.0
     while time.monotonic() < deadline:
         jobs_data = client.get("/api/jobs").get_json()
@@ -393,9 +392,11 @@ def test_api_new_images_registers_ephemeral_job_on_cache_cold(app_and_db, monkey
     history_rows = db.conn.execute(
         "SELECT id FROM job_history WHERE type = 'new_images_walk'"
     ).fetchall()
-    assert history_rows == [], (
-        f"new_images_walk must not persist to job_history, got {history_rows}"
-    )
+    assert len(history_rows) == 1
+    history = client.get("/api/jobs/history").get_json()
+    recorded = next(j for j in history if j["id"] == job["id"])
+    assert recorded["status"] == "completed"
+    assert recorded["duration"] is not None
 
 
 def test_api_new_images_job_marked_failed_when_walk_raises(app_and_db, monkeypatch):
@@ -1031,10 +1032,10 @@ def test_post_snapshot_202_reports_live_walk_progress(app_and_db, monkeypatch):
         release.set()
 
 
-def test_post_snapshot_registers_ephemeral_job_when_walk_needed(
+def test_post_snapshot_registers_job_when_walk_needed(
         app_and_db, monkeypatch):
     """A click-triggered walk must be just as visible in the bottom panel as
-    a navbar-triggered one: same ephemeral ``new_images_walk`` job."""
+    a navbar-triggered one: same recorded ``new_images_walk`` job."""
     import threading
     import time
 
@@ -1652,3 +1653,73 @@ def test_recheck_forgets_a_wedged_root_walk(app_and_db, monkeypatch):
     finally:
         release.set()
         wedged.join(5)
+
+
+@pytest.mark.parametrize("job_type", [
+    "pipeline", "classify", "precompute-embeddings", "extract-masks", "import", "missing_originals_scan",
+])
+def test_automatic_discovery_defers_to_processing_then_recovers(app_and_db, job_type):
+    import threading
+    import time
+
+    app, db, ws_id, tmp_path = app_and_db
+    root = tmp_path / "shoot"
+    _touch_image(str(root / "IMG.JPG"))
+    db.add_folder(str(root))
+    release = threading.Event()
+    job_id = app._job_runner.start(job_type, lambda _: release.wait(5), workspace_id=ws_id)
+    client = app.test_client()
+    try:
+        response = client.get("/api/workspaces/active/new-images").get_json()
+        assert response["deferred_reason"] == "foreground_job_active"
+        assert not db._new_images_cache.has_inflight(db._db_path, ws_id)
+        assert not any(j["type"] == "new_images_walk" for j in app._job_runner.list_jobs())
+    finally:
+        release.set()
+    deadline = time.monotonic() + 3
+    while app._job_runner.get(job_id)["status"] == "running" and time.monotonic() < deadline:
+        time.sleep(0.01)
+    response = client.get("/api/workspaces/active/new-images").get_json()
+    assert "deferred_reason" not in response
+    assert response.get("new_count") == 1 or response.get("pending")
+
+
+@pytest.mark.parametrize("snapshot", [False, True])
+def test_manual_recheck_bypasses_foreground_job_deferral(app_and_db, snapshot):
+    """A recheck triggered by the user's "Check again" click must bypass the
+    foreground-job deferral. Without this, a click during a long pipeline
+    job would leave the button stuck on "Checking..." for the rest of the
+    job while the automatic-poll cadence is applied to a manual action."""
+    import threading
+    import time
+
+    app, db, ws_id, tmp_path = app_and_db
+    root = tmp_path / "shoot"
+    _touch_image(str(root / "IMG.JPG"))
+    db.add_folder(str(root))
+    release = threading.Event()
+    job_id = app._job_runner.start(
+        "pipeline", lambda _: release.wait(5), workspace_id=ws_id,
+    )
+    client = app.test_client()
+    try:
+        # Baseline: without the marker the endpoint defers.
+        deferred = client.get("/api/workspaces/active/new-images").get_json()
+        assert deferred["deferred_reason"] == "foreground_job_active"
+        # With manual_recheck=1 the deferral is bypassed and the walk runs.
+        url = ("/api/workspaces/active/new-images/snapshot" if snapshot
+               else "/api/workspaces/active/new-images?manual_recheck=1")
+        request_check = client.post if snapshot else client.get
+        response = request_check(url).get_json()
+        deadline = time.monotonic() + 3
+        while response.get("pending") and time.monotonic() < deadline:
+            time.sleep(0.05)
+            response = request_check(url).get_json()
+        assert "deferred_reason" not in response
+        assert response.get("file_count" if snapshot else "new_count") == 1
+    finally:
+        release.set()
+        deadline = time.monotonic() + 3
+        while (app._job_runner.get(job_id)["status"] == "running"
+               and time.monotonic() < deadline):
+            time.sleep(0.01)

@@ -13469,7 +13469,15 @@ async function checkNewImages(options) {
   }
   _newImagesInFlight = true;
   try {
-    const resp = await fetch('/api/workspaces/active/new-images');
+    // While a manual "Check again" is outstanding, ask the server to bypass
+    // the foreground-job deferral. Without this, a recheck during a long
+    // pipeline job returns pending+deferred_reason and the button stays
+    // "Checking..." for the rest of the job — the user's explicit "look
+    // now" click gets treated like an automatic poll.
+    const url = _newImagesRecheckToken > 0
+      ? '/api/workspaces/active/new-images?manual_recheck=1'
+      : '/api/workspaces/active/new-images';
+    const resp = await fetch(url);
     if (!resp.ok) {
       _failNewImagesRecheck(_newImagesAnswersRecheck(startInvalidated));
       return;
@@ -13479,7 +13487,15 @@ async function checkNewImages(options) {
     // running in the background. The result will land in the cache shortly,
     // so re-poll soon instead of waiting for the next 60s tick.
     if (data && data.pending) {
-      _newImagesPendingTimer = setTimeout(checkNewImages, 3000);
+      if (data.deferred_reason) {
+        const stamp = document.getElementById('newImagesCheckedAt');
+        if (stamp) {
+          stamp.textContent = data.deferred_reason === 'storage_move_active'
+            ? 'Check deferred until the storage move finishes'
+            : 'Check deferred until active processing finishes';
+        }
+      }
+      _newImagesPendingTimer = setTimeout(checkNewImages, data.deferred_reason ? 15000 : 3000);
       return;
     }
     // Persistent backend failure (unreachable volume, DB error). Don't

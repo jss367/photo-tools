@@ -4473,9 +4473,14 @@ async function loadEmbeddingCache() {
   try {
     var d = await safeFetch('/api/embedding-cache', {}, { toast: false });
     document.getElementById('embeddingCacheSize').textContent = formatBytes(d.total_size);
-    var count = (d.entries || []).length;
-    document.getElementById('embeddingCacheCount').textContent = count > 0 ? count + ' cached label ' + (count === 1 ? 'set' : 'sets') : 'empty';
-    document.getElementById('clearCacheBtn').style.display = count > 0 ? '' : 'none';
+    var entries = d.entries || [];
+    var count = entries.filter(entry => !entry.label_count).length;
+    var labels = entries.reduce((sum, entry) => sum + (entry.label_count || 0), 0);
+    var parts = [];
+    if (count) parts.push(count + ' cached label ' + (count === 1 ? 'set' : 'sets'));
+    if (labels) parts.push(labels.toLocaleString() + ' reusable species labels');
+    document.getElementById('embeddingCacheCount').textContent = parts.join(' · ') || 'empty';
+    document.getElementById('clearCacheBtn').style.display = entries.length > 0 ? '' : 'none';
   } catch(e) {}
 }
 

@@ -534,6 +534,20 @@ class EmbeddingCache:
         try:
             if cancel_check and cancel_check():
                 raise EmbeddingWaitCancelled("classification cancelled")
+            # A producer may have published after our first disk read but
+            # before we acquired the flight registry. Recheck as its new
+            # owner so a late caller cannot repeat that completed work.
+            try:
+                value = self._load(initial_digest, label_count, embedding_dim=embedding_dim)
+            except (EOFError, OSError, ValueError):
+                pass
+            else:
+                if cancel_check and cancel_check():
+                    raise EmbeddingWaitCancelled("classification cancelled")
+                flight.published_digest = initial_digest
+                with _flights_lock:
+                    _diagnostics["cache_hits"] += 1
+                return value, identity
             log.info("EmbeddingCache: producing key=%s", initial_digest[:12])
             _begin_producer_execution(flight_key)
             try:
@@ -679,3 +693,45 @@ class EmbeddingCache:
             finally:
                 with contextlib.suppress(FileNotFoundError):
                     os.unlink(temporary)
+
+
+class LabelEmbeddingCache(EmbeddingCache):
+    """Reuse individual labels under an exact text-encoder identity.
+
+    Each column is independent of the other labels in a classifier. Reuse
+    the existing atomic publication, validation and single-flight machinery
+    for each column, keeping model/tokenizer/prompt changes isolated.
+    """
+
+    def __init__(self, cache_dir, identity, embedding_dim=None):
+        text_identity = {k: v for k, v in identity.items() if k != "labels"}
+        super().__init__(os.path.join(cache_dir, "labels", identity_digest(text_identity)))
+        self.embedding_dim = embedding_dim
+
+    def read(self, label):
+        try:
+            return self._load(
+                identity_digest({"labels": [label]}), 1,
+                embedding_dim=self.embedding_dim,
+            )[:, 0]
+        except (EOFError, OSError, ValueError):
+            return None
+
+    def resolve(self, label, compute, cancel_check=None):
+        value, _ = self.get_or_compute(
+            {"labels": [label]}, lambda: compute()[:, None],
+            embedding_dim=self.embedding_dim, cancel_check=cancel_check,
+        )
+        return value[:, 0]
+
+    def seed(self, labels, value):
+        """Make a verified whole-set cache hit reusable by other label sets."""
+        _validate_payload(value, len(labels), embedding_dim=self.embedding_dim)
+        for index, label in enumerate(labels):
+            if self.read(label) is None:
+                self._publish(identity_digest({"labels": [label]}), value[:, index:index + 1], 1)
+
+    def _update_manifest(self, digest, identity, value):
+        # The directory identifies the text encoder and the filename the
+        # label. Avoid rewriting a manifest for every individual label.
+        pass

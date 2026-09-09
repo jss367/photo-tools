@@ -10,6 +10,7 @@ from datetime import datetime
 
 import power
 from job_contract import failure_event
+from job_summaries import describe_result
 from resource_ledger import (
     bind_resource_cancel_check,
     bind_resource_owner,
@@ -1239,7 +1240,7 @@ class JobRunner:
                 result_data = {"error": primary_error}
 
         tree_json = json.dumps(job.get("steps", []))
-        summary = self._build_summary(job)
+        summary = self._build_summary(job, result_data)
 
         params = (
             job["id"],
@@ -1308,8 +1309,14 @@ class JobRunner:
                 if conn is not None:
                     conn.close()
 
-    def _build_summary(self, job):
-        """Build a one-line summary from job steps or result."""
+    def _build_summary(self, job, result=None):
+        """Build a one-line summary from job steps or result.
+
+        ``result`` is the payload being persisted (which for a failed job
+        already carries the fatal ``error``); it defaults to the job's own
+        result so failed runs summarize with their error instead of a bare
+        "<Type> failed".
+        """
         steps = job.get("steps", [])
         if steps:
             parts = []
@@ -1319,17 +1326,12 @@ class JobRunner:
             if parts:
                 return ", ".join(parts)
 
-        result = job.get("result")
+        if result is None:
+            result = job.get("result")
         if result and isinstance(result, dict):
-            if result.get("summary"):
-                return result["summary"]
-            parts = []
-            for k, v in result.items():
-                if isinstance(v, dict):
-                    continue
-                parts.append(f"{k}: {v}")
-            if parts:
-                return ", ".join(parts[:3])
+            described = describe_result(job["type"], result, job.get("config"))
+            if described["summary"]:
+                return described["summary"]
 
         # Final fallback: title-case the job type (e.g. "duplicate-scan" →
         # "Duplicate Scan") so the summary line is presentable to the user.
@@ -1384,7 +1386,64 @@ class JobRunner:
             timing = get_resource_ledger().owner_timing(job["id"])
             snap["resource_wait_seconds"] = timing["wait_seconds"]
             snap["resource_wait_count"] = timing["wait_count"]
+        elif job.get("status") in ("completed", "failed", "cancelled"):
+            JobRunner._attach_result_text(snap)
         return snap
+
+    @staticmethod
+    def _attach_result_text(job):
+        """Add ``summary`` / ``result_details`` prose derived from ``result``.
+
+        The Jobs page shows these instead of the raw result dict, so a
+        finished job reads as "28 photos removed from Vireo, 28 files
+        moved to Trash" rather than ``{"deleted": 28, "trashed": 28, ...}``.
+
+        A stored ``summary`` is kept only when it came from step summaries
+        or from the job itself (``result["summary"]``). Anything else was
+        generated from the result dict, and history rows written before
+        the prose describer exist still carry the old ``ok: True,
+        deleted: 28`` form, so those are recomputed from the result here
+        instead of requiring a backfill.
+        """
+        result = job.get("result")
+        if isinstance(result, str):
+            try:
+                result = json.loads(result)
+            except (json.JSONDecodeError, TypeError):
+                result = None
+        # A worker that stored a partial result and then raised leaves the
+        # in-memory job with the fatal error in _fatal_error/errors, not in
+        # result (only the persisted history row gets it merged in). Fold
+        # it in here so live snapshots of failed jobs describe the failure
+        # too, not just the partial counts.
+        if job.get("status") == "failed" and not (
+            isinstance(result, dict) and result.get("error")
+        ):
+            fatal = job.get("_fatal_error") or (job.get("errors") or [None])[0]
+            if fatal:
+                result = {**result, "error": fatal} if isinstance(result, dict) else {"error": fatal}
+        described = describe_result(job.get("type") or "", result, job.get("config"))
+        steps = job.get("steps") or job.get("tree") or []
+        if isinstance(steps, str):
+            try:
+                steps = json.loads(steps)
+            except (json.JSONDecodeError, TypeError):
+                steps = []
+        from_steps = any(
+            isinstance(s, dict) and s.get("summary") for s in steps
+        )
+        # Interrupted rows get a summary from the startup sweep that says
+        # how far the job got; that beats the plain error text the
+        # describer would produce, so treat it as authored too.
+        authored = isinstance(result, dict) and bool(
+            result.get("summary") or result.get("interrupted")
+        )
+        if described["summary"] and not (from_steps or authored) or not job.get("summary"):
+            job["summary"] = described["summary"]
+        job["result_details"] = described["details"]
+        if described["error"] and not job.get("error"):
+            job["error"] = described["error"]
+        return job
 
     def get(self, job_id):
         """Get a job by id. Returns a copy so callers don't mutate (or race
@@ -1453,6 +1512,7 @@ class JobRunner:
                             d[field] = json.loads(d[field])
                         except (json.JSONDecodeError, TypeError):
                             pass
+                self._attach_result_text(d)
                 result.append(d)
             return result
         except Exception:

@@ -347,7 +347,10 @@ def _ingest(result: dict, config: dict) -> tuple[str, list[str]]:
 def _capture_time(result: dict, config: dict) -> tuple[str, list[str]]:
     updated = _int(result, "updated")
     failed = _int(result, "failed")
+    skipped = _int(result, "skipped")
     summary = _n(updated, "photo") + " updated"
+    if skipped:
+        summary += f", {skipped:,} already correct"
     shift = result.get("shift_minutes")
     if isinstance(shift, (int, float)) and shift and not result.get("shifts_vary"):
         sign = "+" if shift > 0 else "-"
@@ -368,11 +371,60 @@ def _capture_time(result: dict, config: dict) -> tuple[str, list[str]]:
 
 
 def _download(result: dict, config: dict) -> tuple[str, list[str]]:
-    model_id = result.get("model_id")
+    """``download-<model_id>`` jobs and anything else named ``download-*``.
+
+    Model downloads return ``{"status": "downloaded", "model_id": ...}``.
+    Other downloads carry their own useful fields (size, path, version),
+    so when there is no ``model_id`` the remaining scalar fields become
+    detail lines instead of being flattened to "Download complete".
+    """
+    model_id = result.get("model_id") or (config or {}).get("model_id")
     status = result.get("status")
     if status and status != "downloaded":
         return (_humanize_key(status) + (f" ({model_id})" if model_id else "")), []
-    return (f"Model {model_id} downloaded" if model_id else "Download complete"), []
+    if model_id:
+        return f"Model {model_id} downloaded", []
+    rest = {k: v for k, v in result.items() if k != "status"}
+    _, details = _generic(rest, config)
+    for key, value in rest.items():
+        if isinstance(value, (dict, list)) or value is None or value == "":
+            continue
+        if key in _SKIPPED_KEYS:
+            continue
+        details.append(f"{_humanize_key(key)}: {_format_scalar(value)}")
+    return "Download complete", details
+
+
+def _download_megadetector(result: dict, config: dict) -> tuple[str, list[str]]:
+    summary = "MegaDetector downloaded"
+    if result.get("size"):
+        summary += f" ({result['size']})"
+    details = []
+    if result.get("path"):
+        details.append(f"Saved to {result['path']}")
+    return summary, details
+
+
+def _download_darktable(result: dict, config: dict) -> tuple[str, list[str]]:
+    version = result.get("version")
+    action = result.get("action")
+    summary = f"darktable {version} downloaded" if version else "darktable downloaded"
+    if action == "installed":
+        summary = f"darktable {version} installed" if version else "darktable installed"
+    elif action == "opened-installer":
+        summary += ", installer opened"
+    details = []
+    if result.get("bin_path"):
+        details.append(f"Vireo will use {result['bin_path']}")
+        if result.get("config_written"):
+            details.append("Saved as the darktable path in Settings")
+    elif result.get("downloaded_to"):
+        details.append(f"Saved to {result['downloaded_to']}")
+    if result.get("verified"):
+        details.append(str(result["verified"]))
+    if result.get("quarantined"):
+        details.append("macOS quarantine flag is set; approve it in System Settings if launch is blocked")
+    return summary, details
 
 
 def _download_taxonomy(result: dict, config: dict) -> tuple[str, list[str]]:
@@ -454,6 +506,8 @@ _DESCRIBERS: dict[str, Callable[[dict, dict], tuple[str, list[str]]]] = {
     "move-folder": _move,
     "move-photos": _move,
     "download-taxonomy": _download_taxonomy,
+    "download-megadetector": _download_megadetector,
+    "download-darktable": _download_darktable,
     "precompute-embeddings": _precompute_embeddings,
     "scan": _scan,
     "sync": _sync,

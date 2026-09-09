@@ -129,6 +129,54 @@ def test_error_only_result_surfaces_error():
     assert out["error"] == "rsync stalled"
 
 
+def test_non_model_downloads_keep_their_details():
+    out = describe_result("download-megadetector",
+                          {"status": "downloaded", "size": "233.4 MB", "path": "/m/md_v6.onnx"})
+    assert out["summary"] == "MegaDetector downloaded (233.4 MB)"
+    assert out["details"] == ["Saved to /m/md_v6.onnx"]
+
+    out = describe_result("download-darktable", {
+        "version": "5.2.1", "downloaded_to": "/tmp/darktable.dmg",
+        "verified": "SHA-256 matches the published checksum", "action": "installed",
+        "bin_path": "/Applications/darktable.app/Contents/MacOS/darktable-cli",
+        "config_written": True, "quarantined": False,
+    })
+    assert out["summary"] == "darktable 5.2.1 installed"
+    assert out["details"] == [
+        "Vireo will use /Applications/darktable.app/Contents/MacOS/darktable-cli",
+        "Saved as the darktable path in Settings",
+        "SHA-256 matches the published checksum",
+    ]
+
+    out = describe_result("download-darktable", {
+        "version": "5.2.1", "downloaded_to": "/Downloads/darktable.exe",
+        "verified": "ok", "action": "opened-installer", "bin_path": None,
+        "config_written": False, "quarantined": False,
+    })
+    assert out["summary"] == "darktable 5.2.1 downloaded, installer opened"
+    assert out["details"][0] == "Saved to /Downloads/darktable.exe"
+
+    # Unknown download-* types without a model id keep their fields as details.
+    out = describe_result("download-something",
+                          {"status": "downloaded", "size": "12 MB", "path": "/x/y"})
+    assert out["summary"] == "Download complete"
+    assert out["details"] == ["Size: 12 MB", "Path: /x/y"]
+
+    # Model downloads still read as before, including via config.model_id.
+    assert describe_result("download-vit-s14", {"status": "downloaded"},
+                           {"model_id": "vit-s14"})["summary"] == "Model vit-s14 downloaded"
+
+
+def test_capture_time_reports_skipped():
+    out = describe_result("capture-time", {"updated": 0, "skipped": 12, "failed": 0,
+                                           "failures": [], "shift_minutes": 0})
+    assert out["summary"] == "0 photos updated, 12 already correct"
+    out = describe_result("capture-time", {"updated": 3, "skipped": 2, "failed": 1,
+                                           "failures": ["a.NEF: locked"], "shift_minutes": 60})
+    assert out["summary"] == "3 photos updated, 2 already correct, capture time shifted +1 hour, 1 failed"
+    assert out["details"] == ["Failed:", "a.NEF: locked"]
+
+
 def test_generic_hides_ids():
     out = describe_result("import-in-place", {"discovered": 3, "indexed": 3,
                                               "process_job_id": "pipeline-1"})

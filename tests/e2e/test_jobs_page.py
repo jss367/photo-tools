@@ -93,3 +93,36 @@ def test_move_folder_job_shows_source_and_destination(live_server, page):
     expect(move_route.locator(".job-move-route-note")).to_contain_text(
         "Organizing photos into capture-date folders using %Y/%Y-%m-%d"
     )
+
+
+def test_label_preparation_shows_progress_and_one_estimate(live_server, page):
+    from datetime import datetime, timedelta
+
+    started_at = (datetime.now() - timedelta(minutes=10)).isoformat()
+    job = {
+        "id": "pipeline-label-preparation",
+        "type": "pipeline", "status": "running", "started_at": started_at,
+        "workspace_id": live_server["db"]._active_workspace_id,
+        "config": {"collection_name": "One photo"}, "errors": [],
+        "progress": {
+            "phase": "Preparing species labels for BioCLIP-2.5",
+            "current": 16, "total": 104,
+            "phase_current": 100, "phase_total": 1419, "phase_label": "Species labels",
+        },
+        "steps": [{
+            "id": "model_loader", "label": "Load models", "status": "running",
+            "started_at": started_at,
+            "progress": {"current": 100, "total": 1419, "unit": "labels"},
+            "current_file": "100 / 1,419 labels ready · about 127 min remaining",
+        }],
+    }
+    page.route("**/api/jobs", lambda route: route.fulfill(json={"active": [job], "history": []}))
+    page.route("**/api/jobs/history?*", lambda route: route.fulfill(json=[]))
+    page.goto(f"{live_server['url']}/jobs")
+    step = page.locator('[data-step-id="model_loader"]')
+    expect(step).to_be_visible()
+    expect(step.locator('.tree-step-current-file')).to_have_text(job["steps"][0]["current_file"])
+    expect(step.locator('.tree-step-progress-text').first).to_have_text('100 / 1,419')
+    # The browser must not invent a second estimate from total elapsed time,
+    # which includes cached labels and time spent paused.
+    expect(step.locator('.tree-step-throughput')).to_have_count(0)

@@ -3937,7 +3937,7 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
 
             _update_stages(runner, job["id"], stages)
 
-        def _load_model_bundle(active_model, tax, thread_db):
+        def _load_model_bundle(active_model, tax, thread_db, progress_step="model_loader"):
             """Turn a resolved model spec into a ready-to-use classifier bundle.
 
             Loads labels for the model and constructs the Classifier/TimmClassifier,
@@ -3959,6 +3959,34 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
             model_type = active_model.get("model_type", "bioclip")
             model_name = active_model["name"]
             model_is_custom = active_model.get("source") == "custom"
+            embedding_started = time.monotonic()
+            embedding_start_count = None
+
+            def embedding_progress(current, total):
+                nonlocal embedding_start_count, embedding_started
+                if embedding_start_count is None:
+                    embedding_start_count = current
+                    embedding_started = time.monotonic()
+                phase = f"Preparing species labels for {model_name}"
+                detail = f"{current:,} / {total:,} labels ready"
+                completed = current - embedding_start_count
+                elapsed = time.monotonic() - embedding_started
+                if completed >= 5 and elapsed >= 5 and current < total:
+                    minutes = math.ceil((total - current) * elapsed / completed / 60)
+                    detail += f" · about {minutes:,} min remaining"
+                runner.update_step(
+                    job["id"], progress_step, current_file=detail,
+                    progress={"current": current, "total": total, "unit": "labels"},
+                )
+                stage_id = "model_loader" if progress_step == "model_loader" else "classify"
+                if stage_id == "model_loader":
+                    stages[stage_id].update(count=current, total=total, label=phase)
+                _emit_progress(
+                    runner, job["id"], stages, stage_id, phase,
+                    current_file=detail, step_id=progress_step,
+                    rate=0,
+                    phase_current=current, phase_total=total, phase_label="Species labels",
+                )
 
             labels, use_tol = _load_labels(
                 model_type=model_type,
@@ -4038,6 +4066,9 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                     pass
 
             def _construct_classifier():
+                nonlocal embedding_start_count, embedding_started
+                embedding_start_count = None
+                embedding_started = time.monotonic()
                 try:
                     from classifier import ClassificationCancelled
                 except ImportError:
@@ -4087,10 +4118,14 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                 if cancel_check():
                     raise ClassificationCancelled("classification cancelled")
                 from classifier import Classifier
+                if not use_tol:
+                    from classify_job import _reuse_saved_label_embeddings
+                    _reuse_saved_label_embeddings(thread_db, model_str, weights_path, labels, cancel_check)
                 return Classifier(
                     labels=None if use_tol else labels,
                     model_str=model_str,
                     pretrained_str=weights_path,
+                    embedding_progress_callback=embedding_progress,
                     cancel_check=cancel_check,
                     pause_check=pause_check,
                 )
@@ -5317,7 +5352,7 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                             loaded_models.pop(k, None)
                         clf = None
                         try:
-                            bundle = _load_model_bundle(active_spec, tax, thread_db)
+                            bundle = _load_model_bundle(active_spec, tax, thread_db, progress_step=step_id)
                         except Exception as model_err:
                             is_classification_cancelled = (
                                 model_err.__class__.__name__ == "ClassificationCancelled"

@@ -443,7 +443,7 @@ def test_check_again_is_not_swallowed_by_an_in_flight_poll(fresh_server, page, m
       window.fetch = (u, o) => {
         const pending = realFetch(u, o);
         if (window.__hold && String(u).includes('new-images')
-            && !String(u).includes('recheck')) {
+            && !new URL(u, window.location.href).pathname.endsWith('/new-images/recheck')) {
           return new Promise(resolve => {
             window.__release = () => { window.__hold = false; resolve(pending); };
           });
@@ -485,7 +485,7 @@ def test_check_again_releases_the_button_when_the_recheck_fails(
 
     page.evaluate("""() => {
       const realFetch = window.fetch;
-      window.fetch = (u, o) => (String(u).includes('recheck')
+      window.fetch = (u, o) => (new URL(u, window.location.href).pathname.endsWith('/new-images/recheck')
         ? Promise.resolve(new Response('', {status: 500}))
         : realFetch(u, o));
     }""")
@@ -523,7 +523,7 @@ def test_check_again_releases_the_button_when_the_follow_up_poll_fails(
     page.evaluate("""() => {
       const realFetch = window.fetch;
       window.fetch = (u, o) => (
-        String(u).includes('new-images') && !String(u).includes('recheck')
+        String(u).includes('new-images') && !new URL(u, window.location.href).pathname.endsWith('/new-images/recheck')
           ? Promise.resolve(new Response('', {status: 500}))
           : realFetch(u, o));
     }""")
@@ -562,7 +562,7 @@ def test_a_poll_landing_mid_recheck_does_not_release_the_button(
       window.__releasePost = null;
       window.fetch = (u, o) => {
         const pending = realFetch(u, o);
-        if (String(u).includes('recheck')) {
+        if (new URL(u, window.location.href).pathname.endsWith('/new-images/recheck')) {
           return new Promise(resolve => {
             window.__releasePost = () => resolve(pending);
           });

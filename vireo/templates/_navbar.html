@@ -13471,7 +13471,15 @@ async function checkNewImages(options) {
   }
   _newImagesInFlight = true;
   try {
-    const resp = await fetch('/api/workspaces/active/new-images');
+    // While a manual "Check again" is outstanding, ask the server to bypass
+    // the foreground-job deferral. Without this, a recheck during a long
+    // pipeline job returns pending+deferred_reason and the button stays
+    // "Checking..." for the rest of the job — the user's explicit "look
+    // now" click gets treated like an automatic poll.
+    const url = _newImagesRecheckToken > 0
+      ? '/api/workspaces/active/new-images?manual_recheck=1'
+      : '/api/workspaces/active/new-images';
+    const resp = await fetch(url);
     if (!resp.ok) {
       _failNewImagesRecheck(_newImagesAnswersRecheck(startInvalidated));
       return;

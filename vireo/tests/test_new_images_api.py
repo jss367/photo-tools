@@ -1682,3 +1682,41 @@ def test_automatic_discovery_defers_to_processing_then_recovers(app_and_db, job_
     response = client.get("/api/workspaces/active/new-images").get_json()
     assert "deferred_reason" not in response
     assert response.get("new_count") == 1 or response.get("pending")
+
+
+def test_manual_recheck_bypasses_foreground_job_deferral(app_and_db):
+    """A recheck triggered by the user's "Check again" click must bypass the
+    foreground-job deferral. Without this, a click during a long pipeline
+    job would leave the button stuck on "Checking..." for the rest of the
+    job while the automatic-poll cadence is applied to a manual action."""
+    import threading
+    import time
+
+    app, db, ws_id, tmp_path = app_and_db
+    root = tmp_path / "shoot"
+    _touch_image(str(root / "IMG.JPG"))
+    db.add_folder(str(root))
+    release = threading.Event()
+    job_id = app._job_runner.start(
+        "pipeline", lambda _: release.wait(5), workspace_id=ws_id,
+    )
+    client = app.test_client()
+    try:
+        # Baseline: without the marker the endpoint defers.
+        deferred = client.get("/api/workspaces/active/new-images").get_json()
+        assert deferred["deferred_reason"] == "foreground_job_active"
+        # With manual_recheck=1 the deferral is bypassed and the walk runs.
+        url = "/api/workspaces/active/new-images?manual_recheck=1"
+        response = client.get(url).get_json()
+        deadline = time.monotonic() + 3
+        while response.get("pending") and time.monotonic() < deadline:
+            time.sleep(0.05)
+            response = client.get(url).get_json()
+        assert "deferred_reason" not in response
+        assert response.get("new_count") == 1
+    finally:
+        release.set()
+        deadline = time.monotonic() + 3
+        while (app._job_runner.get(job_id)["status"] == "running"
+               and time.monotonic() < deadline):
+            time.sleep(0.01)

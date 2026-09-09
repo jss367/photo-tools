@@ -15393,6 +15393,13 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             payload.pop("sample_complete", None)
             return payload
 
+        # The "Check again" button's follow-up GET carries this marker so
+        # the deferral that hides automatic polls behind foreground work
+        # doesn't also swallow a click the user just made. Without it, a
+        # recheck during a long pipeline would leave the button stuck on
+        # "Checking..." for the remainder of the job.
+        manual_recheck = request.args.get("manual_recheck", "").lower() in ("1", "true", "yes")
+
         cache = db._new_images_cache
         db_path = db._db_path
         cached = cache.get(db_path, ws_id)
@@ -15413,7 +15420,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 "error": recent_err,
             })
 
-        deferred_reason = _new_images_deferred_reason()
+        deferred_reason = None if manual_recheck else _new_images_deferred_reason()
         if deferred_reason and not cache.has_inflight(db_path, ws_id):
             return jsonify({
                 "workspace_id": ws_id,
@@ -15433,7 +15440,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         compute, on_spawn, spawned = _new_images_walk_fns(db, ws_id)
         event = cache.kickoff_compute(
             db_path, ws_id, compute, on_spawn=on_spawn,
-            can_start=lambda: _new_images_deferred_reason() is None,
+            can_start=None if manual_recheck else (lambda: _new_images_deferred_reason() is None),
         )
         if spawned() and event.wait(timeout=_NEW_IMAGES_SYNC_WAIT_SECS):
             cached = cache.get(db_path, ws_id)

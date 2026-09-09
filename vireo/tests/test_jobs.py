@@ -1137,6 +1137,44 @@ def test_job_history_prunes_to_100(tmp_path):
     assert count <= 100
 
 
+def test_discovery_history_does_not_evict_user_jobs(tmp_path):
+    from db import Database
+    from jobs import JobRunner
+
+    db = Database(str(tmp_path / "test.db"))
+    ws_id = db.ensure_default_workspace()
+    db.set_active_workspace(ws_id)
+    runner = JobRunner(db=db)
+    for job_type in ("pipeline", "new_images_walk", "missing_originals_scan"):
+        for i in range(101):
+            db.conn.execute(
+                """INSERT INTO job_history
+                   (id, type, status, started_at, workspace_id)
+                   VALUES (?, ?, 'completed', ?, ?)""",
+                (f"{job_type}-{i}", job_type, f"2026-01-01T00:00:{i:03d}", ws_id),
+            )
+    db.conn.execute(
+        """INSERT INTO job_history (id, type, status, started_at, workspace_id)
+           VALUES ('queued-pipeline', 'pipeline', 'queued', '2025-01-01', ?)""",
+        (ws_id,),
+    )
+    db.conn.commit()
+    job_id = runner.start("new_images_walk", lambda _: {}, workspace_id=ws_id)
+    wait_for_job_via_runner(runner, job_id, wait_for_history=True)
+    counts = dict(db.conn.execute(
+        """SELECT type, COUNT(*) FROM job_history
+           WHERE workspace_id = ? AND status = 'completed' GROUP BY type""", (ws_id,),
+    ).fetchall())
+    assert counts["pipeline"] == 100
+    assert counts.get("new_images_walk", 0) + counts.get("missing_originals_scan", 0) == 100
+    assert db.conn.execute(
+        "SELECT status FROM job_history WHERE id = 'queued-pipeline'",
+    ).fetchone()[0] == "queued"
+    assert db.conn.execute(
+        "SELECT id FROM job_history WHERE id = ?", (job_id,),
+    ).fetchone() is not None
+
+
 def test_progress_events_include_steps(tmp_path):
     """Progress events include the steps array when steps are defined."""
 

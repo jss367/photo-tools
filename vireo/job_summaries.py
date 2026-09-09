@@ -83,7 +83,11 @@ def _item_text(item: Any) -> str:
             item.get("filename") or item.get("path") or item.get("name")
             or item.get("model_id") or item.get("label")
         )
-        reason = item.get("error") or item.get("reason") or item.get("message")
+        if not label and item.get("photo_id") is not None:
+            # Sync and iNaturalist-export failures identify the photo only
+            # by id; keep it so separate failures stay distinguishable.
+            label = f"Photo {item['photo_id']}"
+        reason = item.get("reason") or item.get("error") or item.get("message")
         if label and reason:
             return f"{label}: {reason}"
         if label:
@@ -226,7 +230,14 @@ def _cull(result: dict, config: dict) -> tuple[str, list[str]]:
     )
     if species:
         summary += f" across {_n(species, 'species', 'species')}"
-    return summary, []
+    details = []
+    missing = _int(result, "photos_missing_phash")
+    if missing:
+        details.append(
+            _n(missing, "photo") + " could not be fingerprinted for scene grouping "
+            "and were grouped on their own"
+        )
+    return summary, details
 
 
 def _regroup(result: dict, config: dict) -> tuple[str, list[str]]:

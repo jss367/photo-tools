@@ -202,6 +202,28 @@ def test_generic_orders_nonzero_counts_before_zero_ones():
     assert describe_result("x", {"ok": True, "count": 2})["summary"] == "Count: 2"
 
 
+def test_failure_records_keep_photo_ids_and_prefer_reasons():
+    out = describe_result("sync", {"synced": 1, "failed": 2, "failures": [
+        {"photo_id": 41, "error": "PermissionError: [Errno 13]", "reason": "File is read-only"},
+        {"photo_id": 42, "change_id": 7, "error": "unsupported change type: rating"},
+    ]})
+    assert out["summary"] == "1 photo synced, 2 failed"
+    assert out["details"] == ["Failed:", "Photo 41: File is read-only",
+                              "Photo 42: unsupported change type: rating"]
+
+
+def test_previews_report_failures_and_cull_reports_missing_phash():
+    out = describe_result("previews", {"generated": 0, "skipped": 0, "failed": 7, "total": 7})
+    assert out["summary"] == "0 previews generated, 7 failed"
+    out = describe_result("cull", {"total_photos": 10, "suggested_keepers": 6,
+                                   "suggested_rejects": 4, "species_count": 2,
+                                   "photos_missing_phash": 3})
+    assert out["details"] == [
+        "3 photos could not be fingerprinted for scene grouping and were grouped on their own"
+    ]
+    assert describe_result("cull", {"total_photos": 1, "photos_missing_phash": 0})["details"] == []
+
+
 def test_generic_hides_ids():
     out = describe_result("import-in-place", {"discovered": 3, "indexed": 3,
                                               "process_job_id": "pipeline-1"})

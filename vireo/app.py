@@ -23495,6 +23495,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             total = len(photos)
             generated = 0
             skipped = 0
+            failed = 0
             job["_start_time"] = time.time()
 
             for i, photo in enumerate(photos):
@@ -23546,9 +23547,12 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                             cache_path=cache_path,
                         )
                     except (ArtifactProducerFailed, PreviewMaterializationError) as exc:
-                        skipped += 1
+                        # A source we could not read is a failure, not a
+                        # cache hit; counting it as skipped made an
+                        # all-unreadable run look fully cached.
+                        failed += 1
                         log.info(
-                            "Skipping preview warmup for photo %s: %s",
+                            "Preview warmup failed for photo %s: %s",
                             photo["id"], exc,
                         )
                     else:
@@ -23577,13 +23581,15 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             # would remain ``pausing`` while eviction ran, and a cancel from
             # that state could leave the cache mid-eviction.
             if ctx.runner.is_cancelled(job["id"]):
-                return {"generated": generated, "skipped": skipped, "total": total}
+                return {"generated": generated, "skipped": skipped,
+                        "failed": failed, "total": total}
 
             # Run a single eviction pass at the end so the batch doesn't
             # fsync after every photo.
             evict_preview_cache_if_over_quota(thread_db, vireo_dir)
 
-            return {"generated": generated, "skipped": skipped, "total": total}
+            return {"generated": generated, "skipped": skipped,
+                    "failed": failed, "total": total}
 
         return ctx.start(
             "previews",

@@ -286,6 +286,9 @@ jobs:
         run: |
           pip install -e ".[dev]"
           if [ "$RUNNER_OS" = "Linux" ]; then
+            # Playwright downloads its own Chromium. The runner's unrelated
+            # Chrome apt index can have checksum mismatches during updates.
+            sudo rm -f /etc/apt/sources.list.d/google-chrome.list /etc/apt/sources.list.d/google-chrome.sources
             python -m playwright install --with-deps chromium
           else
             python -m playwright install chromium

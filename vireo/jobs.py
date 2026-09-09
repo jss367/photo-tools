@@ -1411,6 +1411,17 @@ class JobRunner:
                 result = json.loads(result)
             except (json.JSONDecodeError, TypeError):
                 result = None
+        # A worker that stored a partial result and then raised leaves the
+        # in-memory job with the fatal error in _fatal_error/errors, not in
+        # result (only the persisted history row gets it merged in). Fold
+        # it in here so live snapshots of failed jobs describe the failure
+        # too, not just the partial counts.
+        if job.get("status") == "failed" and not (
+            isinstance(result, dict) and result.get("error")
+        ):
+            fatal = job.get("_fatal_error") or (job.get("errors") or [None])[0]
+            if fatal:
+                result = {**result, "error": fatal} if isinstance(result, dict) else {"error": fatal}
         described = describe_result(job.get("type") or "", result, job.get("config"))
         steps = job.get("steps") or job.get("tree") or []
         if isinstance(steps, str):

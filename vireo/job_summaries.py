@@ -479,6 +479,36 @@ def _verify_hashes(result: dict, config: dict) -> tuple[str, list[str]]:
     return summary, []
 
 
+def _card_cleanup_scan(result: dict, config: dict) -> tuple[str, list[str]]:
+    if result.get("cancelled"):
+        return "Scan cancelled", []
+    totals = result.get("totals") or {}
+
+    def bucket(name):
+        entry = totals.get(name) or {}
+        if isinstance(entry, dict):
+            return _int(entry, "count"), _int(entry, "bytes")
+        return (int(entry) if isinstance(entry, (int, float)) else 0), 0
+
+    deletable, deletable_bytes = bucket("deletable")
+    kept, kept_bytes = bucket("kept")
+    ignored, _ = bucket("ignored")
+    parts = [_n(deletable, "card file") + " safe to delete"]
+    if deletable_bytes:
+        parts[-1] += f" ({_human_bytes(deletable_bytes)})"
+    parts.append(f"{kept:,} to keep" + (f" ({_human_bytes(kept_bytes)})" if kept_bytes else ""))
+    if ignored:
+        parts.append(f"{ignored:,} ignored")
+    summary = ", ".join(parts)
+    details = []
+    if result.get("source_root"):
+        details.append(f"Card: {result['source_root']}")
+    walk_errors = _int(result, "walk_errors")
+    if walk_errors:
+        details.append(_n(walk_errors, "folder") + " could not be read during the walk")
+    return summary, details
+
+
 def _sync(result: dict, config: dict) -> tuple[str, list[str]]:
     synced = _int(result, "synced")
     failed = _int(result, "failed")
@@ -548,6 +578,7 @@ _DESCRIBERS: dict[str, Callable[[dict, dict], tuple[str, list[str]]]] = {
     "scan": _scan,
     "sync": _sync,
     "verify-hashes": _verify_hashes,
+    "card-cleanup-scan": _card_cleanup_scan,
 }
 
 
@@ -609,9 +640,8 @@ def describe_result(job_type: str, result: Any, config: dict | None = None) -> d
 
     explicit = result.get("summary")
     payload = {k: v for k, v in result.items() if k != "error"}
-    if isinstance(explicit, str) and explicit.strip():
-        summary, details = explicit.strip(), []
-    elif error_text and not any(k not in _SKIPPED_KEYS for k in payload):
+    authored = isinstance(explicit, str) and bool(explicit.strip())
+    if error_text and not any(k not in _SKIPPED_KEYS for k in payload):
         # ``{"error": ...}`` alone (or only bookkeeping such as the
         # startup sweep's ``interrupted`` stamp): nothing happened worth
         # describing, and running a describer over it would invent "0
@@ -627,9 +657,13 @@ def describe_result(job_type: str, result: Any, config: dict | None = None) -> d
             summary, details = describer(payload, config)
         except Exception:
             summary, details = _generic(payload, config)
+        if authored:
+            # The job wrote its own sentence; keep it, but still surface the
+            # describer's detail lines (error lists and the like) from the
+            # rest of the payload.
+            summary = explicit.strip()
 
     details = list(details)
-    authored = isinstance(explicit, str) and bool(explicit.strip())
     if error_text and not authored:
         # A failed job leads with why it failed. Whatever partial progress
         # the result records ("344 of 548 photos classified") stays

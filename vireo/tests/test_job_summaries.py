@@ -109,6 +109,14 @@ def test_explicit_summary_wins():
     assert out["summary"] == "10 published, 0 deleted"
     assert out["details"] == []
 
+    # The authored sentence stays, but details still come from the payload.
+    out = describe_result("move-folder", {
+        "ok": True, "moved": 8, "errors": ["DSC_1.NEF: stem exists", "DSC_2.NEF: stem exists"],
+        "summary": "Moved 8 photos, 2 error(s)",
+    })
+    assert out["summary"] == "Moved 8 photos, 2 error(s)"
+    assert out["details"] == ["2 errors:", "DSC_1.NEF: stem exists", "DSC_2.NEF: stem exists"]
+
 
 def test_error_only_result_surfaces_error():
     out = describe_result("sync", {"error": "No module named 'xmp_writer'"})
@@ -224,6 +232,21 @@ def test_previews_report_failures_and_cull_reports_missing_phash():
     assert describe_result("cull", {"total_photos": 1, "photos_missing_phash": 0})["details"] == []
 
 
+def test_card_cleanup_scan_surfaces_nested_totals():
+    out = describe_result("card-cleanup-scan", {
+        "cancelled": False,
+        "totals": {"deletable": {"count": 120, "bytes": 3_000_000_000},
+                   "kept": {"count": 4, "bytes": 90_000_000},
+                   "ignored": {"count": 2, "bytes": 0}},
+        "source_root": "/Volumes/SD_CARD/DCIM", "manifest_path": "/x/manifest.json",
+        "walk_errors": 1,
+    })
+    assert out["summary"] == "120 card files safe to delete (2.8 GB), 4 to keep (85.8 MB), 2 ignored"
+    assert out["details"] == ["Card: /Volumes/SD_CARD/DCIM",
+                              "1 folder could not be read during the walk"]
+    assert describe_result("card-cleanup-scan", {"cancelled": True})["summary"] == "Scan cancelled"
+
+
 def test_generic_hides_ids():
     out = describe_result("import-in-place", {"discovered": 3, "indexed": 3,
                                               "process_job_id": "pipeline-1"})
@@ -313,6 +336,38 @@ def test_legacy_history_summaries_are_recomputed(tmp_path):
     assert by_id["authored"]["summary"] == "Move failed — rsync timed out"
     assert by_id["interrupted"]["summary"] == "Interrupted by Vireo restart at 1,234 of 5,000"
     assert by_id["interrupted"]["result_details"] == []
+
+
+def test_failed_snapshot_with_partial_result_carries_fatal_error(tmp_path):
+    """A worker that stores a partial result and then raises (offline-cache
+    does this) must describe the failure in the live snapshot, not only in
+    the persisted history row."""
+    from db import Database
+    from jobs import JobRunner
+    from tests.test_jobs import wait_for_job_via_runner
+
+    db = Database(str(tmp_path / "test.db"))
+    ws_id = db.ensure_default_workspace()
+    db.set_active_workspace(ws_id)
+    runner = JobRunner(db=db)
+
+    def work(job):
+        job["result"] = {"cached": 3, "skipped": 0, "failed": 2, "total": 5, "bytes": 10}
+        job["_fatal_error"] = "2/5 photos could not be cached: disk full"
+        raise RuntimeError("disk full")
+
+    job_id = runner.start("offline-cache", work, workspace_id=ws_id)
+    wait_for_job_via_runner(runner, job_id, wait_for_history=True)
+
+    snap = runner.get(job_id)
+    assert snap["status"] == "failed"
+    assert snap["error"] == "2/5 photos could not be cached: disk full"
+    assert snap["summary"] == "2/5 photos could not be cached: disk full"
+    assert any("Cached: 3" in line for line in snap["result_details"])
+
+    row = runner.get_history(db, limit=1)[0]
+    assert row["summary"] == snap["summary"]
+    assert row["error"] == snap["error"]
 
 
 def test_runner_history_and_snapshot_carry_prose(tmp_path):
